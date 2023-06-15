@@ -2,12 +2,21 @@
 
 import numpy as np
 
-def davidson_liu(hvp, hdiag, roots, grad_dim):
+def davidson_liu(hvp, hdiag, roots, tol=1e-3):
+    """
+    Solves for eigenvalues and eigenvectors of a hessian.
+
+    Args:
+        hvp (callable): hessian-vector product, function that implements the matrix-vector product of the hessian with a trial vector
+        hdiag (array): (approximate) diagonal hessian elements
+        roots (int): number of roots to solve for
+        tol (float): convergence tolerance on the residual norm
+    """
     # select initial unit vectors based on diagonal hessian
+    grad_dim = len(hdiag)
     V = np.zeros((grad_dim, roots))
     V[np.argsort(hdiag)[:roots], np.arange(roots)] = 1.0
 
-    tol = 1e-3
     AV = hvp(V)
     for i in range(100):
         S = V.T @ AV
