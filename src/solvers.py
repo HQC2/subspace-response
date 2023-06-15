@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 import numpy as np
+import scipy
+import time
 
 def davidson_liu(hvp, hdiag, roots, tol=1e-3):
     """
@@ -46,3 +48,22 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
         AV = np.hstack([AV, hvp(new_vs)])
     raise ValueError('Convergence not reached')
 
+def cg(A,b, maxiter=1000, tol=1e-5):
+    matvec = lambda v: A@v
+    residual = np.copy(b)
+    residual_norm = np.dot(residual,residual)
+    x = np.zeros_like(b)
+    direction = np.zeros_like(residual)
+    direction[:] = residual[:]
+    for i in range(maxiter):
+        product = matvec(direction)
+        gamma = residual_norm / np.dot(direction, product)
+        x += gamma * direction
+        residual_norm_old = residual_norm
+        residual -= gamma * product
+        residual_norm = np.dot(residual, residual)
+        if residual_norm < tol**2:
+            return x
+        beta = residual_norm / residual_norm_old
+        direction = residual + beta*direction
+    raise ValueError('Not converged')
