@@ -3,6 +3,7 @@
 import numpy as np
 import scipy
 import time
+from typing import Callable
 
 def davidson_liu(hvp, hdiag, roots, tol=1e-3):
     """
@@ -48,8 +49,13 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
         AV = np.hstack([AV, hvp(new_vs)])
     raise ValueError('Convergence not reached')
 
-def cg(A,b, maxiter=1000, tol=1e-5):
-    matvec = lambda v: A@v
+def cg(A,b, maxiter=1000, tol=1e-5, verbose=False):
+    if isinstance(A, np.ndarray):
+        matvec = lambda v: A@v
+    elif isinstance(A, Callable):
+        matvec = A
+    else:
+        raise ValueError
     residual = np.copy(b)
     residual_norm = np.dot(residual,residual)
     x = np.zeros_like(b)
@@ -62,6 +68,8 @@ def cg(A,b, maxiter=1000, tol=1e-5):
         residual_norm_old = residual_norm
         residual -= gamma * product
         residual_norm = np.dot(residual, residual)
+        if verbose:
+            print(i, np.sqrt(residual_norm))
         if residual_norm < tol**2:
             return x
         beta = residual_norm / residual_norm_old
