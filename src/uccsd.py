@@ -14,225 +14,110 @@ import excitations
 import time
 
 
-def uccsd_ground_state(symbols, geometry, charge, basis=None, min_method=None):
-    if basis is None:
-        basis = 'STO-3G'
+class uccsd(object):
+    def __init__(self, symbols, geometry, charge, basis):
+        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
+        electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        hf_state = qml.qchem.hf_state(electrons, qubits)
+        hf_state.requires_grad = False
+        singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
+        s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
+        dev = qml.device("lightning.qubit", wires=qubits)
 
-    H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit(params, wires, s_wires, d_wires, parameter_map, hf_state):
+            UCCSD(params, wires, s_wires, d_wires, parameter_map, hf_state)
+            return qml.expval(H)
 
-    electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
+            UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
+            return qml.expval(H)
 
-    hf_state = qml.qchem.hf_state(electrons, qubits)
-    singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-    s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
+        self.H = H
+        self.qubits = qubits
+        self.electrons = electrons
+        self.hf_state = hf_state
+        self.singles = singles
+        self.doubles = doubles
+        self.parameter_map = parameter_map
+        self.num_params = max(self.parameter_map[len(self.parameter_map)-1][0]) + 1
+        self.theta = qml.numpy.zeros(self.num_params)
+        self.s_wires = s_wires
+        self.d_wires = d_wires
+        self.device = dev
+        self.circuit = circuit
+        self.circuit_exc = circuit_exc
 
-    dev = qml.device("lightning.qubit", wires=qubits)
+        atom_str = ''
+        for symbol, coord in zip(symbols, geometry):
+            atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
+            print(atom_str)
+        m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
+        mf = pyscf.scf.RHF(m)
+        mf.kernel()
+        self.m = m
+        self.mf = mf
 
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit(params, wires, s_wires, d_wires, parameter_map, hf_state):
-        UCCSD(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(H)
+    def ground_state(self, min_method='slsqp'):
+        def energy(params):
+            params = qml.numpy.array(params)
+            energy = self.circuit(params, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+            print('energy = ', energy)
+            return energy
 
-    def energy(params):
-        params = qml.numpy.array(params)
-        energy = circuit(params, range(qubits), s_wires, d_wires, parameter_map, hf_state)
-        print('energy = ', energy)
-        return energy
+        def jac(params):
+            params = qml.numpy.array(params)
+            grad = get_gradient(self.circuit)(params, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+            return grad
+        
+        res = minimize(energy, jac=jac, x0=self.theta, method=min_method, tol=1e-12)
+        self.theta = res.x
 
-    def jac(params):
-        params = qml.numpy.array(params)
-        grad = get_gradient(circuit)(params, range(qubits), s_wires, d_wires, parameter_map, hf_state)[0]
-        return grad
-    
-    num_params = max(parameter_map[len(parameter_map)-1][0]) + 1
-    params = qml.numpy.zeros(num_params)
-    t1 = time.time()
-    
-    print(num_params)
-
-
-    if min_method is not None:
-        res = minimize(energy, jac=jac, x0=params, method=min_method, tol=1e-12)
-    else:
-        res = minimize(energy, jac=jac, x0=params, method='slsqp', tol=1e-12)
-    t2 = time.time()
-    print('Optimizing ground state took', t2 - t1, 'seconds')
-
-    theta_opt = res.x
-    def spinstring(l):
-        string = ''
-        for i in l:
-            string += 'ab'[i%2]
-        return string
-    for i, single in enumerate(singles):
-        pmap = parameter_map[i][0]
-        print(single, spinstring(single), pmap, theta_opt[pmap])
-    for i, double in enumerate(doubles):
-        pmap = parameter_map[i+len(singles)][0]
-        print(double, spinstring(double), pmap, theta_opt[pmap])
-    print(theta_opt)
-    print(res)
-    return theta_opt
-
-def uccsd_hvp(symbols, geometry, charge, theta_opt, basis=None, h=1e-6):
-    if basis is None:
-        basis = 'STO-3G'
-    H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
-
-    electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
-
-    hf_state = qml.qchem.hf_state(electrons, qubits)
-    singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-    s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
-
-    dev = qml.device("lightning.qubit", wires=qubits)
-
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit_sd(params, wires, s_wires, d_wires, parameter_map, hf_state):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(H)
-
-    def jac_sd(params_excitation):
-        params_excitation = qml.numpy.array(params_excitation)
-        grad = get_gradient(circuit_sd)(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state)[0]
-        return grad
-
-    def jac_exc(v, theta_opt=theta_opt, full_grad=jac_sd):
-        # gradient on SingleExcitation + DoubleExcitation parameter part
-        params = qml.numpy.zeros(len(theta_opt) + len(v))
-        params[:len(theta_opt)] = theta_opt
-        params[len(theta_opt):] = v
-        fg = full_grad(params)
-        grad = fg[len(theta_opt):]
-        return grad
-
-    def hessian_vector_product(v, grad, theta, h):
+    def hvp(self, v, h=1e-6):
+        def grad(x):
+            return get_gradient(self.circuit_exc, argnum=1)(self.theta, x, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
         hvp = np.zeros_like(v)
         if len(v.shape) == 1:
-            hvp = (grad(theta+h*v) - grad(theta-h*v)) / (2*h)
+            hvp = (grad(h*v) - grad(-h*v)) / (2*h)
         elif len(v.shape) == 2:
             for i in range(v.shape[1]):
-                hvp[:, i] =  (grad(theta+h*v[:,i]) - grad(theta-h*v[:,i])) / (2*h)
+                hvp[:, i] =  (grad(h*v[:,i]) - grad(-h*v[:,i])) / (2*h)
         else:
             raise ValueError
         return hvp
 
-    num_params = max(parameter_map[len(parameter_map)-1][0]) + 1
-    dim = num_params
-    hvp = functools.partial(hessian_vector_product, grad=jac_exc, theta=qml.numpy.zeros(dim), h=h)
-    return hvp
+    def hess_diag_approximate(self):
+        orbital_energies = self.mf.mo_energy
+        e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
+        hdiag = np.zeros(self.num_params)
+        for idx, (i,a) in enumerate(self.singles):
+            for k, factor in zip(*self.parameter_map[idx]):
+                hdiag[k] += abs(factor)*(e[a] - e[i])
+        for idx, (i,j,a,b) in enumerate(self.doubles):
+            for k, factor in zip(*self.parameter_map[len(self.singles) + idx]):
+                hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
+        return hdiag
 
-def uccsd_spin_squared(symbols, geometry, charge, theta_opt, v, basis=None):
-    if basis is None:
-        basis = 'STO-3G'
-    H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
+    def property_gradient(self, integral_label):
+        ao_integrals = self.m.intor(integral_label)
+        # integral with single component
+        if len(ao_integrals.shape) == 2:
+            ao_integrals = ao_integrals.reshape(1, ao_integrals.shape)
+        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+        operator_gradients = []
+        for component in mo_integrals:
+            # skip null operator
+            if np.allclose(component, 0.0):
+                operator_gradients.append(np.zeros_like(self.theta))
+                continue
+            operator = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), component))
 
-    electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+            @qml.qnode(self.device, diff_method="adjoint")
+            def circuit_operator(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
+                UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
+                return qml.expval(operator)
 
-    hf_state = qml.qchem.hf_state(electrons, qubits)
-    singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-    s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
-
-    params = qml.numpy.zeros(len(theta_opt) + len(v))
-    params[:len(theta_opt)] = theta_opt
-    params[len(theta_opt):] = v
-
-    dev = qml.device("lightning.qubit", wires=qubits)
-
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit(params, wires, s_wires, d_wires, parameter_map, hf_state, electrons, qubits):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(qml.qchem.spin2(electrons, qubits))
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuitz(params, wires, s_wires, d_wires, parameter_map, hf_state, electrons, qubits):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(qml.qchem.spinz(qubits))
-    
-    return circuit(params, range(qubits), s_wires, d_wires, parameter_map, hf_state, electrons, qubits)
-
-def uccsd_dipole_property_gradient(symbols, geometry, charge, theta_opt, basis=None):
-    if basis is None:
-        basis = 'STO-3G'
-    H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
-
-    electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
-
-    hf_state = qml.qchem.hf_state(electrons, qubits)
-    singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-    s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
-
-    dev = qml.device("lightning.qubit", wires=qubits)
-    atom_str = ''
-    for symbol, coord in zip(symbols, geometry):
-        atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
-        print(atom_str)
-    m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
-    mf = pyscf.scf.RHF(m)
-    mf.kernel()
-    mo_dipole_integrals = np.einsum('uj,xuv,vi->xij', mf.mo_coeff, m.intor('int1e_r'), mf.mo_coeff)
-    try:
-        dipole_x = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), mo_dipole_integrals[0]))
-    except IndexError:
-        dipole_x = None
-        gradx = None
-    try:
-        dipole_y = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), mo_dipole_integrals[1]))
-    except IndexError:
-        dipole_y = None
-        grady = None
-    try:
-        dipole_z = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), mo_dipole_integrals[2]))
-    except IndexError:
-        dipole_z = None
-        gradz = None
-
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit_dipole_x(params, wires, s_wires, d_wires, parameter_map, hf_state):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(dipole_x)
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit_dipole_y(params, wires, s_wires, d_wires, parameter_map, hf_state):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(dipole_y)
-    @qml.qnode(dev, diff_method="adjoint")
-    def circuit_dipole_z(params, wires, s_wires, d_wires, parameter_map, hf_state):
-        UCCSD_exc(params, wires, s_wires, d_wires, parameter_map, hf_state)
-        return qml.expval(dipole_z)
-
-    params_excitation = qml.numpy.zeros(len(theta_opt)*2)
-    params_excitation[:len(theta_opt)] = theta_opt
-    if dipole_x:
-        print('X:', circuit_dipole_x(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state))
-        gradx = get_gradient(circuit_dipole_x)(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state)[0]
-        gradx = gradx[len(theta_opt):]
-    if dipole_y:
-        print('Y:', circuit_dipole_y(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state))
-        grady = get_gradient(circuit_dipole_y)(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state)[0]
-        grady = grady[len(theta_opt):]
-    if dipole_z:
-        print('Z:', circuit_dipole_z(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state))
-        gradz = get_gradient(circuit_dipole_z)(params_excitation, range(qubits), s_wires, d_wires, parameter_map, hf_state)[0]
-        gradz = gradz[len(theta_opt):]
-
-    return gradx, grady, gradz
-
-def hess_diag_approximate(symbols, geometry, charge, basis=None):
-    if basis is None:
-        basis = 'STO-3G'
-    electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
-    H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
-    singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-    mol = qml.qchem.Molecule(symbols, geometry, basis_name=basis, charge=charge)
-    scf = qml.qchem.hartree_fock.scf(mol)
-    orbital_energies = scf()[0]
-    e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
-    num_params = max(parameter_map[len(parameter_map)-1][0]) + 1
-    hdiag = np.zeros(num_params)
-    for idx, (i,a) in enumerate(singles):
-        for k, factor in zip(*parameter_map[idx]):
-            hdiag[k] += abs(factor*(e[a] - e[i]))
-    for idx, (i,j,a,b) in enumerate(doubles):
-        for k, factor in zip(*parameter_map[len(singles) + idx]):
-            hdiag[k] += abs(factor*(e[a] + e[b] - e[i] - e[j]))
-    print(hdiag)
-    return hdiag
+            operator_gradient = get_gradient(circuit_operator, argnum=1)(self.theta, qml.numpy.zeros_like(self.theta), range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+            operator_gradients.append(operator_gradient)
+        return np.array(operator_gradients)
