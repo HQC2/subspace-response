@@ -95,8 +95,8 @@ def davidson_liu_response(hvp, property_gradient, omega, hdiag, roots, tol=1e-3)
         AV = np.hstack([AV, hvp(new_vs)])
     raise ValueError('Convergence not reached')
 
-def cg(A,b, maxiter=1000, tol=1e-5, verbose=False):
-    if np.allclose(b, 0.0):
+def cg(A,b, maxiter=1000, tol=1e-5, omega=None, verbose=False):
+    if np.allclose(b, 0.0, atol=1e-20):
         return b
     if isinstance(A, np.ndarray):
         matvec = lambda v: A@v
@@ -104,6 +104,8 @@ def cg(A,b, maxiter=1000, tol=1e-5, verbose=False):
         matvec = A
     else:
         raise ValueError
+    if omega is not None:
+        I = omega*np.ones(len(b))
     residual = np.copy(b)
     residual_norm = np.dot(residual,residual)
     x = np.zeros_like(b)
@@ -111,6 +113,8 @@ def cg(A,b, maxiter=1000, tol=1e-5, verbose=False):
     direction[:] = residual[:]
     for i in range(maxiter):
         product = matvec(direction)
+        if omega is not None:
+            product -= I*direction
         gamma = residual_norm / np.dot(direction, product)
         x += gamma * direction
         residual_norm_old = residual_norm
