@@ -99,17 +99,52 @@ class uccsd(object):
                 hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
         return hdiag
 
-    def property_gradient(self, integral_label):
-        ao_integrals = self.m.intor(integral_label)
+    def expectation_value(self, integral):
+        if isinstance(integral, str):
+            ao_integrals = self.m.intor(integral)
+        elif isinstance(integral, np.ndarray):
+            ao_integrals = integral
+        else:
+            raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
         # integral with single component
         if len(ao_integrals.shape) == 2:
-            ao_integrals = ao_integrals.reshape(1, ao_integrals.shape)
+            ao_integrals = ao_integrals.reshape(1, *ao_integrals.shape)
+        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+        expectation_values = []
+        for component in mo_integrals:
+            # skip null operator
+            if np.allclose(component, 0.0):
+                expectation_values.append(0.0)
+                print('Skipping null operator')
+                continue
+            operator = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), component))
+
+            @qml.qnode(self.device, diff_method="adjoint")
+            def circuit_operator(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
+                UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
+                return qml.expval(operator)
+
+            expectation_values.append(circuit_operator(self.theta, qml.numpy.zeros_like(self.theta), range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state))
+
+        return np.array(expectation_values)
+
+    def property_gradient(self, integral):
+        if isinstance(integral, str):
+            ao_integrals = self.m.intor(integral)
+        elif isinstance(integral, np.ndarray):
+            ao_integrals = integral
+        else:
+            raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
+        # integral with single component
+        if len(ao_integrals.shape) == 2:
+            ao_integrals = ao_integrals.reshape(1, *ao_integrals.shape)
         mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
         operator_gradients = []
         for component in mo_integrals:
             # skip null operator
             if np.allclose(component, 0.0):
                 operator_gradients.append(np.zeros_like(self.theta))
+                print('Null integral skipped in property gradient')
                 continue
             operator = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), component))
 
