@@ -114,14 +114,19 @@ def cg(A,b, maxiter=1000, tol=1e-5, omega=None, gamma=None, verbose=False):
     direction = np.zeros_like(residual)
     direction[:] = residual[:]
     for i in range(maxiter):
-        product = matvec(direction)
+        if np.allclose(direction.imag, 0.):
+            product = matvec(direction)
+        else:
+            product_real = matvec(direction.real)
+            product_imag = matvec(direction.imag)
+            product = product_real - 1j*product_imag
         if omega is not None:
             product = product - I*direction
-        gamma = residual_norm / np.dot(direction, product)
+        gamma = residual_norm / np.dot(direction.conj(), product)
         x = x + gamma * direction
         residual_norm_old = residual_norm
         residual = residual - gamma * product
-        residual_norm = np.dot(residual, residual)
+        residual_norm = np.dot(residual.conj(), residual)
         if verbose:
             print(i, np.sqrt(residual_norm))
         if residual_norm < tol**2:
