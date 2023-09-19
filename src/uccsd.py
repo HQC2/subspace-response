@@ -11,12 +11,12 @@ import functools
 from uccsd_circuits import UCCSD, UCCSD_exc
 import pyscf
 import excitations
-import time
-
+import h5py
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis):
         H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
+        hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
         hf_state = qml.qchem.hf_state(electrons, qubits)
         hf_state.requires_grad = False
@@ -55,7 +55,9 @@ class uccsd(object):
             print(atom_str)
         m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
         mf = pyscf.scf.RHF(m)
-        mf.kernel()
+        with h5py.File(hf_filename, 'r') as f:
+            mf.mo_coeff = f['canonical_orbitals'][()]
+            mf.mo_energy = f['orbital_energies'][()]
         self.m = m
         self.mf = mf
 
