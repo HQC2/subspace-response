@@ -27,7 +27,7 @@ class UCCSD(Operation):
     grad_method = None
 
     def __init__(
-        self, weights, wires, s_wires, d_wires, parameter_map, init_state, do_queue=True, id=None
+        self, weights, wires, s_wires, d_wires, parameter_map, init_state, id=None
     ):
         if (not s_wires) and (not d_wires):
             raise ValueError(
@@ -49,7 +49,7 @@ class UCCSD(Operation):
         self._hyperparameters = {"init_state": init_state, "s_wires": s_wires, "d_wires": d_wires,
                 "parameter_map": parameter_map}
 
-        super().__init__(weights, wires=wires, do_queue=do_queue, id=id)
+        super().__init__(weights, wires=wires, id=id)
 
     @property
     def num_params(self):
@@ -84,7 +84,7 @@ class UCCSD_exc(Operation):
     grad_method = None
 
     def __init__(
-        self, weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state, do_queue=True, id=None
+        self, weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state, id=None
     ):
         if (not s_wires) and (not d_wires):
             raise ValueError(
@@ -105,7 +105,7 @@ class UCCSD_exc(Operation):
         self._hyperparameters = {"init_state": init_state, "s_wires": s_wires, "d_wires": d_wires,
                 "parameter_map": parameter_map}
 
-        super().__init__(weights_ground_state, weights_excitation, wires=wires, do_queue=do_queue, id=id)
+        super().__init__(weights_ground_state, weights_excitation, wires=wires, id=id)
 
     @property
     def num_params(self):
