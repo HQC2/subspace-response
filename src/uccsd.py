@@ -7,15 +7,24 @@ import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
 import periodictable
-import functools
 from uccsd_circuits import UCCSD, UCCSD_exc
 import pyscf
 import excitations
-import time
+from importlib import import_module
+from sys import argv
+from pennylane.fermi import FermiSentence, FermiWord
+from pennylane.pauli.utils import simplify
 
 
 class uccsd(object):
-    def __init__(self, symbols, geometry, charge, basis):
+    def __init__(self):
+        # import molecule
+        mol = import_module(argv[1][:-3])
+        symbols = mol.symbols
+        geometry = mol.geometry
+        charge = mol.charge
+        basis = mol.basis
+
         H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
         hf_state = qml.qchem.hf_state(electrons, qubits)
@@ -139,6 +148,7 @@ class uccsd(object):
         if len(ao_integrals.shape) == 2:
             ao_integrals = ao_integrals.reshape(1, *ao_integrals.shape)
         mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+        print("\nmo integrals:\n", mo_integrals)
         operator_gradients = []
         for component in mo_integrals:
             # skip null operator
@@ -146,9 +156,12 @@ class uccsd(object):
                 operator_gradients.append(np.zeros_like(self.theta))
                 print('Null integral skipped in property gradient')
                 continue
-            operator = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), component))
+            o_ferm = qml.qchem.fermionic_observable(np.array([0.0]), component)
+            
+            operator = qml.qchem.qubit_observable(o_ferm)
+            print('\noperator:\n',operator)
 
-            @qml.qnode(self.device, diff_method="adjoint")
+            @qml.qnode(self.device, diff_method="finite-diff")
             def circuit_operator(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
                 UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
                 return qml.expval(operator)
