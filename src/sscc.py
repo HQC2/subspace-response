@@ -53,7 +53,6 @@ def dso_integral(mol, orig1, orig2):
     mat  = pmol.intor(mol._add_suffix('int3c1e_iprinv'), comp=3,
                       shls_slice=(mol.nbas, pmol.nbas, 0, mol.nbas, 0, mol.nbas))
     mat += mat1.transpose(0,3,1,2) + mat1.transpose(0,3,2,1)
-    print(mat.shape)
     return mat
 
 def _atom_gyro_list(mol):
@@ -69,14 +68,20 @@ def _atom_gyro_list(mol):
             gyro.append(get_nuc_g_factor(symb))
     return numpy.array(gyro)
 
-
-# def dso(mol, dm0, nuc_pair):
-#     ssc_dia = []
-#     for (i,j) in nuc_pair:
-#         h11 = dso_integral(mol, mol.atom_coord(i), mol.atom_coord(j))
-#         a11 = -numpy.einsum('xyij,ji->xy', h11, dm0)
-#         a11 = a11 - a11.trace() * numpy.eye(3)
-#         ssc_dia.append(a11)
+def convert_unit(e11):
+    # unit conversions
+    e11 = e11*nist.ALPHA**4
+    nuc_magneton = .5 * (nist.E_MASS/nist.PROTON_MASS)  # e*hbar/2m
+    au2Hz = nist.HARTREE2J / nist.PLANCK
+    unit = au2Hz * nuc_magneton ** 2
+    iso_ssc = unit * numpy.einsum('kii->k', e11) / 3
+    natm = ucc.m.natm
+    ktensor = numpy.zeros((natm,natm))
+    for k, (i, j) in enumerate(nuc_pair):
+        ktensor[i,j] = ktensor[j,i] = iso_ssc[k]
+    gyro = _atom_gyro_list(ucc.m)
+    jtensor = numpy.einsum('ij,i,j->ij', ktensor, gyro, gyro)
+    return jtensor
 
 ucc = uccsd.uccsd(symbols, geometry, charge, basis)
 theta = np.array([-1.35066821e-16, -4.54632328e-17, -4.86482370e-17, -1.42047871e-16,
@@ -86,27 +91,26 @@ theta = np.array([-1.35066821e-16, -4.54632328e-17, -4.86482370e-17, -1.42047871
 ucc.theta = theta
 ucc.ground_state()
 
-nuc_pair = [[0,1]]
+nuc_pair = [(i,j) for i in range(ucc.m.natm) for j in range(i)]
+print(nuc_pair)
 # SSCC - DSO (expectation value)
 ssc_dia = []
-print('DSO:')
 for (i,j) in nuc_pair:
     dso_ao = dso_integral(ucc.m, ucc.m.atom_coord(i), ucc.m.atom_coord(j)).reshape(9, *ucc.mf.mo_coeff.shape)
     a11 = -ucc.expectation_value(dso_ao).reshape(3,3)
     a11 = a11 - a11.trace() * np.eye(3)
     ssc_dia.append(a11)
-e11 = np.array(ssc_dia)*nist.ALPHA**4
+e11_dso = np.array(ssc_dia)
 
 # SSCC - PSO (response)
 h1 = []
 d1 = []
-print('PSO:')
 for ia in range(ucc.m.natm):
     ucc.m.set_rinv_origin(ucc.m.atom_coord(ia))
 
-    h1ao = -ucc.m.intor_asymmetric('int1e_prinvxp', 3)
+    h1ao = ucc.m.intor_asymmetric('int1e_prinvxp', 3)
     print('AO integral', h1ao)
-    property_gradient = ucc.property_gradient(h1ao, imag=True)
+    property_gradient = ucc.property_gradient(h1ao, approach='statevector')
     print('Property gradient', property_gradient)
     h1.append(property_gradient)
     d = []
@@ -114,22 +118,18 @@ for ia in range(ucc.m.natm):
         d.append(solvers.cg(ucc.hvp, pg, verbose=True))
     d1.append(d)
 
+e11_pso = np.zeros_like(e11_dso)
 for k, (i,j) in enumerate(nuc_pair):
-    e11[k] = np.einsum('xi,yi->xy', d1[i], h1[j])
+    e11_pso[k] = -np.einsum('xi,yi->xy', d1[i], h1[j]) # minus because imag
 
 # SSCC - FC + SD (response)
 #...
 
+j_tensor_dso = convert_unit(e11_dso)
+j_tensor_pso = convert_unit(e11_pso)
+#j_tensor_fcsd = convert_unit(e11_fcsd)
+j_tensor_total = j_tensor_dso + j_tensor_pso # + j_tensor_fcsd
 
-# unit conversions
-nuc_magneton = .5 * (nist.E_MASS/nist.PROTON_MASS)  # e*hbar/2m
-au2Hz = nist.HARTREE2J / nist.PLANCK
-unit = au2Hz * nuc_magneton ** 2
-iso_ssc = unit * numpy.einsum('kii->k', e11) / 3
-natm = ucc.m.natm
-ktensor = numpy.zeros((natm,natm))
-for k, (i, j) in enumerate(nuc_pair):
-    ktensor[i,j] = ktensor[j,i] = iso_ssc[k]
-gyro = _atom_gyro_list(ucc.m)
-jtensor = numpy.einsum('ij,i,j->ij', ktensor, gyro, gyro)
-print(jtensor)
+print('SSCC (in Hz):')
+for (i,j) in nuc_pair:
+    print(f'{i} {j}: DSO={j_tensor_dso[i,j]:.3f}, PSO={j_tensor_pso[i,j]:.3f}, Total={j_tensor_total[i,j]:.3f}')
