@@ -130,7 +130,7 @@ class uccsd(object):
 
         return np.array(expectation_values)
 
-    def property_gradient(self, integral):
+    def property_gradient(self, integral, approach='derivative'):
         if isinstance(integral, str):
             ao_integrals = self.m.intor(integral)
         elif isinstance(integral, np.ndarray):
@@ -148,13 +148,43 @@ class uccsd(object):
                 operator_gradients.append(np.zeros_like(self.theta))
                 print('Null integral skipped in property gradient')
                 continue
-            operator = qml.qchem.qubit_observable(qml.qchem.fermionic_observable(np.array([0.0]), component))
 
-            @qml.qnode(self.device, diff_method="adjoint")
-            def circuit_operator(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
-                UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
-                return qml.expval(operator)
+            operator = 0.0
+            for p in range(self.m.nao):
+                for q in range(self.m.nao):
+                    operator += component[p,q] * qml.FermiC(2*p) * qml.FermiA(2*q)
+                    operator += component[p,q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+            operator = qml.jordan_wigner(operator)
 
-            operator_gradient = get_gradient(circuit_operator, argnum=1)(self.theta, qml.numpy.zeros_like(self.theta), range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
-            operator_gradients.append(operator_gradient)
+            if approach == 'derivative':
+                @qml.qnode(self.device, diff_method="adjoint")
+                def circuit_operator(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
+                    UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
+                    return qml.expval(operator)
+
+                operator_gradient = get_gradient(circuit_operator, argnum=1)(self.theta, qml.numpy.zeros_like(self.theta), range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                operator_gradients.append(operator_gradient)
+            elif approach == 'statevector':
+                operator_matrix = operator.matrix()
+
+                @qml.qnode(self.device, diff_method="best")
+                def circuit_state(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state):
+                    UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
+                    return qml.state()
+
+                operator_gradient = np.zeros(len(self.theta), dtype=np.complex128)
+                theta_excitation = qml.numpy.zeros_like(self.theta)
+                state_0 = circuit_state(self.theta, theta_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                h = 1e-3
+                for i in range(len(self.theta)):
+                    theta_excitation[i] = h
+                    state_plus = circuit_state(self.theta, theta_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                    theta_excitation[i] = -h
+                    state_minus = circuit_state(self.theta, theta_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                    theta_excitation[i] = 0.
+                    diff_state = (state_plus - state_minus)/(2*h)
+                    operator_gradient[i] = 2*diff_state.conj() @ operator_matrix @ state_0
+                operator_gradients.append(operator_gradient)
+            else:
+                raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients)
