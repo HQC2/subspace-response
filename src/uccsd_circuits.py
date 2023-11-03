@@ -76,7 +76,7 @@ class UCCSD(Operation):
             for idx, factor in zip(*parameter_map[i]):
                 weight += factor * weights[idx]
             op_list.append(qml.FermionicSingleExcitation(weight, wires=s_wires_))
-
+        
         return op_list
 
 class UCCSD_exc(Operation):
@@ -84,7 +84,8 @@ class UCCSD_exc(Operation):
     grad_method = None
 
     def __init__(
-        self, weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state, id=None
+        self, weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state, id=None,
+        s_wires_triplet=None, d_wires_triplet=None, parameter_map_triplet=None,
     ):
         if (not s_wires) and (not d_wires):
             raise ValueError(
@@ -103,7 +104,8 @@ class UCCSD_exc(Operation):
             raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
 
         self._hyperparameters = {"init_state": init_state, "s_wires": s_wires, "d_wires": d_wires,
-                "parameter_map": parameter_map}
+                                 "parameter_map": parameter_map, "s_wires_triplet": s_wires_triplet,
+                                 "d_wires_triplet": d_wires_triplet, "parameter_map_triplet": parameter_map_triplet}
 
         super().__init__(weights_ground_state, weights_excitation, wires=wires, id=id)
 
@@ -113,21 +115,35 @@ class UCCSD_exc(Operation):
 
     @staticmethod
     def compute_decomposition(
-        weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state
+        weights_ground_state, weights_excitation, wires, s_wires, d_wires, parameter_map, init_state,
+        s_wires_triplet=None, d_wires_triplet=None, parameter_map_triplet=None,
     ):  # pylint: disable=arguments-differ
         op_list = []
         op_list.append(BasisState(init_state, wires=wires))
         
-        for i, (w1, w2) in enumerate(d_wires):
-            weight = 0.0
-            for idx, factor in zip(*parameter_map[len(s_wires) + i]):
-                weight += factor * weights_excitation[idx]
-            op_list.append(qml.FermionicDoubleExcitation(weight, wires1=w1, wires2=w2))
-        for i, s_wires_ in enumerate(s_wires):
-            weight = 0.0
-            for idx, factor in zip(*parameter_map[i]):
-                weight += factor * weights_excitation[idx]
-            op_list.append(qml.FermionicSingleExcitation(weight, wires=s_wires_))
+
+        if parameter_map_triplet is not None:
+            for i, (w1, w2) in enumerate(d_wires_triplet):
+                weight = 0.0
+                for idx, factor in zip(*parameter_map_triplet[len(s_wires_triplet) + i]):
+                    weight += factor * weights_excitation[idx]
+                op_list.append(qml.FermionicDoubleExcitation(weight, wires1=w1, wires2=w2))
+            for i, s_wires_ in enumerate(s_wires_triplet):
+                weight = 0.0
+                for idx, factor in zip(*parameter_map_triplet[i]):
+                    weight += factor * weights_excitation[idx]
+                op_list.append(qml.FermionicSingleExcitation(weight, wires=s_wires_))
+        else:
+            for i, (w1, w2) in enumerate(d_wires):
+                weight = 0.0
+                for idx, factor in zip(*parameter_map[len(s_wires) + i]):
+                    weight += factor * weights_excitation[idx]
+                op_list.append(qml.FermionicDoubleExcitation(weight, wires1=w1, wires2=w2))
+            for i, s_wires_ in enumerate(s_wires):
+                weight = 0.0
+                for idx, factor in zip(*parameter_map[i]):
+                    weight += factor * weights_excitation[idx]
+                op_list.append(qml.FermionicSingleExcitation(weight, wires=s_wires_))
 
         for i, (w1, w2) in enumerate(d_wires):
             weight = 0.0

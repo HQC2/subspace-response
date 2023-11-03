@@ -21,7 +21,9 @@ class uccsd(object):
         hf_state = qml.qchem.hf_state(electrons, qubits)
         hf_state.requires_grad = False
         singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
+        singles_triplet, doubles_triplet, parameter_map_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
         s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
+        s_wires_triplet, d_wires_triplet = qml.qchem.excitations_to_wires(singles_triplet, doubles_triplet)
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
@@ -34,6 +36,11 @@ class uccsd(object):
             UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state)
             return qml.expval(H)
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_exc_triplet(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state, s_wires_triplet, d_wires_triplet, parameter_map_triplet):
+            UCCSD_exc(params_ground_state, params_excitation, wires, s_wires, d_wires, parameter_map, hf_state, s_wires_triplet=s_wires_triplet, d_wires_triplet=d_wires_triplet, parameter_map_triplet=parameter_map_triplet)
+            return qml.expval(H)
+
         self.H = H
         self.qubits = qubits
         self.electrons = electrons
@@ -42,12 +49,19 @@ class uccsd(object):
         self.doubles = doubles
         self.parameter_map = parameter_map
         self.num_params = max(self.parameter_map[len(self.parameter_map)-1][0]) + 1
+        self.singles_triplet = singles_triplet
+        self.doubles_triplet = doubles_triplet
+        self.parameter_map_triplet = parameter_map_triplet
+        self.num_params_triplet = max(self.parameter_map_triplet[len(self.parameter_map_triplet)-1][0]) + 1
         self.theta = qml.numpy.zeros(self.num_params)
         self.s_wires = s_wires
         self.d_wires = d_wires
+        self.s_wires_triplet = s_wires_triplet
+        self.d_wires_triplet = d_wires_triplet
         self.device = dev
         self.circuit = circuit
         self.circuit_exc = circuit_exc
+        self.circuit_exc_triplet = circuit_exc_triplet
 
         atom_str = ''
         for symbol, coord in zip(symbols, geometry):
@@ -89,16 +103,40 @@ class uccsd(object):
             raise ValueError
         return hvp
 
-    def hess_diag_approximate(self):
+    def hvp_triplet(self, v, h=1e-6):
+        print(v)
+        print(self.parameter_map_triplet)
+        def grad(x):
+            return get_gradient(self.circuit_exc_triplet, argnum=1)(self.theta, x, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state, s_wires_triplet=self.s_wires_triplet, d_wires_triplet=self.d_wires_triplet, parameter_map_triplet=self.parameter_map_triplet)
+        hvp = np.zeros_like(v)
+        if len(v.shape) == 1:
+            hvp = (grad(h*v) - grad(-h*v)) / (2*h)
+        elif len(v.shape) == 2:
+            for i in range(v.shape[1]):
+                hvp[:, i] =  (grad(h*v[:,i]) - grad(-h*v[:,i])) / (2*h)
+        else:
+            raise ValueError
+        return hvp
+
+    def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
         e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
-        hdiag = np.zeros(self.num_params)
-        for idx, (i,a) in enumerate(self.singles):
-            for k, factor in zip(*self.parameter_map[idx]):
-                hdiag[k] += abs(factor)*(e[a] - e[i])
-        for idx, (i,j,a,b) in enumerate(self.doubles):
-            for k, factor in zip(*self.parameter_map[len(self.singles) + idx]):
-                hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
+        if triplet:
+            hdiag = np.zeros(self.num_params_triplet)
+            for idx, (i,a) in enumerate(self.singles_triplet):
+                for k, factor in zip(*self.parameter_map_triplet[idx]):
+                    hdiag[k] += abs(factor)*(e[a] - e[i])
+            for idx, (i,j,a,b) in enumerate(self.doubles_triplet):
+                for k, factor in zip(*self.parameter_map_triplet[len(self.singles_triplet) + idx]):
+                    hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
+        else:
+            hdiag = np.zeros(self.num_params)
+            for idx, (i,a) in enumerate(self.singles):
+                for k, factor in zip(*self.parameter_map[idx]):
+                    hdiag[k] += abs(factor)*(e[a] - e[i])
+            for idx, (i,j,a,b) in enumerate(self.doubles):
+                for k, factor in zip(*self.parameter_map[len(self.singles) + idx]):
+                    hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
         return hdiag
 
     def expectation_value(self, integral):
