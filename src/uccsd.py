@@ -169,9 +169,8 @@ class uccsd(object):
             ao_integrals = integral
         else:
             raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
-        # integral with single component
-        if len(ao_integrals.shape) == 2:
-            ao_integrals = ao_integrals.reshape(1, *ao_integrals.shape)
+        out_shape = ao_integrals.shape[:-2]
+        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
         mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
         expectation_values = []
         for component in mo_integrals:
@@ -189,7 +188,7 @@ class uccsd(object):
             operator = qml.jordan_wigner(operator)
 
             expectation_values.append(self.circuit_operator(self, self.theta, operator))
-        return np.array(expectation_values)
+        return np.array(expectation_values).reshape(out_shape)
 
     def property_gradient(self, integral, approach='derivative', triplet=False):
         if isinstance(integral, str):
@@ -198,15 +197,20 @@ class uccsd(object):
             ao_integrals = integral
         else:
             raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
-        # integral with single component
-        if len(ao_integrals.shape) == 2:
-            ao_integrals = ao_integrals.reshape(1, *ao_integrals.shape)
+        out_shape = ao_integrals.shape[:-2]
+        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
         mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
         operator_gradients = []
+        
+        if triplet:
+            parameter_excitation = qml.numpy.zeros(self.num_params_triplet)
+        else:
+            parameter_excitation = qml.numpy.zeros(self.num_params)
+
         for component in mo_integrals:
             # skip null operator
             if np.allclose(component, 0.0):
-                operator_gradients.append(np.zeros_like(self.theta))
+                operator_gradients.append(np.zeros_like(parameter_excitation))
                 print('Null integral skipped in property gradient')
                 continue
 
@@ -219,25 +223,24 @@ class uccsd(object):
             operator = qml.jordan_wigner(operator)
 
             if approach == 'derivative':
-                operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, qml.numpy.zeros_like(self.theta), operator, triplet=triplet)
+                operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
                 operator_matrix = operator.matrix()
 
 
-                operator_gradient = np.zeros(len(self.theta), dtype=np.complex128)
-                theta_excitation = qml.numpy.zeros_like(self.theta)
-                state_0 = self.circuit_state(self, self.theta, theta_excitation, triplet=triplet)
+                operator_gradient = np.zeros_like(parameter_excitation)
+                state_0 = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
                 h = 1e-3
-                for i in range(len(self.theta)):
-                    theta_excitation[i] = h
-                    state_plus = self.circuit_state(self, self.theta, theta_excitation, triplet=triplet)
-                    theta_excitation[i] = -h
-                    state_minus = self.circuit_state(self, self.theta, theta_excitation, triplet=triplet)
-                    theta_excitation[i] = 0.
+                for i in range(len(parameter_excitation)):
+                    parameter_excitation[i] = h
+                    state_plus = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
+                    parameter_excitation[i] = -h
+                    state_minus = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
+                    parameter_excitation[i] = 0.
                     diff_state = (state_plus - state_minus)/(2*h)
                     operator_gradient[i] = 2*diff_state.conj() @ operator_matrix @ state_0
                 operator_gradients.append(operator_gradient)
             else:
                 raise ValueError('Invalid property gradient approach')
-        return np.array(operator_gradients)
+        return np.array(operator_gradients).reshape(*out_shape, -1)
