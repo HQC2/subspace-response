@@ -107,11 +107,8 @@ h1 = []
 d1 = []
 for ia in range(ucc.m.natm):
     ucc.m.set_rinv_origin(ucc.m.atom_coord(ia))
-
     h1ao = ucc.m.intor_asymmetric('int1e_prinvxp', 3)
-    print('AO integral', h1ao)
     property_gradient = ucc.property_gradient(h1ao, approach='statevector')
-    print('Property gradient', property_gradient)
     h1.append(property_gradient)
     d = []
     for pg in property_gradient:
@@ -123,13 +120,30 @@ for k, (i,j) in enumerate(nuc_pair):
     e11_pso[k] = -np.einsum('xi,yi->xy', d1[i], h1[j]) # minus because imag
 
 # SSCC - FC + SD (response)
-#...
+h1 = []
+d1 = []
+for ia in range(ucc.m.natm):
+    ucc.m.set_rinv_origin(ucc.m.atom_coord(ia))
+    a01p = 0.5*ucc.m.intor('int1e_sa01sp', 12).reshape(3,4,ucc.m.nao,ucc.m.nao)
+    h1ao = -(a01p[:,:3] + a01p[:,:3].transpose(0,1,3,2))
+    property_gradient = ucc.property_gradient(h1ao, triplet=True)
+    h1.append(property_gradient)
+    d = []
+    for pg in property_gradient.reshape(9, -1):
+        d.append(solvers.cg(ucc.hvp_triplet, pg, verbose=True))
+    d1.append(np.array(d).reshape(3,3, *property_gradient.shape[2:]))
+
+e11_fcsd = np.zeros_like(e11_dso)
+for k, (i,j) in enumerate(nuc_pair):
+    print(d1[i].shape, h1[j].shape)
+    e11_fcsd[k] = -np.einsum('xwi,ywi->xy', d1[i], h1[j])
+
 
 j_tensor_dso = convert_unit(e11_dso)
 j_tensor_pso = convert_unit(e11_pso)
-#j_tensor_fcsd = convert_unit(e11_fcsd)
-j_tensor_total = j_tensor_dso + j_tensor_pso # + j_tensor_fcsd
+j_tensor_fcsd = convert_unit(e11_fcsd)
+j_tensor_total = j_tensor_dso + j_tensor_pso + j_tensor_fcsd
 
 print('SSCC (in Hz):')
 for (i,j) in nuc_pair:
-    print(f'{i} {j}: DSO={j_tensor_dso[i,j]:.3f}, PSO={j_tensor_pso[i,j]:.3f}, Total={j_tensor_total[i,j]:.3f}')
+    print(f'{i} {j}: DSO={j_tensor_dso[i,j]:.3f}, PSO={j_tensor_pso[i,j]:.3f}, FCSD={j_tensor_fcsd[i,j]:.3f}, Total={j_tensor_total[i,j]:.3f}')
