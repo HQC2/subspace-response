@@ -21,4 +21,4 @@ ucc = uccsd.uccsd(symbols, geometry, charge, basis)
 ucc.ground_state()
 
 hdiag = ucc.hess_diag_approximate(triplet=True)
-w,v, dim = solvers.davidson_liu(ucc.hvp_triplet, hdiag, len(hdiag), tol=1e-3)
+w,v = solvers.davidson_liu(ucc.hvp_triplet, hdiag, len(hdiag), tol=1e-3)
