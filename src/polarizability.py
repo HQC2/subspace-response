@@ -6,30 +6,22 @@ import pennylane as qml
 import numpy as np
 
 
-symbols = ['H', 'H']#, 'H', 'H']
+symbols = ['Be', 'H', 'H']
 geometry = qml.numpy.array([
-[0.0000000000,   -0.0000000000,    0.0],
-[0.0000000000,   -0.0000000000,    2.0],
-#[1.5000000000,   -0.0000000000,    0.0],
-#[1.5000000000,   -0.0000000000,    2.0],
-                 ], requires_grad=False)
+[0.0,  0.0         ,  0.],
+[0., 0., 1.3517358726],
+[0., 0., -1.3517358726],
+                 ], requires_grad=False)*1.8897259886
 basis = 'STO-3G'
 charge = 0
 
 ucc = uccsd.uccsd(symbols, geometry, charge, basis)
-#theta = np.array([-1.35066821e-16, -4.54632328e-17, -4.86482370e-17, -1.42047871e-16,
-#  1.03048404e-01,  2.26491572e-16,  1.13066447e-16, -1.87589773e-01,
-# -5.11526101e-02,  4.97979006e-02,  3.49274247e-16,  2.14070553e-01,
-#  1.15892459e-16,  9.26284955e-02,])
-#ucc.theta = theta
+print(ucc.qubits)
 ucc.ground_state()
+hdiag = ucc.hess_diag_approximate()
 
 dipx, dipy, dipz = ucc.property_gradient('int1e_r')
-
-#resp_x = solvers.cg(ucc.hvp, dipx, verbose=True)
-#print(np.dot(resp_x, dipx))
-#resp_y = solvers.cg(ucc.hvp, dipy, verbose=True)
-#print(np.dot(resp_y, dipy))
-for omega in np.arange(0, 1.4, 0.01):
-    resp_z = solvers.cg(ucc.hvp, dipz, omega=omega, gamma=0.1, verbose=False)
-    print(omega, np.dot(resp_z, dipz).real, np.dot(resp_z, dipz).imag)
+resp_x, resp_y, resp_z = [solvers.davidson_response(ucc.hvp, dip, hdiag) for dip in [dipx, dipy, dipz]]
+print('alpha_xx', np.dot(dipx, resp_x).real)
+print('alpha_yy', np.dot(dipy, resp_y).real)
+print('alpha_zz', np.dot(dipz, resp_z).real)
