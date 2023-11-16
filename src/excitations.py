@@ -13,29 +13,11 @@ def spin_adapted_excitations(electrons, qubits, triplet=False):
                 for b in range(a, nbas):
                     space_doubles.append([i,j,a,b])
     # form spin-orbital excitations
-    singles = []
-    doubles = []
-    idx_parameter = 0
-    idx_excitation = 0
-    parameter_map = {}
+    excitations = []
+
     if not triplet:
-        # singlet
-        for k, single in enumerate(space_singles):
-            i, a = single
-            aa = [2*i, 2*a] 
-            bb = [2*i+1, 2*a+1]
-
-            w = 1.0
-
-            singles.append(aa)
-            parameter_map[idx_excitation] = [[idx_parameter], [w]]
-            idx_excitation += 1
-
-            singles.append(bb)
-            parameter_map[idx_excitation] = [[idx_parameter], [w]]
-            idx_excitation += 1
-            idx_parameter += 1
-
+        # singlet operators
+        # doubles
         for k, double in enumerate(space_doubles):
             i, j, a, b = double
             aaaa = [2*i, 2*j, 2*a, 2*b]
@@ -45,88 +27,31 @@ def spin_adapted_excitations(electrons, qubits, triplet=False):
             abba = [2*i, 2*j+1, 2*a+1, 2*b]
             baab = [2*i+1, 2*j, 2*a, 2*b+1]
 
-            
             if i==j and a == b:
                 #abab
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [np.sqrt(2)]]
-                idx_excitation += 1
-                idx_parameter += 1
+                excitations.append([[abab], [np.sqrt(2)]])
             elif i==j:
                 # => occupied in same spatial, so first index is ab
                 #abab + abba
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [-1]]
-                idx_excitation += 1
-                idx_parameter += 1
+                excitations.append([[abab, abba], [1, -1]])
             elif a==b:
                 #abab + baab
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [-1]]
-                idx_excitation += 1
-                idx_parameter += 1
+                excitations.append([[abab, baab], [1, -1]])
             else:
                 # R(1)
                 wR1 = 0.5 * np.sqrt(2)
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR1]]
-                idx_excitation += 1
-                doubles.append(baba)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR1]]
-                idx_excitation += 1
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wR1]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wR1]]
-                idx_excitation += 1
-                idx_parameter += 1
-
+                excitations.append([[abab, baba, baab, abba], [wR1, wR1, -wR1, -wR1]])
                 # R(2)
                 wR2 = 1/(2*np.sqrt(3)) * np.sqrt(2)
-                doubles.append(aaaa)
-                parameter_map[idx_excitation] = [[idx_parameter], [2*wR2]]
-                idx_excitation += 1
-                doubles.append(bbbb)
-                parameter_map[idx_excitation] = [[idx_parameter], [2*wR2]]
-                idx_excitation += 1
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR2]]
-                idx_excitation += 1
-                doubles.append(baba)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR2]]
-                idx_excitation += 1
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR2]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [wR2]]
-                idx_excitation += 1
-                idx_parameter += 1
-    else:
-        # triplet 
+                excitations.append([[aaaa, bbbb, abab, baba, baab, abba], [2*wR2, 2*wR2, wR2, wR2, wR2, wR2]])
+        # singles
         for k, single in enumerate(space_singles):
             i, a = single
-            w = 1.0
             aa = [2*i, 2*a] 
             bb = [2*i+1, 2*a+1]
-
-
-            singles.append(aa)
-            parameter_map[idx_excitation] = [[idx_parameter], [w]]
-            idx_excitation += 1
-
-            singles.append(bb)
-            parameter_map[idx_excitation] = [[idx_parameter], [-w]]
-            idx_excitation += 1
-            idx_parameter += 1
+            excitations.append([[aa,bb], [1.0, 1.0]])
+    else:
+        # triplet 
         for k, double in enumerate(space_doubles):
             i, j, a, b = double
             aaaa = [2*i, 2*j, 2*a, 2*b]
@@ -140,63 +65,22 @@ def spin_adapted_excitations(electrons, qubits, triplet=False):
                 continue
             elif i==j:
                 # abab and abba
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-                idx_parameter += 1
+                excitations.append([[abab, abba], [1, 1]])
             elif a==b:
                 # abab and baab
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [1]]
-                idx_excitation += 1
-                idx_parameter += 1
+                excitations.append([[abab, baab], [1, 1]])
             else:
                 # T(1)
-                wT1 = 1
-                doubles.append(aaaa)
-                parameter_map[idx_excitation] = [[idx_parameter], [wT1]]
-                idx_excitation += 1
-                doubles.append(bbbb)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wT1]]
-                idx_excitation += 1
-                idx_parameter += 1
-
+                excitations.append([[aaaa, bbbb], [1, -1]])
                 # T(2)
                 wT2 =  0.5 * np.sqrt(2)
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wT2]]
-                idx_excitation += 1
-                doubles.append(baba)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wT2]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wT2]]
-                idx_excitation += 1
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wT2]]
-                idx_excitation += 1
-                idx_parameter += 1
-
+                excitations.append([[abab, baba, abba, baab], [wT2, -wT2, -wT2, wT2]])
                 # T(3)
-                wT3 =0.5 * np.sqrt(2)
-                doubles.append(abab)
-                parameter_map[idx_excitation] = [[idx_parameter], [wT3]]
-                idx_excitation += 1
-                doubles.append(baba)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wT3]]
-                idx_excitation += 1
-                doubles.append(abba)
-                parameter_map[idx_excitation] = [[idx_parameter], [wT3]]
-                idx_excitation += 1
-                doubles.append(baab)
-                parameter_map[idx_excitation] = [[idx_parameter], [-wT3]]
-                idx_excitation += 1
-                idx_parameter += 1
-        print(singles, doubles, parameter_map)
-    return singles, doubles, parameter_map
+                wT3 = 0.5 * np.sqrt(2)
+                excitations.append([[abab, baba, abba, baab], [wT2, -wT2, wT2, -wT2]])
+        for k, single in enumerate(space_singles):
+            i, a = single
+            aa = [2*i, 2*a] 
+            bb = [2*i+1, 2*a+1]
+            excitations.append([[aa, bb], [1, -1]])
+    return excitations

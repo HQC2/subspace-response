@@ -20,47 +20,45 @@ class uccsd(object):
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
         hf_state = qml.qchem.hf_state(electrons, qubits)
         hf_state.requires_grad = False
-        singles, doubles, parameter_map = excitations.spin_adapted_excitations(electrons, qubits)
-        singles_triplet, doubles_triplet, parameter_map_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
-        s_wires, d_wires = qml.qchem.excitations_to_wires(singles, doubles)
-        s_wires_triplet, d_wires_triplet = qml.qchem.excitations_to_wires(singles_triplet, doubles_triplet)
+        excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
+        excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit(self, params_ground_state):
-            UCCSD(params_ground_state, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_singlet, self.hf_state)
             return qml.expval(H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state,
-                          s_wires_triplet=self.s_wires_triplet, d_wires_triplet=self.d_wires_triplet, parameter_map_triplet=self.parameter_map_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
+                          excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
             return qml.expval(H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_operator(self, params_ground_state, operator):
-            UCCSD(params_ground_state, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_singlet, self.hf_state)
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state,
-                  s_wires_triplet=self.s_wires_triplet, d_wires_triplet=self.d_wires_triplet, parameter_map_triplet=self.parameter_map_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
+                  excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="best")
         def circuit_state(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state,
-                  s_wires_triplet=self.s_wires_triplet, d_wires_triplet=self.d_wires_triplet, parameter_map_triplet=self.parameter_map_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
+                  excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.s_wires, self.d_wires, self.parameter_map, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
             return qml.state()
 
 
@@ -68,19 +66,11 @@ class uccsd(object):
         self.qubits = qubits
         self.electrons = electrons
         self.hf_state = hf_state
-        self.singles = singles
-        self.doubles = doubles
-        self.parameter_map = parameter_map
-        self.num_params = max(self.parameter_map[len(self.parameter_map)-1][0]) + 1
-        self.singles_triplet = singles_triplet
-        self.doubles_triplet = doubles_triplet
-        self.parameter_map_triplet = parameter_map_triplet
-        self.num_params_triplet = max(self.parameter_map_triplet[len(self.parameter_map_triplet)-1][0]) + 1
+        self.excitations_singlet = excitations_singlet
+        self.num_params = len(excitations_singlet)
+        self.excitations_triplet = excitations_triplet
+        self.num_params_triplet = len(excitations_triplet)
         self.theta = qml.numpy.zeros(self.num_params)
-        self.s_wires = s_wires
-        self.d_wires = d_wires
-        self.s_wires_triplet = s_wires_triplet
-        self.d_wires_triplet = d_wires_triplet
         self.device = dev
         self.circuit = circuit
         self.circuit_operator = circuit_operator
@@ -144,22 +134,17 @@ class uccsd(object):
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
         e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
+        num_params = self.num_params
+        excitations = self.excitations_singlet
         if triplet:
-            hdiag = np.zeros(self.num_params_triplet)
-            for idx, (i,a) in enumerate(self.singles_triplet):
-                for k, factor in zip(*self.parameter_map_triplet[idx]):
-                    hdiag[k] += abs(factor)*(e[a] - e[i])
-            for idx, (i,j,a,b) in enumerate(self.doubles_triplet):
-                for k, factor in zip(*self.parameter_map_triplet[len(self.singles_triplet) + idx]):
-                    hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
-        else:
-            hdiag = np.zeros(self.num_params)
-            for idx, (i,a) in enumerate(self.singles):
-                for k, factor in zip(*self.parameter_map[idx]):
-                    hdiag[k] += abs(factor)*(e[a] - e[i])
-            for idx, (i,j,a,b) in enumerate(self.doubles):
-                for k, factor in zip(*self.parameter_map[len(self.singles) + idx]):
-                    hdiag[k] += abs(factor)*(e[a] + e[b] - e[i] - e[j])
+            num_params = self.num_params_triplet
+            excitations = self.excitations_triplet
+        hdiag = np.zeros(num_params)
+        for k, (excitation_group, weights) in enumerate(excitations):
+            first = excitation_group[0]
+            occ_indices = first[:len(first)//2]
+            vir_indices = first[len(first)//2:]
+            hdiag[k] = sum(e[vir_indices]) - sum(e[occ_indices])
         return hdiag
 
     def expectation_value(self, integral):
