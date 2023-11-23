@@ -12,6 +12,7 @@ from uccsd_circuits import UCCSD, UCCSD_exc
 import pyscf
 import excitations
 import h5py
+import copy
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis):
@@ -26,30 +27,32 @@ class uccsd(object):
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit(self, params_ground_state):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_singlet, self.hf_state)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
             return qml.expval(H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
                           excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
+                          excitations_singlet=self.excitations_singlet)
             return qml.expval(H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_operator(self, params_ground_state, operator):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_singlet, self.hf_state)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
                   excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
+                          excitations_singlet=self.excitations_singlet)
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="best")
@@ -58,7 +61,8 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
                   excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
+                          excitations_singlet=self.excitations_singlet)
             return qml.state()
 
 
@@ -67,10 +71,9 @@ class uccsd(object):
         self.electrons = electrons
         self.hf_state = hf_state
         self.excitations_singlet = excitations_singlet
-        self.num_params = len(excitations_singlet)
+        self.excitations_ground_state = copy.deepcopy(self.excitations_singlet)
         self.excitations_triplet = excitations_triplet
-        self.num_params_triplet = len(excitations_triplet)
-        self.theta = qml.numpy.zeros(self.num_params)
+        self.theta = qml.numpy.zeros(len(self.excitations_ground_state))
         self.device = dev
         self.circuit = circuit
         self.circuit_operator = circuit_operator
@@ -134,10 +137,10 @@ class uccsd(object):
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
         e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
-        num_params = self.num_params
+        num_params = len(self.excitations_singlet)
         excitations = self.excitations_singlet
         if triplet:
-            num_params = self.num_params_triplet
+            num_params = len(self.excitations_triplet)
             excitations = self.excitations_triplet
         hdiag = np.zeros(num_params)
         for k, (excitation_group, weights) in enumerate(excitations):
@@ -188,9 +191,9 @@ class uccsd(object):
         operator_gradients = []
         
         if triplet:
-            parameter_excitation = qml.numpy.zeros(self.num_params_triplet)
+            parameter_excitation = qml.numpy.zeros(len(self.excitations_triplet))
         else:
-            parameter_excitation = qml.numpy.zeros(self.num_params)
+            parameter_excitation = qml.numpy.zeros(len(self.excitations_singlet))
 
         for component in mo_integrals:
             # skip null operator

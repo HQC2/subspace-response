@@ -95,9 +95,9 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
     print('Not converged...')
     return x
 
-def davidson_response(A, b, hdiag, omega=None, gamma=None, n_init=1, tol=1e-4):
+def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, n_init=1, tol=1e-6, verbose=False):
     if np.allclose(b, 0.0, atol=1e-20):
-        return b
+        return b, history
        
     def matvec(v, A=A, omega=omega, gamma=gamma):
         if np.allclose(v.imag, 0.):
@@ -106,29 +106,45 @@ def davidson_response(A, b, hdiag, omega=None, gamma=None, n_init=1, tol=1e-4):
             Av_real = A(v.real)
             Av_imag = A(v.imag)
             Av = Av_real + 1j*Av_imag
-        I = np.ones(len(v))
-        if omega is not None:
-            Av = Av - omega*I*v
-        if gamma is not None:
-            Av = Av - 1j*gamma*I*v
         return Av
 
+    I = np.ones(len(hdiag))
+    S = np.zeros_like(I)
+    if omega is not None:
+        S = S - omega*I
+    if gamma is not None:
+        S = S - 1j*gamma*I
+
     diagonal_guess = b/hdiag
-    V = np.zeros((len(hdiag), n_init), dtype=np.complex128)
-    V[np.argsort(diagonal_guess)[:n_init], np.arange(n_init)] = 1.0
-    AV = np.zeros_like(V, dtype=np.complex128)
-    for i in range(n_init):
-        AV[:,i] = matvec(V[:,i])
+    if history is not None:
+        V = history['V']
+        AV = history['AV']
+        SV = np.zeros_like(V, dtype=np.complex128)
+        for i in range(V.shape[1]):
+            SV[:,i] = S*V[:,i]
+    else:
+        V = np.zeros((len(hdiag), n_init), dtype=np.complex128)
+        V[np.argsort(diagonal_guess)[:n_init], np.arange(n_init)] = 1.0
+        AV = np.zeros_like(V, dtype=np.complex128)
+        SV = np.zeros_like(V, dtype=np.complex128)
+        for i in range(n_init):
+            AV[:,i] = matvec(V[:,i])
+            SV[:,i] = S*V[:,i]
 
     bred = V.T@b
-
     for i in range(100):
-        S = V.T @ AV
-        xred = np.linalg.solve(S, bred)
+        Ered = V.T @ (AV - SV)
+        xred = np.linalg.solve(Ered, bred)
         x = xred @ V.T
-        residual = b - matvec(x)
+        residual = b - (xred @ AV.T - S*x)
+#       (equivalent to) 
+#       residual = b - (matvec(x) - S*x)
+        if verbose:
+            print(f'Iteration {i+1:3d} residual norm: {np.linalg.norm(residual):6e}')
         if np.linalg.norm(residual) < tol:
-            return x
+            history = {'V': V,
+                       'AV': AV}
+            return x, history
         delta = residual / (hdiag)
         delta = delta / np.linalg.norm(delta)
         vnew = delta - V@(V.T@delta)
@@ -136,4 +152,5 @@ def davidson_response(A, b, hdiag, omega=None, gamma=None, n_init=1, tol=1e-4):
         V = np.hstack([V, vnew[:,None]])
         bred = V.T@b
         AV = np.hstack([AV, matvec(vnew)[:,None]])
+        SV = np.hstack([SV, (S*vnew)[:,None]])
     raise ValueError('Not converged')

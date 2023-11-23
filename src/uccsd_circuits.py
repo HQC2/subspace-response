@@ -27,7 +27,7 @@ class UCCSD(Operation):
     grad_method = None
 
     def __init__(
-        self, weights, wires, excitations_singlet, init_state
+        self, weights, wires, excitations_ground_state, init_state
     ):
         shape = qml.math.shape(weights)
         init_state = qml.math.toarray(init_state)
@@ -35,7 +35,7 @@ class UCCSD(Operation):
         if init_state.dtype != np.dtype("int"):
             raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
 
-        self._hyperparameters = {"init_state": init_state, "excitations_singlet": excitations_singlet}
+        self._hyperparameters = {"init_state": init_state, "excitations_ground_state": excitations_ground_state}
         super().__init__(weights, wires=wires)
 
     @property
@@ -44,13 +44,13 @@ class UCCSD(Operation):
 
     @staticmethod
     def compute_decomposition(
-        weights, wires, excitations_singlet, init_state
+        weights, wires, excitations_ground_state, init_state
     ):  # pylint: disable=arguments-differ
         op_list = []
 
         op_list.append(BasisState(init_state, wires=wires))
 
-        for i, (excitations, excitation_weights) in enumerate(excitations_singlet):
+        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
             for excitation, excitation_weight in zip(excitations, excitation_weights):
                 if len(excitation) == 2:
                     r, p = excitation
@@ -70,13 +70,15 @@ class UCCSD_exc(Operation):
     grad_method = None
 
     def __init__(
-        self, weights_ground_state, weights_excitation, wires, excitations_singlet, init_state,
-        excitations_triplet=None,
+        self, weights_ground_state, weights_excitation, wires, excitations_ground_state, init_state,
+        excitations_singlet=None, excitations_triplet=None,
     ):
         if init_state.dtype != np.dtype("int"):
             raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
 
-        self._hyperparameters = {"init_state": init_state, "excitations_singlet":  excitations_singlet,
+        self._hyperparameters = {"init_state": init_state, 
+                                 "excitations_ground_state": excitations_ground_state,
+                                 "excitations_singlet": excitations_singlet,
                                  "excitations_triplet": excitations_triplet}
 
         super().__init__(weights_ground_state, weights_excitation, wires=wires)
@@ -87,16 +89,18 @@ class UCCSD_exc(Operation):
 
     @staticmethod
     def compute_decomposition(
-        weights_ground_state, weights_excitation, wires, excitations_singlet, init_state,
-        excitations_triplet=None,
+        weights_ground_state, weights_excitation, wires, excitations_ground_state, init_state,
+        excitations_singlet=None, excitations_triplet=None,
     ):  # pylint: disable=arguments-differ
         op_list = []
         op_list.append(BasisState(init_state, wires=wires))
 
         # excitation things
-        excitations = excitations_singlet
+        excitations = []
+        if excitations_singlet is not None:
+            excitations += excitations_singlet
         if excitations_triplet is not None:
-            excitations = excitations_triplet
+            excitations += excitations_triplet
         assert len(excitations) == len(weights_excitation)
         for i, (excitations, excitation_weights) in enumerate(excitations):
             for excitation, excitation_weight in zip(excitations, excitation_weights):
@@ -113,7 +117,7 @@ class UCCSD_exc(Operation):
                     raise ValueError
 
         # ground-state
-        for i, (excitations, excitation_weights) in enumerate(excitations_singlet):
+        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
             for excitation, excitation_weight in zip(excitations, excitation_weights):
                 if len(excitation) == 2:
                     r, p = excitation
