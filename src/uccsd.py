@@ -15,10 +15,13 @@ import h5py
 import copy
 
 class uccsd(object):
-    def __init__(self, symbols, geometry, charge, basis):
-        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis)
+    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
+        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis,
+                                                    active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        if active_electrons is not None:
+            electrons = active_electrons
         hf_state = qml.qchem.hf_state(electrons, qubits)
         hf_state.requires_grad = False
         excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
