@@ -1,16 +1,28 @@
 import numpy as np
 
-def spin_adapted_excitations(electrons, qubits, triplet=False):
+def spin_adapted_excitations(electrons, qubits, triplet=False, generalized=False):
     nocc = electrons // 2
     nbas = qubits // 2
     # form spatial excitation singles, doubles
     space_singles = []
     space_doubles = []
-    for i in range(nocc):
-        for a in range(nocc, nbas):
+    
+    occ_start = 0
+    occ_end = nocc
+    vir_start = nocc
+    vir_end = nbas
+    if generalized:
+        occ_end = nbas
+        vir_start = 0
+
+    for i in range(occ_start, occ_end):
+        for a in range(max(i+1, vir_start), vir_end):
             space_singles.append([i,a])
-            for j in range(i, nocc):
-                for b in range(a, nbas):
+    for i in range(occ_start, occ_end):
+        for j in range(i, occ_end):
+            for a in range(max(i, j, vir_start)+1, vir_end):
+                for b in range(a, vir_end):
+                    print(i,j,a,b)
                     space_doubles.append([i,j,a,b])
     # form spin-orbital excitations
     excitations = []
