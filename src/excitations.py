@@ -22,7 +22,6 @@ def spin_adapted_excitations(electrons, qubits, triplet=False, generalized=False
         for j in range(i, occ_end):
             for a in range(max(i, j, vir_start)+1, vir_end):
                 for b in range(a, vir_end):
-                    print(i,j,a,b)
                     space_doubles.append([i,j,a,b])
     # form spin-orbital excitations
     excitations = []
