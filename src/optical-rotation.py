@@ -55,7 +55,7 @@ mu_m = get_response_fct(dips_x,mags,num_imag=1,omega=omega,history=history)
 # Velocity Gauge: <<p,m>>
 p_m = get_response_fct(dips_p,mags,num_imag=2,omega=omega,history=history)
 
-# Modified velocity gauge, term 2: 
+# Modified velocity gauge, term 2: <<p,m>>_0
 p_m_0 = get_response_fct(dips_p,mags,num_imag=2,omega=0,history=history)
 
 print("Length gauge")
@@ -68,7 +68,16 @@ print("xx:", p_m[0])
 print("yy:", p_m[1])
 print("zz:", p_m[2])
 
-print("Velocity gauge, term 2:")
+print("Modified velocity gauge, term 2:")
 print("xx:", p_m_0[0])
 print("yy:", p_m_0[1])
 print("zz:", p_m_0[2])
+
+# Calculate G' 
+G_length   = - np.sum(mu_m) 
+G_velocity = - np.sum(p_m) / (omega)
+G_modveloc = G_velocity + np.sum(p_m_0) / (omega)
+
+print("G' length: ", G_length)
+print("G' velocity: ", G_velocity)
+print("G' modified velocity: ", G_modveloc)
