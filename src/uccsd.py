@@ -13,6 +13,7 @@ import pyscf
 import excitations
 import h5py
 import copy
+import solvers
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
@@ -138,20 +139,24 @@ class uccsd(object):
         return hvp
 
     def hess_diag_approximate(self, triplet=False):
-        orbital_energies = self.mf.mo_energy
-        e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
-        num_params = len(self.excitations_singlet)
-        excitations = self.excitations_singlet
-        if triplet:
-            num_params = len(self.excitations_triplet)
-            excitations = self.excitations_triplet
-        hdiag = np.zeros(num_params)
-        for k, (excitation_group, weights) in enumerate(excitations):
-            first = excitation_group[0]
-            occ_indices = first[:len(first)//2]
-            vir_indices = first[len(first)//2:]
-            hdiag[k] = sum(e[vir_indices]) - sum(e[occ_indices])
-        return hdiag
+        if not hasattr(self,"hdiag"):
+            orbital_energies = self.mf.mo_energy
+            e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
+            num_params = len(self.excitations_singlet)
+            excitations = self.excitations_singlet
+            if triplet:
+                num_params = len(self.excitations_triplet)
+                excitations = self.excitations_triplet
+            hdiag = np.zeros(num_params)
+            for k, (excitation_group, weights) in enumerate(excitations):
+                first = excitation_group[0]
+                occ_indices = first[:len(first)//2]
+                vir_indices = first[len(first)//2:]
+                hdiag[k] = sum(e[vir_indices]) - sum(e[occ_indices])
+            self.hdiag = hdiag
+            return hdiag
+        else:
+            return self.hdiag
 
     def expectation_value(self, integral):
         if isinstance(integral, str):
@@ -235,3 +240,71 @@ class uccsd(object):
             else:
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
+
+    def get_response_fct(self, prop1, prop2, num_imag, omega, history,diag=True):
+        """
+        Obtain response function by parsing two integrals
+        """
+
+        if diag == False:
+            raise NameError("Only diagonal response function is implemented")
+
+        hdiag = self.hess_diag_approximate()
+        diag_resp = []
+        for p1, p2 in zip(prop1, prop2):
+            # Calculate linear response vector of prop1
+            resp_plus, history = solvers.davidson_response(self.hvp, p1, hdiag, omega=omega, history=history, verbose=True)
+            resp_minus, history = solvers.davidson_response(self.hvp, -p1, hdiag, omega=-omega, history=history, verbose=True)
+            resp = resp_plus -(-1)**num_imag * resp_minus 
+            resp_fct = -(-1)**num_imag * 0.5*np.dot(resp,p2)
+            diag_resp.append(resp_fct.real)
+            print(omega, resp_fct, f'dim_V={history["V"].shape}', flush=True)
+
+        return diag_resp
+    
+    def get_OR(self, omega, history,verbose=False):
+        """
+        Obtain optical rotation in various gauges
+        """
+
+        #Get property gradients
+        dips_x= self.property_gradient('int1e_r') # V_\mu
+        dips_p= self.property_gradient('int1e_ipovlp', approach='statevector') # V_p
+        mags= self.property_gradient('int1e_cg_irxp', approach='statevector')  # V_m
+
+        # Length Gauge: <<\mu,m>>
+        mu_m = self.get_response_fct(dips_x,mags,num_imag=1,omega=omega,history=history)
+
+        # Velocity Gauge: <<p,m>>
+        p_m = self.get_response_fct(dips_p,mags,num_imag=2,omega=omega,history=history)
+
+        # Modified velocity gauge, term 2: <<p,m>>_0
+        p_m_0 = self.get_response_fct(dips_p,mags,num_imag=2,omega=0,history=history)
+
+        if verbose:
+            print("Length gauge")
+            print("xx:", mu_m[0])
+            print("yy:", mu_m[1])
+            print("zz:", mu_m[2])
+
+            print("Velocity gauge:")
+            print("xx:", p_m[0])
+            print("yy:", p_m[1])
+            print("zz:", p_m[2])
+
+            print("Modified velocity gauge, term 2:")
+            print("xx:", p_m_0[0])
+            print("yy:", p_m_0[1])
+            print("zz:", p_m_0[2])
+
+        # Calculate G' 
+        G_length   = - np.sum(mu_m) 
+        G_velocity = - np.sum(p_m) / (omega)
+        G_modveloc = G_velocity + np.sum(p_m_0) / (omega)
+
+        if verbose:
+            print("G' length: ", G_length)
+            print("G' velocity: ", G_velocity)
+            print("G' modified velocity: ", G_modveloc)
+
+        return G_length, G_velocity, G_modveloc
