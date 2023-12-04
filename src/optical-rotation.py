@@ -21,7 +21,7 @@ ucc.ground_state()
 omega = 0.07619285815529173 # 589nm in a.u.
 history = None
 
-G_len, G_veloc, G_modveloc = ucc.get_OR(omega=omega,history=history)
+G_len, G_veloc, G_modveloc = ucc.get_OR(omega=omega)
 print("G' length: ", G_len)
 print("G' velocity: ", G_veloc)
 print("G' modified velocity: ", G_modveloc)

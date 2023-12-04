@@ -262,7 +262,7 @@ class uccsd(object):
 
         return diag_resp
     
-    def get_OR(self, omega, history,verbose=False):
+    def get_OR(self, omega, history=None,verbose=False):
         """
         Obtain optical rotation in various gauges
         """
