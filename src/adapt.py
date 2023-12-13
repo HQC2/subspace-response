@@ -7,6 +7,7 @@ from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
 from uccsd import UCCSD
 import solvers
+import excitations
 
 symbols = ['H', 'H', 'H', 'H']
 geometry = qml.numpy.array([
@@ -38,7 +39,7 @@ class adaptwfn(uccsd.uccsd):
 
     def ground_state(self, adapt_tol=1e-5):
         # 1) define operator pool
-        pool = self.excitations_ground_state
+        pool = excitations.spin_adapted_excitations(self.electrons, self.qubits, generalized=True)
         self.excitations_ground_state = []
         self.theta = []
         
