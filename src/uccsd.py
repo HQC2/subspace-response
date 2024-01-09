@@ -23,7 +23,6 @@ class uccsd(object):
         if active_electrons is not None:
             electrons = active_electrons
         hf_state = qml.qchem.hf_state(electrons, qubits)
-        hf_state.requires_grad = False
         excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
         excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
