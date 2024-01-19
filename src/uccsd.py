@@ -30,7 +30,7 @@ class uccsd(object):
         @qml.qnode(dev, diff_method="adjoint")
         def circuit(self, params_ground_state):
             UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return qml.expval(H)
+            return qml.expval(self.H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
@@ -40,7 +40,7 @@ class uccsd(object):
             else:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
                           excitations_singlet=self.excitations_singlet)
-            return qml.expval(H)
+            return qml.expval(self.H)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_operator(self, params_ground_state, operator):
