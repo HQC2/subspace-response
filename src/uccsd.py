@@ -20,7 +20,11 @@ class uccsd(object):
                                                     active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        self.active_electrons = active_electrons
+        self.active_orbitals = active_orbitals
+        self.inactive_electrons = 0
         if active_electrons is not None:
+            self.inactive_electrons = electrons - active_electrons
             electrons = active_electrons
         hf_state = qml.qchem.hf_state(electrons, qubits)
         excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
@@ -171,13 +175,19 @@ class uccsd(object):
                 continue
 
             operator = 0.0
-            for p in range(self.m.nao):
-                for q in range(self.m.nao):
-                    operator += component[p,q] * qml.FermiC(2*p) * qml.FermiA(2*q)
-                    operator += component[p,q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+            I = self.inactive_electrons //2
+            for p in range(self.qubits//2):
+                for q in range(self.qubits//2):
+                    operator += component[I+p,I+q] * qml.FermiC(2*p) * qml.FermiA(2*q)
+                    operator += component[I+p,I+q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+            # with casci-style active space, add contribution due to doubly occupied MOs
             operator = qml.jordan_wigner(operator)
-
-            expectation_values.append(self.circuit_operator(self, self.theta, operator))
+            term = 0.
+            if self.active_electrons is not None:
+                num_inactive = self.inactive_electrons // 2
+                for i in range(num_inactive):
+                    term += 2*component[i,i]
+            expectation_values.append(self.circuit_operator(self, self.theta, operator)+term)
         return np.array(expectation_values).reshape(out_shape)
 
     def property_gradient(self, integral, approach='derivative', triplet=False):
@@ -206,10 +216,11 @@ class uccsd(object):
 
             operator = 0.0
             sign = -1 if triplet else 1
-            for p in range(self.m.nao):
-                for q in range(self.m.nao):
-                    operator += component[p,q] * qml.FermiC(2*p) * qml.FermiA(2*q)
-                    operator += sign * component[p,q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+            I = self.inactive_electrons // 2
+            for p in range(self.qubits//2):
+                for q in range(self.qubits//2):
+                    operator += component[I+p,I+q] * qml.FermiC(2*p) * qml.FermiA(2*q)
+                    operator += sign * component[I+p,I+q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
             operator = qml.jordan_wigner(operator)
 
             if approach == 'derivative':
