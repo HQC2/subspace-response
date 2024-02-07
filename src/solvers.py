@@ -95,7 +95,7 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
     print('Not converged...')
     return x
 
-def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, n_init=1, tol=1e-6, verbose=False):
+def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, tol=1e-6, verbose=False):
     if np.allclose(b, 0.0, atol=1e-20):
         return b, history
        
@@ -115,7 +115,7 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, n_init=
     if gamma is not None:
         S = S - 1j*gamma*I
 
-    diagonal_guess = b/hdiag
+    diagonal_guess = b/(hdiag)
     if history is not None:
         V = history['V']
         AV = history['AV']
@@ -123,13 +123,11 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, n_init=
         for i in range(V.shape[1]):
             SV[:,i] = S*V[:,i]
     else:
-        V = np.zeros((len(hdiag), n_init), dtype=np.complex128)
-        V[np.argsort(diagonal_guess)[:n_init], np.arange(n_init)] = 1.0
+        V = diagonal_guess.astype(np.complex128).reshape(-1,1)
         AV = np.zeros_like(V, dtype=np.complex128)
         SV = np.zeros_like(V, dtype=np.complex128)
-        for i in range(n_init):
-            AV[:,i] = matvec(V[:,i])
-            SV[:,i] = S*V[:,i]
+        AV[:,0] = matvec(V[:,0])
+        SV[:,0] = S*V[:,0]
 
     bred = V.T@b
     for i in range(100):
