@@ -15,10 +15,11 @@ import h5py
 import copy
 from functools import partial
 
+
 class uccsd(object):
+
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
-        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis,
-                                                    active_electrons=active_electrons, active_orbitals=active_orbitals)
+        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
         self.active_electrons = active_electrons
@@ -40,11 +41,9 @@ class uccsd(object):
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
-                          excitations_triplet=self.excitations_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
-                          excitations_singlet=self.excitations_singlet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.expval(self.H)
 
         @qml.qnode(dev, diff_method="adjoint")
@@ -55,23 +54,18 @@ class uccsd(object):
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
-                  excitations_triplet=self.excitations_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
-                          excitations_singlet=self.excitations_singlet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="best")
         def circuit_state(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state,
-                  excitations_triplet=self.excitations_triplet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_singlet, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state,
-                          excitations_singlet=self.excitations_singlet)
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
-
 
         self.H = H
         self.qubits = qubits
@@ -101,6 +95,7 @@ class uccsd(object):
         self.mf = mf
 
     def ground_state(self, min_method='slsqp'):
+
         def energy(params):
             params = qml.numpy.array(params)
             energy = self.circuit(self, params)
@@ -111,37 +106,37 @@ class uccsd(object):
             params = qml.numpy.array(params)
             grad = get_gradient(self.circuit)(self, params)
             return grad
-        
+
         res = minimize(energy, jac=jac, x0=self.theta, method=min_method, tol=1e-12)
         self.theta = res.x
 
     def hvp(self, v, h=1e-6, scheme='central', triplet=False):
         grad = lambda x: get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
-                'forward': lambda grad, h, v: grad(h*v)/h,
-                'central': lambda grad, h, v: (grad(h*v) - grad(-h*v)) / (2*h),
-                '5-point': lambda grad, h, v: (grad(-2*h*v)-8*grad(-1*h*v)+8*grad(h*v)-grad(2*h*v))/(12*h),
-                '7-point': lambda grad, h, v: (-grad(-3*h*v)+9*grad(-2*h*v)-45*grad(-1*h*v)+45*grad(h*v)-9*grad(2*h*v)+grad(3*h*v))/(60*h),
-                '9-point': lambda grad, h, v: (3*grad(-4*h*v)-32*grad(-3*h*v)+168*grad(-2*h*v)-672*grad(-1*h*v)+672*grad(h*v)-168*grad(2*h*v)+32*grad(3*h*v)-3*grad(4*h*v))/(840*h),
-               '11-point': lambda grad, h, v: (-2*grad(-5*h*v)+25*grad(-4*h*v)-150*grad(-3*h*v)+600*grad(-2*h*v)-2100*grad(-1*h*v)+2100*grad(h*v)-600*grad(2*h*v)+150*grad(3*h*v)-25*grad(4*h*v)+2*grad(5*h*v))/(2520*h),
-                }
+            'forward': lambda g, h, v: g(h*v)/h,
+            'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
+            '5-point': lambda g, h, v: (g(-2*h*v) - 8*g(-1*h*v) + 8*g(h*v) - g(2*h*v))/(12*h),
+            '7-point': lambda g, h, v: (-g(-3*h*v) + 9*g(-2*h*v) - 45*g(-1*h*v) + 45*g(h*v) - 9*g(2*h*v) + g(3*h*v))/(60*h),
+            '9-point': lambda g, h, v: (3*g(-4*h*v) - 32*g(-3*h*v) + 168*g(-2*h*v) - 672*g(-1*h*v) + 672*g(h*v) - 168*g(2*h*v) + 32*g(3*h*v) - 3*g(4*h*v))/(840*h),
+            '11-point': lambda g, h, v: (-2*g(-5*h*v) + 25*g(-4*h*v) - 150*g(-3*h*v) + 600*g(-2*h*v) - 2100*g(-1*h*v) + 2100*g(h*v) - 600*g(2*h*v) + 150*g(3*h*v) - 25*g(4*h*v) + 2*g(5*h*v))/(2520*h),
+        }
         need_reshape = False
         if len(v.shape) == 1:
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
         for i in range(v.shape[1]):
-            hvp[:, i] = fd_scheme[scheme](grad, h, v[:,i])
+            hvp[:, i] = fd_scheme[scheme](grad, h, v[:, i])
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
-    
+
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
 
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
-        e = np.repeat(orbital_energies, 2) # alpha,beta,alpha,beta
+        e = np.repeat(orbital_energies, 2)  # alpha,beta,alpha,beta
         num_params = len(self.excitations_singlet)
         excitations = self.excitations_singlet
         if triplet:
@@ -174,19 +169,19 @@ class uccsd(object):
                 continue
 
             operator = 0.0
-            I = self.inactive_electrons //2
+            I = self.inactive_electrons//2
             for p in range(self.qubits//2):
                 for q in range(self.qubits//2):
-                    operator += component[I+p,I+q] * qml.FermiC(2*p) * qml.FermiA(2*q)
-                    operator += component[I+p,I+q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                    operator += component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
             # with casci-style active space, add contribution due to doubly occupied MOs
             operator = qml.jordan_wigner(operator)
             term = 0.
             if self.active_electrons is not None:
-                num_inactive = self.inactive_electrons // 2
+                num_inactive = self.inactive_electrons//2
                 for i in range(num_inactive):
-                    term += 2*component[i,i]
-            expectation_values.append(self.circuit_operator(self, self.theta, operator)+term)
+                    term += 2*component[i, i]
+            expectation_values.append(self.circuit_operator(self, self.theta, operator) + term)
         return np.array(expectation_values).reshape(out_shape)
 
     def property_gradient(self, integral, approach='derivative', triplet=False):
@@ -200,7 +195,7 @@ class uccsd(object):
         ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
         mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
         operator_gradients = []
-        
+
         if triplet:
             parameter_excitation = qml.numpy.zeros(len(self.excitations_triplet))
         else:
@@ -215,11 +210,11 @@ class uccsd(object):
 
             operator = 0.0
             sign = -1 if triplet else 1
-            I = self.inactive_electrons // 2
+            I = self.inactive_electrons//2
             for p in range(self.qubits//2):
                 for q in range(self.qubits//2):
-                    operator += component[I+p,I+q] * qml.FermiC(2*p) * qml.FermiA(2*q)
-                    operator += sign * component[I+p,I+q] * qml.FermiC(2*p+1) * qml.FermiA(2*q+1)
+                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                    operator += sign*component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
             operator = qml.jordan_wigner(operator)
 
             if approach == 'derivative':
@@ -227,7 +222,6 @@ class uccsd(object):
                 operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
                 operator_matrix = operator.matrix()
-
 
                 operator_gradient = np.zeros_like(parameter_excitation)
                 state_0 = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)

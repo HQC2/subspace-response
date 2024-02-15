@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
-
 r"""
 Contains the UCCSD template.
 Added spin adaptation stuff.
@@ -22,13 +21,12 @@ import pennylane as qml
 from pennylane.operation import Operation, AnyWires
 from pennylane.ops import BasisState
 
+
 class UCCSD(Operation):
     num_wires = AnyWires
     grad_method = None
 
-    def __init__(
-        self, weights, wires, excitations_ground_state, init_state
-    ):
+    def __init__(self, weights, wires, excitations_ground_state, init_state):
         shape = qml.math.shape(weights)
         init_state = qml.math.toarray(init_state)
 
@@ -43,9 +41,7 @@ class UCCSD(Operation):
         return 1
 
     @staticmethod
-    def compute_decomposition(
-        weights, wires, excitations_ground_state, init_state
-    ):  # pylint: disable=arguments-differ
+    def compute_decomposition(weights, wires, excitations_ground_state, init_state):  # pylint: disable=arguments-differ
         op_list = []
 
         op_list.append(BasisState(init_state, wires=wires))
@@ -65,21 +61,25 @@ class UCCSD(Operation):
                     raise ValueError
         return op_list
 
+
 class UCCSD_exc(Operation):
     num_wires = AnyWires
     grad_method = None
 
     def __init__(
-        self, weights_ground_state, weights_excitation, wires, excitations_ground_state, init_state,
-        excitations_singlet=None, excitations_triplet=None,
+        self,
+        weights_ground_state,
+        weights_excitation,
+        wires,
+        excitations_ground_state,
+        init_state,
+        excitations_singlet=None,
+        excitations_triplet=None,
     ):
         if init_state.dtype != np.dtype("int"):
             raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
 
-        self._hyperparameters = {"init_state": init_state, 
-                                 "excitations_ground_state": excitations_ground_state,
-                                 "excitations_singlet": excitations_singlet,
-                                 "excitations_triplet": excitations_triplet}
+        self._hyperparameters = {"init_state": init_state, "excitations_ground_state": excitations_ground_state, "excitations_singlet": excitations_singlet, "excitations_triplet": excitations_triplet}
 
         super().__init__(weights_ground_state, weights_excitation, wires=wires)
 
@@ -89,8 +89,13 @@ class UCCSD_exc(Operation):
 
     @staticmethod
     def compute_decomposition(
-        weights_ground_state, weights_excitation, wires, excitations_ground_state, init_state,
-        excitations_singlet=None, excitations_triplet=None,
+        weights_ground_state,
+        weights_excitation,
+        wires,
+        excitations_ground_state,
+        init_state,
+        excitations_singlet=None,
+        excitations_triplet=None,
     ):  # pylint: disable=arguments-differ
         op_list = []
         op_list.append(BasisState(init_state, wires=wires))
