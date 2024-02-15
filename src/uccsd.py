@@ -13,6 +13,7 @@ import pyscf
 import excitations
 import h5py
 import copy
+from functools import partial
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
@@ -114,31 +115,29 @@ class uccsd(object):
         res = minimize(energy, jac=jac, x0=self.theta, method=min_method, tol=1e-12)
         self.theta = res.x
 
-    def hvp(self, v, h=1e-6):
-        def grad(x):
-            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x)
-        hvp = np.zeros_like(v)
+    def hvp(self, v, h=1e-6, scheme='central', triplet=False):
+        grad = lambda x: get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+        fd_scheme = {
+                'forward': lambda grad, h, v: grad(h*v)/h,
+                'central': lambda grad, h, v: (grad(h*v) - grad(-h*v)) / (2*h),
+                '5-point': lambda grad, h, v: (grad(-2*h*v)-8*grad(-1*h*v)+8*grad(h*v)-grad(2*h*v))/(12*h),
+                '7-point': lambda grad, h, v: (-grad(-3*h*v)+9*grad(-2*h*v)-45*grad(-1*h*v)+45*grad(h*v)-9*grad(2*h*v)+grad(3*h*v))/(60*h),
+                '9-point': lambda grad, h, v: (3*grad(-4*h*v)-32*grad(-3*h*v)+168*grad(-2*h*v)-672*grad(-1*h*v)+672*grad(h*v)-168*grad(2*h*v)+32*grad(3*h*v)-3*grad(4*h*v))/(840*h),
+               '11-point': lambda grad, h, v: (-2*grad(-5*h*v)+25*grad(-4*h*v)-150*grad(-3*h*v)+600*grad(-2*h*v)-2100*grad(-1*h*v)+2100*grad(h*v)-600*grad(2*h*v)+150*grad(3*h*v)-25*grad(4*h*v)+2*grad(5*h*v))/(2520*h),
+                }
+        need_reshape = False
         if len(v.shape) == 1:
-            hvp = (grad(h*v) - grad(-h*v)) / (2*h)
-        elif len(v.shape) == 2:
-            for i in range(v.shape[1]):
-                hvp[:, i] =  (grad(h*v[:,i]) - grad(-h*v[:,i])) / (2*h)
-        else:
-            raise ValueError
-        return hvp
-
-    def hvp_triplet(self, v, h=1e-6):
-        def grad(x):
-            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=True)
+            v = v.reshape(-1, 1)
+            need_reshape = True
         hvp = np.zeros_like(v)
-        if len(v.shape) == 1:
-            hvp = (grad(h*v) - grad(-h*v)) / (2*h)
-        elif len(v.shape) == 2:
-            for i in range(v.shape[1]):
-                hvp[:, i] =  (grad(h*v[:,i]) - grad(-h*v[:,i])) / (2*h)
-        else:
-            raise ValueError
+        for i in range(v.shape[1]):
+            hvp[:, i] = fd_scheme[scheme](grad, h, v[:,i])
+        if need_reshape:
+            hvp = hvp.reshape(-1)
         return hvp
+    
+    def hvp_triplet(self, v, h=1e-6, scheme='central'):
+        return self.hvp(v, h=h, scheme=scheme, triplet=True)
 
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
