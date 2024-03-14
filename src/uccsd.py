@@ -15,10 +15,31 @@ import h5py
 import copy
 from functools import partial
 
+import polarizationsolver
+from molecular_hamiltonian import get_molecular_hamiltonian 
+
+def read_xyz(filename):
+    elements = []
+    coordinates = []
+    with open(filename, 'r') as f:
+        N = int(f.readline())
+        f.readline()
+        for _ in range(N):
+            element, x, y, z, *_ = f.readline().split()
+            elements.append(element)
+            coordinates.append([float(x), float(y), float(z)])
+    return elements, np.array(coordinates)
+
+def _make_rdm1_on_mo(casdm1, ncore, ncas, nmo):
+    nocc = ncas + ncore
+    dm1 = np.zeros((nmo,nmo))
+    idx = np.arange(ncore)
+    dm1[idx,idx] = 2
+    dm1[ncore:nocc,ncore:nocc] = casdm1
+    return dm1
 
 class uccsd(object):
-
-    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
+    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None, PE=None):
         H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
         electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
@@ -52,12 +73,25 @@ class uccsd(object):
             return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
+        def circuit_operators(self, params_ground_state, operators):
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
+            return [qml.expval(operator) for operator in operators]
+
+        @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.expval(operator)
+
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_exc_operators(self, params_ground_state, params_excitation, operators, triplet=False):
+            if triplet:
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            return [qml.expval(operator) for operator in operators]
 
         @qml.qnode(dev, diff_method="best")
         def circuit_state(self, params_ground_state, params_excitation, triplet=False):
@@ -78,9 +112,15 @@ class uccsd(object):
         self.device = dev
         self.circuit = circuit
         self.circuit_operator = circuit_operator
+        self.circuit_operators = circuit_operators
         self.circuit_exc = circuit_exc
         self.circuit_exc_operator = circuit_exc_operator
+        self.circuit_exc_operators = circuit_exc_operators
         self.circuit_state = circuit_state
+        self.PE = None
+        if PE is not None:
+            system = polarizationsolver.readers.parser(polarizationsolver.readers.potreader(PE))
+            self.PE = system
 
         atom_str = ''
         for symbol, coord in zip(symbols, geometry):
@@ -91,27 +131,180 @@ class uccsd(object):
         with h5py.File(hf_filename, 'r') as f:
             mf.mo_coeff = f['canonical_orbitals'][()]
             mf.mo_energy = f['orbital_energies'][()]
+            print(mf.mo_energy)
         self.m = m
         self.mf = mf
+        if PE is not None:
+            self.mf = pyscf.solvent.PE(mf, PE)
+            self.mf.kernel()
+
+    def rdm1_slow(self, params_ground_state, params_excitation=None, triplet=False):
+        rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
+        k = 0
+        for i in range(self.qubits//2):
+            for j in range(i, self.qubits//2):
+                fermi = qml.FermiC(2*i)*qml.FermiA(2*j)
+                fermi += qml.FermiC(2*i + 1)*qml.FermiA(2*j + 1)
+                operator = qml.jordan_wigner(fermi)
+                if params_excitation is not None:
+                    expval = self.circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=triplet)
+                else:
+                    expval = self.circuit_operator(self, params_ground_state, operator)
+                rdm1_active[i, j] = expval
+                rdm1_active[j, i] = expval
+                k = k + 1
+        return rdm1_active
+
+    def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
+        rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
+        k = 0
+        operators = []
+        for i in range(self.qubits//2):
+            for j in range(i, self.qubits//2):
+                fermi = qml.FermiC(2*i)*qml.FermiA(2*j)
+                fermi += qml.FermiC(2*i + 1)*qml.FermiA(2*j + 1)
+                operator = qml.jordan_wigner(fermi)
+                coeffs = []
+                obs = []
+                for term in operator.terms()[1]:
+                    if term.arithmetic_depth > 0:
+                        coeff, ob = term.terms()
+                        if term.arithmetic_depth == 1:
+                            ob = qml.operation.Tensor(*ob)
+                        else:
+                            ob = qml.operation.Tensor(*ob[0])
+                    else:
+                        coeff = [1]
+                        ob = term
+                    coeffs.extend(coeff)
+                    obs.append(ob)
+                operators.append(qml.Hamiltonian(np.array(coeffs).astype(np.float64), obs).simplify())
+        if params_excitation is not None:
+            expectation_values = self.circuit_exc_operators(self, params_ground_state, params_excitation, operators, triplet=triplet)
+        else:
+            expectation_values = self.circuit_operators(self, params_ground_state, operators)
+        for i in range(self.qubits//2):
+            for j in range(i, self.qubits//2):
+                expval = expectation_values[k]
+                rdm1_active[i, j] = expval
+                rdm1_active[j, i] = expval
+                k = k + 1
+        return rdm1_active
 
     def ground_state(self, min_method='slsqp'):
-
-        def energy(params):
+        def energy_and_jac(params):
             params = qml.numpy.array(params)
+            energy_pe_en = 0.
+            E_pol_nuc = 0.
+            E_pol = 0.
+            if self.PE:
+                # get 1RDM and transform to AO
+                dm_mo = self.rdm1(params)
+                dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
+                dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
+                # get electric fields from QM
+                # get induction contribution
+                # modify gas-phase Hamiltonian with v_es + v_ind 
+                v_PE = np.zeros_like(dm_ao)
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                # charges
+                if 1 in (self.PE.active_permanent_multipole_ranks) or (1 in self.PE.active_induced_multipole_ranks):
+                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                if 0 in self.PE.active_permanent_multipole_ranks:
+                    v_PE += -np.sum(pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e')*self.PE.permanent_moments[0], axis=2)
+                    energy_pe_en = -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 0, self.PE.permanent_moments[0], 0) * self.m.atom_charges()).sum()
+                # dipoles
+                # field_integrals could maybe be symmetrized in (0,1) dimension
+                if 1 in self.PE.active_permanent_multipole_ranks:
+                    v_dip = -np.sum(field_integrals*self.PE.permanent_moments[1], axis=(2,3))
+                    v_PE += v_dip + v_dip.T
+                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.permanent_moments[1], 0) * self.m.atom_charges()).sum()
+                # quadrupoles
+                if 2 in self.PE.active_permanent_multipole_ranks:
+                    # remove trace
+                    self.PE.permanent_moments[2] -= np.eye(3)[None, :, :] * np.einsum('qii->q', self.PE.permanent_moments[2])[:,None, None]/3
+                    v_quad = -0.5*np.sum((pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipip1') +  pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipvip1')).transpose(1,2,3,0) * self.PE.permanent_moments[2].reshape(-1,9), axis=(2,3))
+                    v_PE += v_quad + v_quad.T
+                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 2, self.PE.permanent_moments[2], 0) * self.m.atom_charges()).sum()
+
+                # solve for induced dipoles
+                # rhs field = F_nuc + F_el + F_multipole
+                # F_multipole is constructed internally by polarizationsolver
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    F_nuc = polarizationsolver.fields.field(self.PE.coordinates - self.m.atom_coords()[:,None,:], 0, self.m.atom_charges(), 1)
+                    F_rhs = F_nuc + 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
+                    self.PE.external_field = [[], F_rhs]
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12)
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    v_PE += v_ind + v_ind.T
+                    E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
+                    E_pol = self.PE.E_pol
+
+                H, qubits = get_molecular_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                self.H = H
+                self.v_PE_gs = v_PE
+
+            
             energy = self.circuit(self, params)
-            print('energy = ', energy)
-            return energy
-
-        def jac(params):
-            params = qml.numpy.array(params)
+            #print("<v_PE> = ", np.sum(dm_ao * v_PE))
             grad = get_gradient(self.circuit)(self, params)
-            return grad
+            if self.PE:
+                #print('E_PE = ', energy + energy_pe_en + E_pol - 0.5*np.dot(self.PE.induced_moments[1].ravel(), F_nuc.ravel()))
+                #print("<v_PE> (tot) = ", np.sum(dm_ao*(v_PE)))
+                energy += energy_pe_en + E_pol
+            #    print("<v_PE> (ind) = ", np.sum(dm_ao*(v_ind)))
+            #else:
+            print('energy = ', energy)
+            return energy, grad
 
-        res = minimize(energy, jac=jac, x0=self.theta, method=min_method, tol=1e-12)
+        res = minimize(energy_and_jac, jac=True, x0=self.theta, method=min_method, tol=1e-12)
         self.theta = res.x
 
     def hvp(self, v, h=1e-6, scheme='central', triplet=False):
-        grad = lambda x: get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+        def grad(x):
+            if self.PE:
+                # get 1RDM and transform to AO
+                dm_mo_gs = self.rdm1(self.theta)
+                dm_mo_gs = _make_rdm1_on_mo(dm_mo_gs, self.inactive_electrons//2, self.qubits//2, self.m.nao)
+                dm_mo = self.rdm1(self.theta, params_excitation=x)
+                dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
+                delta = dm_mo - dm_mo_gs
+                #dm_ao = self.mf.mo_coeff @ (dm_mo_gs + 0.5 * delta) @ self.mf.mo_coeff.T
+                dm_ao = self.mf.mo_coeff @ (dm_mo_gs) @ self.mf.mo_coeff.T
+                # get electric fields from QM
+                # get induction contribution
+                # modify gas-phase Hamiltonian with v_es + v_ind 
+                v_PE = np.zeros_like(dm_ao)
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                if 1 in (self.PE.active_permanent_multipole_ranks) or (1 in self.PE.active_induced_multipole_ranks):
+                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                # charges
+                if 0 in self.PE.active_permanent_multipole_ranks:
+                    v_PE += -np.sum(pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e')*self.PE.permanent_moments[0], axis=2)
+                # dipoles
+                # field_integrals could maybe be symmetrized in (0,1) dimension
+                if 1 in self.PE.active_permanent_multipole_ranks:
+                    v_dip = -np.sum(field_integrals*self.PE.permanent_moments[1], axis=(2,3))
+                    v_PE += v_dip + v_dip.T
+                # quadrupoles
+                if 2 in self.PE.active_permanent_multipole_ranks:
+                    v_quad = -0.5*np.sum((pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipip1') +  pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipvip1')).transpose(1,2,3,0) * self.PE.permanent_moments[2].reshape(-1,9), axis=(2,3))
+                    v_PE += v_quad + v_quad.T
+
+                # solve for induced dipoles
+                # rhs field = F_nuc + F_el + F_multipole
+                # F_multipole is handled internally by polarizationsolver
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    F_nuc = polarizationsolver.fields.field(self.PE.coordinates - self.m.atom_coords()[:,None,:], 0, self.m.atom_charges(), 1)
+                    F_rhs = F_nuc + 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
+                    self.PE.external_field = [[], F_rhs]
+                    polarizationsolver.solvers.iterative_solver(self.PE)
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    v_PE += v_ind + v_ind.T
+
+                H, qubits = get_molecular_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                self.H = H
+            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
             'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
