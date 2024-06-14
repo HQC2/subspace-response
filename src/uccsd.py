@@ -6,29 +6,33 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-import periodictable
-import functools
 from uccsd_circuits import UCCSD, UCCSD_exc
 import pyscf
 import excitations
-import h5py
 import copy
-from functools import partial
+from molecular_hamiltonian import get_molecular_hamiltonian
 
 
 class uccsd(object):
 
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
-        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
-        hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
-        electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        atom_str = ''
+        for symbol, coord in zip(symbols, geometry):
+            atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
+        m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
+        mf = pyscf.scf.RHF(m).run()
+        self.m = m
+        self.mf = mf
+        electrons = sum(m.nelec)
+        orbitals = m.nao
+        active_electrons = active_electrons if active_electrons else electrons
+        active_orbitals = active_orbitals if active_orbitals else orbitals
+        self.inactive_electrons = electrons - active_electrons
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
-        self.inactive_electrons = 0
-        if active_electrons is not None:
-            self.inactive_electrons = electrons - active_electrons
-            electrons = active_electrons
+        H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_state = qml.qchem.hf_state(electrons, qubits)
+
         excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
         excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
@@ -82,17 +86,6 @@ class uccsd(object):
         self.circuit_exc_operator = circuit_exc_operator
         self.circuit_state = circuit_state
 
-        atom_str = ''
-        for symbol, coord in zip(symbols, geometry):
-            atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
-            print(atom_str)
-        m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
-        mf = pyscf.scf.RHF(m)
-        with h5py.File(hf_filename, 'r') as f:
-            mf.mo_coeff = f['canonical_orbitals'][()]
-            mf.mo_energy = f['orbital_energies'][()]
-        self.m = m
-        self.mf = mf
 
     def ground_state(self, min_method='slsqp'):
 
