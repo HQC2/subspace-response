@@ -6,11 +6,12 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_exc_stateprep, UCCSD_iH_exc
 import pyscf
 import excitations
 import copy
 from molecular_hamiltonian import get_molecular_hamiltonian
+import scipy
 
 
 class uccsd(object):
@@ -51,6 +52,11 @@ class uccsd(object):
             return qml.expval(self.H)
 
         @qml.qnode(dev, diff_method="adjoint")
+        def circuit_exc_stateprep(self, params_ground_state, statevector):
+            UCCSD_exc_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
+            return qml.expval(self.H)
+
+        @qml.qnode(dev, diff_method="adjoint")
         def circuit_operator(self, params_ground_state, operator):
             UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
             return qml.expval(operator)
@@ -71,6 +77,22 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc(self, params_ground_state, params_excitation, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            return qml.expval(self.H)
+
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            return qml.expval(operator)
+
         self.H = H
         self.qubits = qubits
         self.electrons = electrons
@@ -83,6 +105,9 @@ class uccsd(object):
         self.circuit = circuit
         self.circuit_operator = circuit_operator
         self.circuit_exc = circuit_exc
+        self.circuit_iH_exc = circuit_iH_exc
+        self.circuit_iH_exc_operator = circuit_iH_exc_operator
+        self.circuit_exc_stateprep = circuit_exc_stateprep
         self.circuit_exc_operator = circuit_exc_operator
         self.circuit_state = circuit_state
 
@@ -122,10 +147,56 @@ class uccsd(object):
             hvp[:, i] = fd_scheme[scheme](grad, h, v[:, i])
         if need_reshape:
             hvp = hvp.reshape(-1)
+        return 2.0*hvp
+
+    def hvp_new(self, v, triplet=false):
+        need_reshape = false
+        if len(v.shape) == 1:
+            v = v.reshape(-1, 1)
+            need_reshape = true
+        hvp = np.zeros_like(v)
+        e_gr = self.circuit(self, self.theta)
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+        for k in range(v.shape[1]):
+            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            for i in range(v.shape[0]):
+                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
+            # todo: support sparse vector in stateprep
+            mvv = self.circuit_exc_stateprep(self, self.theta, v_statevector.toarray().ravel())
+            data = []
+            for i in range(v.shape[0]):
+                i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
+                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
+                v_plus_i_statevector /= norm
+                mii = self.circuit_exc_stateprep(self, self.theta, i_statevector.toarray().ravel())
+                miv = self.circuit_exc_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel()) * norm**2
+                hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
+        if need_reshape:
+            hvp = hvp.reshape(-1)
         return hvp
 
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
+
+    def e3vwp(self, v, w, h=1e-3, triplet=False, scheme='valeev-1'):
+        fd_scheme = {
+            'central': lambda g, h, v, w: (g(h*v+h*w) - g(-h*v+h*w) - g (h*v-h*w) + g(-h*v-h*w))/(4*h**2),
+            'valeev-1': lambda g, h, v, w: (16*(g(-h*w)+g(+h*w)+g(-h*v)+g(+h*v)) 
+                                             - (g(2*h*v)+g(-2*h*v)+g(2*h*w)+g(-2*h*w))
+                                          - 16*(g(-h*v+h*w)+g(h*v-h*w))
+                                             + (g(-2*h*v+2*h*w)+g(2*h*v-2*h*w))
+                                          - 30*(g(0*v+0*w))
+                                            )/(24*h**2)
+                }
+        def grad(x):
+            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+        assert len(v.shape) == 1
+        assert len(w.shape) == 1
+        return fd_scheme[scheme](grad, h, v, w)
 
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
@@ -231,3 +302,101 @@ class uccsd(object):
             else:
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
+
+    def V2vp(self, integral, parameter_excitation, triplet=False, h=1e-6, scheme='5-point', optype='fermionic'):
+        if isinstance(integral, str):
+            ao_integrals = self.m.intor(integral)
+        elif isinstance(integral, np.ndarray):
+            ao_integrals = integral
+        else:
+            raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
+        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
+        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+
+        fd_scheme = {
+            'forward': lambda g, h, v: g(h*v)/h,
+            'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
+            '5-point': lambda g, h, v: (g(-2*h*v) - 8*g(-1*h*v) + 8*g(h*v) - g(2*h*v))/(12*h),
+            '7-point': lambda g, h, v: (-g(-3*h*v) + 9*g(-2*h*v) - 45*g(-1*h*v) + 45*g(h*v) - 9*g(2*h*v) + g(3*h*v))/(60*h),
+            '9-point': lambda g, h, v: (3*g(-4*h*v) - 32*g(-3*h*v) + 168*g(-2*h*v) - 672*g(-1*h*v) + 672*g(h*v) - 168*g(2*h*v) + 32*g(3*h*v) - 3*g(4*h*v))/(840*h),
+            '11-point': lambda g, h, v: (-2*g(-5*h*v) + 25*g(-4*h*v) - 150*g(-3*h*v) + 600*g(-2*h*v) - 2100*g(-1*h*v) + 2100*g(h*v) - 600*g(2*h*v) + 150*g(3*h*v) - 25*g(4*h*v) + 2*g(5*h*v))/(2520*h),
+        }
+        operator_gradients = []
+
+        for component in mo_integrals:
+            # skip null operator
+            if np.allclose(component, 0.0):
+                operator_gradients.append(np.zeros_like(parameter_excitation))
+                continue
+
+            operator = 0.0
+            sign = -1 if triplet else 1
+            I = self.inactive_electrons//2
+            for p in range(self.qubits//2):
+                for q in range(self.qubits//2):
+                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                    operator += sign*component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
+            operator = qml.jordan_wigner(operator)
+            if optype == 'fermionic':
+                circuit = self.circuit_exc_operator
+            elif optype == 'iH':
+                circuit = self.circuit_iH_exc_operator
+            else:
+                raise ValueError
+            grad = lambda v: get_gradient(circuit, argnum=2)(self, self.theta, v, operator, triplet=triplet)
+            operator_gradient = fd_scheme[scheme](grad, h, parameter_excitation)
+            operator_gradients.append(operator_gradient)
+        return np.array(operator_gradients)
+
+    def V2_contraction(self, integral, I_vector, J_vector, triplet=False):
+        if isinstance(integral, str):
+            ao_integrals = self.m.intor(integral)
+        elif isinstance(integral, np.ndarray):
+            ao_integrals = integral
+        else:
+            raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
+        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
+        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+
+        fd_scheme = {
+            'forward': lambda g, h, v: g(h*v)/h,
+            'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
+            '5-point': lambda g, h, v: (g(-2*h*v) - 8*g(-1*h*v) + 8*g(h*v) - g(2*h*v))/(12*h),
+            '7-point': lambda g, h, v: (-g(-3*h*v) + 9*g(-2*h*v) - 45*g(-1*h*v) + 45*g(h*v) - 9*g(2*h*v) + g(3*h*v))/(60*h),
+            '9-point': lambda g, h, v: (3*g(-4*h*v) - 32*g(-3*h*v) + 168*g(-2*h*v) - 672*g(-1*h*v) + 672*g(h*v) - 168*g(2*h*v) + 32*g(3*h*v) - 3*g(4*h*v))/(840*h),
+            '11-point': lambda g, h, v: (-2*g(-5*h*v) + 25*g(-4*h*v) - 150*g(-3*h*v) + 600*g(-2*h*v) - 2100*g(-1*h*v) + 2100*g(h*v) - 600*g(2*h*v) + 150*g(3*h*v) - 25*g(4*h*v) + 2*g(5*h*v))/(2520*h),
+        }
+        operator_gradients = []
+
+        for component in mo_integrals:
+            # skip null operator
+            if np.allclose(component, 0.0):
+                operator_gradients.append(np.zeros_like(parameter_excitation))
+                continue
+
+            operator = 0.0
+            sign = -1 if triplet else 1
+            I = self.inactive_electrons//2
+            for p in range(self.qubits//2):
+                for q in range(self.qubits//2):
+                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                    operator += sign*component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
+            operator = qml.jordan_wigner(operator)
+
+            gs_expval = self.circuit_operator(ucc.theta, operator)
+            op_I = sum([I_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))])
+            op_I_dag = op_I.adjoint()
+            op_J = sum([J_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))])
+            op_J_dag = op_J.adjoint()
+
+            # (dagger,dagger) term
+            # -<Psi|I'J'O|Psi>
+            
+            # (dagger,.) term
+            # <Psi|I'OJ - I'JO|Psi>
+
+            # (.,dagger) term
+            # <Psi|J'OI - OJ'I|Psi>
+
+            # (.,.) term
+            # -<Psi|OJI|Psi>
