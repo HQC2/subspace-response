@@ -138,7 +138,7 @@ class UCCSD_exc(Operation):
                     raise ValueError
         return op_list
 
-class UCCSD_exc_stateprep(Operation):
+class UCCSD_stateprep(Operation):
     num_wires = AnyWires
     grad_method = None
 
