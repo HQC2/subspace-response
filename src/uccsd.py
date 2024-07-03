@@ -582,3 +582,44 @@ class uccsd(object):
             print(term)
             total += term
             print('Total:', total)
+
+    def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
+        if triplet:
+            excitations = self.excitations_triplet
+        else:
+            excitations = self.excitations_singlet
+
+        excitation_rank = np.array([len(excitation[0][0])//2 for excitation in excitations]) 
+        singles = np.where(excitation_rank == 1)[0]
+        doubles = np.where(excitation_rank == 2)[0]
+
+        result = 0.0
+        for D_idx in doubles:
+            for (D_exc, wD) in zip(*excitations[D_idx]):
+                i,j,a,b = D_exc
+                for S1_idx in singles:
+                    for (S1_exc, wS1) in zip(*excitations[S1_idx]):
+                        k1, c1 = S1_exc
+                        # (ia,jb), (ib,ja), (ja,ib), (jb,ia)
+                        # first index is ia,ib,ja, or jb
+                        if (k1==i or k1==j) and (c1==a or c1==b):
+                            k, c = set([i,j,a,b]).difference([k1,c1])
+                            for S2_idx in singles:
+                                for (S2_exc, wS2) in zip(*excitations[S2_idx]):
+                                    k2, c2 = S2_exc
+                                    if (k2==k) and (c2==c):
+                                        #  I'J'K
+                                        # -I'K'J
+                                        # -J'KI
+                                        #  K'JI
+                                        phase = 1 if k1>k2 else -1
+                                        phase *= 1 if c1>c2 else -1
+                                        #print(phase, k1>k2, c1>c2)
+                                        w = phase*wS1*wS2*wD
+                                        result += w*I_dag[S1_idx]*J_dag[S2_idx]*K[D_idx]
+                                        result -= w*I_dag[S1_idx]*K_dag[S2_idx]*J[D_idx]
+                                        result -= w*J_dag[D_idx]*K[S1_idx]*I[S2_idx]
+                                        result += w*K_dag[D_idx]*I[S1_idx]*J[S2_idx]
+        return 0.5*result
+
+
