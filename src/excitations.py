@@ -134,3 +134,32 @@ def excitation_to_statevector(ref_state, excitations, weights):
             exc_vector[c] = 1
         statevec += w * phase * occupation_to_statevector(exc_vector)
     return -statevec
+
+def excitations_to_operators(excitations):
+    excitation_operators = []
+    def Epq(p,q):
+        return qml.jordan_wigner(qml.FermiC(2*p)*qml.FermiA(2*q) + qml.FermiC(2*p+1)*qml.FermiA(2*q+1))
+    def T1(i,a):
+        return Epq(a,i)/np.sqrt(2)
+    def T2t(i,j,a,b):
+        return (Epq(a,i)@Epq(b,j)-Epq(a,j)@Epq(b,i))/(2*np.sqrt(3))
+    def T2(i,j,a,b):
+        if (i==j) and (a==b):
+            prefactor = 0.25
+        elif (i==j) or (a==b):
+            prefactor = 0.5 / np.sqrt(2)
+        else:
+            prefactor = 0.5
+        return prefactor*(Epq(a,i)@Epq(b,j)+Epq(a,j)@Epq(b,i))
+    for e,w in excitations:
+        exci = [p // 2 for p in e[0]]
+        if len(exci) == 2:
+            i, a = exci
+            excitation_operators.append(T1(i,a))
+        elif len(exci) == 4:
+            i,j,a,b = exci
+            if len(w)==6:
+                excitation_operators.append(T2t(i,j,a,b))
+            else:
+                excitation_operators.append(T2(i,j,a,b))
+    return excitation_operators
