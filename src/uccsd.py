@@ -6,7 +6,7 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_stateprep, UCCSD_iH_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_stateprep, UCCSD_iH_exc, UCCSD_U
 import pyscf
 import excitations
 import copy
@@ -189,22 +189,6 @@ class uccsd(object):
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
 
-    def e3vwp(self, v, w, h=1e-3, triplet=False, scheme='valeev-1'):
-        fd_scheme = {
-            'central': lambda g, h, v, w: (g(h*v+h*w) - g(-h*v+h*w) - g (h*v-h*w) + g(-h*v-h*w))/(4*h**2),
-            'valeev-1': lambda g, h, v, w: (16*(g(-h*w)+g(+h*w)+g(-h*v)+g(+h*v)) 
-                                             - (g(2*h*v)+g(-2*h*v)+g(2*h*w)+g(-2*h*w))
-                                          - 16*(g(-h*v+h*w)+g(h*v-h*w))
-                                             + (g(-2*h*v+2*h*w)+g(2*h*v-2*h*w))
-                                          - 30*(g(0*v+0*w))
-                                            )/(24*h**2)
-                }
-        def grad(x):
-            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
-        assert len(v.shape) == 1
-        assert len(w.shape) == 1
-        return fd_scheme[scheme](grad, h, v, w)
-
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
         e = np.repeat(orbital_energies, 2)  # alpha,beta,alpha,beta
@@ -310,51 +294,6 @@ class uccsd(object):
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
 
-    def V2vp(self, integral, parameter_excitation, triplet=False, h=1e-6, scheme='5-point', optype='fermionic'):
-        if isinstance(integral, str):
-            ao_integrals = self.m.intor(integral)
-        elif isinstance(integral, np.ndarray):
-            ao_integrals = integral
-        else:
-            raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
-        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
-        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
-
-        fd_scheme = {
-            'forward': lambda g, h, v: g(h*v)/h,
-            'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
-            '5-point': lambda g, h, v: (g(-2*h*v) - 8*g(-1*h*v) + 8*g(h*v) - g(2*h*v))/(12*h),
-            '7-point': lambda g, h, v: (-g(-3*h*v) + 9*g(-2*h*v) - 45*g(-1*h*v) + 45*g(h*v) - 9*g(2*h*v) + g(3*h*v))/(60*h),
-            '9-point': lambda g, h, v: (3*g(-4*h*v) - 32*g(-3*h*v) + 168*g(-2*h*v) - 672*g(-1*h*v) + 672*g(h*v) - 168*g(2*h*v) + 32*g(3*h*v) - 3*g(4*h*v))/(840*h),
-            '11-point': lambda g, h, v: (-2*g(-5*h*v) + 25*g(-4*h*v) - 150*g(-3*h*v) + 600*g(-2*h*v) - 2100*g(-1*h*v) + 2100*g(h*v) - 600*g(2*h*v) + 150*g(3*h*v) - 25*g(4*h*v) + 2*g(5*h*v))/(2520*h),
-        }
-        operator_gradients = []
-
-        for component in mo_integrals:
-            # skip null operator
-            if np.allclose(component, 0.0):
-                operator_gradients.append(np.zeros_like(parameter_excitation))
-                continue
-
-            operator = 0.0
-            sign = -1 if triplet else 1
-            I = self.inactive_electrons//2
-            for p in range(self.qubits//2):
-                for q in range(self.qubits//2):
-                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
-                    operator += sign*component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
-            operator = qml.jordan_wigner(operator)
-            if optype == 'fermionic':
-                circuit = self.circuit_exc_operator
-            elif optype == 'iH':
-                circuit = self.circuit_iH_exc_operator
-            else:
-                raise ValueError
-            grad = lambda v: get_gradient(circuit, argnum=2)(self, self.theta, v, operator, triplet=triplet)
-            operator_gradient = fd_scheme[scheme](grad, h, parameter_excitation)
-            operator_gradients.append(operator_gradient)
-        return np.array(operator_gradients)
-
     def apply_tensor_op(self, op, basis_state):
         statevector = np.zeros(2**len(basis_state), dtype=np.complex128)
         phase_map = {
@@ -400,188 +339,177 @@ class uccsd(object):
 
     def V2_contraction(self, integral, I_vector, I_vector_dag, J_vector, J_vector_dag, triplet=False):
         if isinstance(integral, str):
-            ao_integrals = self.m.intor(integral)
+            ao_integral = self.m.intor(integral)
         elif isinstance(integral, np.ndarray):
-            ao_integrals = integral
+            ao_integral = integral
         else:
             raise ValueError('Integral should be provided either as a string to evaluate with pyscf m.intor or as a plain numpy array (AO basis).')
-        ao_integrals = ao_integrals.reshape(-1, self.m.nao, self.m.nao)
-        mo_integrals = np.einsum('uj,xuv,vi->xij', self.mf.mo_coeff, ao_integrals, self.mf.mo_coeff)
+        if len(ao_integral.shape) != 2:
+            raise ValueError('Integral must have just a single component (dimension (nao,nao)).')
+        mo_integral = np.einsum('uj,uv,vi->ij', self.mf.mo_coeff, ao_integral, self.mf.mo_coeff)
 
-        fd_scheme = {
-            'forward': lambda g, h, v: g(h*v)/h,
-            'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
-            '5-point': lambda g, h, v: (g(-2*h*v) - 8*g(-1*h*v) + 8*g(h*v) - g(2*h*v))/(12*h),
-            '7-point': lambda g, h, v: (-g(-3*h*v) + 9*g(-2*h*v) - 45*g(-1*h*v) + 45*g(h*v) - 9*g(2*h*v) + g(3*h*v))/(60*h),
-            '9-point': lambda g, h, v: (3*g(-4*h*v) - 32*g(-3*h*v) + 168*g(-2*h*v) - 672*g(-1*h*v) + 672*g(h*v) - 168*g(2*h*v) + 32*g(3*h*v) - 3*g(4*h*v))/(840*h),
-            '11-point': lambda g, h, v: (-2*g(-5*h*v) + 25*g(-4*h*v) - 150*g(-3*h*v) + 600*g(-2*h*v) - 2100*g(-1*h*v) + 2100*g(h*v) - 600*g(2*h*v) + 150*g(3*h*v) - 25*g(4*h*v) + 2*g(5*h*v))/(2520*h),
-        }
-        operator_gradients = []
+        # skip null operator
+        if np.allclose(mo_integral, 0.0):
+            return 0.0
 
-        for component in mo_integrals:
-            # skip null operator
-            if np.allclose(component, 0.0):
-                operator_gradients.append(np.zeros_like(parameter_excitation))
-                continue
+        operator = 0.0
+        sign = -1 if triplet else 1
+        I = self.inactive_electrons//2
+        for p in range(self.qubits//2):
+            for q in range(self.qubits//2):
+                operator += mo_integral[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                operator += sign*mo_integral[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
+        operator = qml.jordan_wigner(operator)
 
-            operator = 0.0
-            sign = -1 if triplet else 1
-            I = self.inactive_electrons//2
-            for p in range(self.qubits//2):
-                for q in range(self.qubits//2):
-                    operator += component[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
-                    operator += sign*component[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
-            operator = qml.jordan_wigner(operator)
-
-            excitation_operators = []
-            def mEpq(p,q):
-                return qml.jordan_wigner(qml.FermiC(2*p)*qml.FermiA(2*q) + qml.FermiC(2*p+1)*qml.FermiA(2*q+1))
-            def T1(i,a):
-                return mEpq(a,i)/np.sqrt(2)
-            def T2t(i,j,a,b):
-                return (mEpq(a,i)@mEpq(b,j)-mEpq(a,j)@mEpq(b,i))/(2*np.sqrt(3))
-            def T2(i,j,a,b):
-                if (i==j) and (a==b):
-                    prefactor = 0.25
-                elif (i==j) or (a==b):
-                    prefactor = 0.5 / np.sqrt(2)
+        excitation_operators = []
+        def Epq(p,q):
+            return qml.jordan_wigner(qml.FermiC(2*p)*qml.FermiA(2*q) + qml.FermiC(2*p+1)*qml.FermiA(2*q+1))
+        def T1(i,a):
+            return Epq(a,i)/np.sqrt(2)
+        def T2t(i,j,a,b):
+            return (Epq(a,i)@Epq(b,j)-Epq(a,j)@Epq(b,i))/(2*np.sqrt(3))
+        def T2(i,j,a,b):
+            if (i==j) and (a==b):
+                prefactor = 0.25
+            elif (i==j) or (a==b):
+                prefactor = 0.5 / np.sqrt(2)
+            else:
+                prefactor = 0.5
+            return prefactor*(Epq(a,i)@Epq(b,j)+Epq(a,j)@Epq(b,i))
+        for e,w in self.excitations_singlet:
+            exci = [p // 2 for p in e[0]]
+            if len(exci) == 2:
+                i, a = exci
+                excitation_operators.append(T1(i,a))
+            elif len(exci) == 4:
+                i,j,a,b = exci
+                if len(w)==6:
+                    excitation_operators.append(T2t(i,j,a,b))
                 else:
-                    prefactor = 0.5
-                return prefactor*(mEpq(a,i)@mEpq(b,j)+mEpq(a,j)@mEpq(b,i))
-            for e,w in self.excitations_singlet:
-                exci = [p // 2 for p in e[0]]
-                if len(exci) == 2:
-                    i, a = exci
-                    excitation_operators.append(T1(i,a))
-                elif len(exci) == 4:
-                    i,j,a,b = exci
-                    if len(w)==6:
-                        excitation_operators.append(T2t(i,j,a,b))
-                    else:
-                        excitation_operators.append(T2(i,j,a,b))
+                    excitation_operators.append(T2(i,j,a,b))
 
-            op_I = sum([I_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-            op_I_dag = sum([I_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-            op_J = sum([J_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-            op_J_dag = sum([J_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I = sum([I_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I_dag = sum([I_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J = sum([J_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J_dag = sum([J_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
 
-            # (dagger,dagger) term
-            # -<Psi|I'J'O|Psi>
-            # apply I'J' to <Psi|
-            total = 0.0
-            op_IJ = (op_J_dag @ op_I_dag).simplify()
-            IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
-            hf_statevec = np.zeros(2**self.qubits)
-            index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
-            hf_statevec[index] = 1
-            plus_statevec = IJ_statevec + hf_statevec
-            IJ_norm  = np.linalg.norm(IJ_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
+        # (dagger,dagger) term
+        # -<Psi|I'J'O|Psi>
+        # apply I'J' to <Psi|
+        total = 0.0
+        op_IJ = (op_J_dag @ op_I_dag).simplify()
+        IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
+        hf_statevec = np.zeros(2**self.qubits)
+        index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
+        hf_statevec[index] = 1
+        plus_statevec = IJ_statevec + hf_statevec
+        IJ_norm  = np.linalg.norm(IJ_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
 
+        X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
+        X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
+        X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
+        print(X_plus,plus_norm, X_IJ,IJ_norm, X_0)
+        print(term)
+        total += term
+        
+        # (dagger,.) term
+        # <Psi|I'OJ - I'JO|Psi>
+        # I'JO:
+        op_IJ = (op_J.adjoint() @ op_I_dag).simplify()
+        IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
+        hf_statevec = np.zeros(2**self.qubits)
+        index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
+        hf_statevec[index] = 1
+        plus_statevec = IJ_statevec + hf_statevec
+        IJ_norm  = np.linalg.norm(IJ_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
+
+        X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
+        X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
+        X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
+        print(term)
+        total += term
+        # I'OJ:
+        I_statevec = self.apply_tensor_op(op_I_dag, self.hf_state)
+        J_statevec = self.apply_tensor_op(op_J, self.hf_state)
+        plus_statevec = I_statevec + J_statevec
+        I_norm  = np.linalg.norm(I_statevec)
+        J_norm  = np.linalg.norm(J_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
+        
+        if plus_norm > 1e-12:
             X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
-            X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
-            print(X_plus,plus_norm, X_IJ,IJ_norm, X_0)
-            print(term)
-            total += term
-            
-            # (dagger,.) term
-            # <Psi|I'OJ - I'JO|Psi>
-            # I'JO:
-            op_IJ = (op_J.adjoint() @ op_I_dag).simplify()
-            IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
-            hf_statevec = np.zeros(2**self.qubits)
-            index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
-            hf_statevec[index] = 1
-            plus_statevec = IJ_statevec + hf_statevec
-            IJ_norm  = np.linalg.norm(IJ_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
+        else:
+            X_plus = 0.
+        X_I = self.circuit_operator_stateprep(self, self.theta, I_statevec/I_norm, operator)
+        X_J = self.circuit_operator_stateprep(self, self.theta, J_statevec/J_norm, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_I*I_norm**2- 0.5*X_J*J_norm**2)
+        print(term)
+        total -= term
 
+        # (.,dagger) term
+        # <Psi|J'OI - OJ'I|Psi>
+        # OJ'I:
+        op_IJ = (op_J_dag.adjoint() @ op_I).simplify()
+        IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
+        hf_statevec = np.zeros(2**self.qubits)
+        index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
+        hf_statevec[index] = 1
+        plus_statevec = IJ_statevec + hf_statevec
+        IJ_norm  = np.linalg.norm(IJ_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
+
+        if plus_norm > 1e-12:
             X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
-            X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
-            print(term)
-            total += term
-            # I'OJ:
-            I_statevec = self.apply_tensor_op(op_I_dag, self.hf_state)
-            J_statevec = self.apply_tensor_op(op_J, self.hf_state)
-            plus_statevec = I_statevec + J_statevec
-            I_norm  = np.linalg.norm(I_statevec)
-            J_norm  = np.linalg.norm(J_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
-            
-            if plus_norm > 1e-12:
-                X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            else:
-                X_plus = 0.
-            X_I = self.circuit_operator_stateprep(self, self.theta, I_statevec/I_norm, operator)
-            X_J = self.circuit_operator_stateprep(self, self.theta, J_statevec/J_norm, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_I*I_norm**2- 0.5*X_J*J_norm**2)
-            print(term)
-            total -= term
+        else:
+            X_plus = 0.
+        X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
+        X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
+        print(term)
+        total += term
+        # J'OI:
+        I_statevec = self.apply_tensor_op(op_I, self.hf_state)
+        J_statevec = self.apply_tensor_op(op_J_dag, self.hf_state)
+        plus_statevec = I_statevec + J_statevec
+        I_norm  = np.linalg.norm(I_statevec)
+        J_norm  = np.linalg.norm(J_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
 
-            # (.,dagger) term
-            # <Psi|J'OI - OJ'I|Psi>
-            # OJ'I:
-            op_IJ = (op_J_dag.adjoint() @ op_I).simplify()
-            IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
-            hf_statevec = np.zeros(2**self.qubits)
-            index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
-            hf_statevec[index] = 1
-            plus_statevec = IJ_statevec + hf_statevec
-            IJ_norm  = np.linalg.norm(IJ_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
+        if plus_norm > 1e-12:
+            X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
+        else:
+            X_plus = 0.
+        X_I = self.circuit_operator_stateprep(self, self.theta, I_statevec/I_norm, operator)
+        X_J = self.circuit_operator_stateprep(self, self.theta, J_statevec/J_norm, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_I*I_norm**2- 0.5*X_J*J_norm**2)
+        print(term)
+        total -= term
 
-            if plus_norm > 1e-12:
-                X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            else:
-                X_plus = 0.
-            X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
-            X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
-            print(term)
-            total += term
-            # J'OI:
-            I_statevec = self.apply_tensor_op(op_I, self.hf_state)
-            J_statevec = self.apply_tensor_op(op_J_dag, self.hf_state)
-            plus_statevec = I_statevec + J_statevec
-            I_norm  = np.linalg.norm(I_statevec)
-            J_norm  = np.linalg.norm(J_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
+        # (.,.) term
+        # -<Psi|OJI|Psi>
+        op_IJ = (op_J @ op_I).simplify()
+        IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
+        hf_statevec = np.zeros(2**self.qubits)
+        index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
+        hf_statevec[index] = 1
+        plus_statevec = IJ_statevec + hf_statevec
+        IJ_norm  = np.linalg.norm(IJ_statevec)
+        plus_norm  = np.linalg.norm(plus_statevec)
 
-            if plus_norm > 1e-12:
-                X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            else:
-                X_plus = 0.
-            X_I = self.circuit_operator_stateprep(self, self.theta, I_statevec/I_norm, operator)
-            X_J = self.circuit_operator_stateprep(self, self.theta, J_statevec/J_norm, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_I*I_norm**2- 0.5*X_J*J_norm**2)
-            print(term)
-            total -= term
-
-            # (.,.) term
-            # -<Psi|OJI|Psi>
-            op_IJ = (op_J @ op_I).simplify()
-            IJ_statevec = self.apply_tensor_op(op_IJ, self.hf_state)
-            hf_statevec = np.zeros(2**self.qubits)
-            index = np.sum(2**(np.arange(self.qubits)[::-1])*self.hf_state)
-            hf_statevec[index] = 1
-            plus_statevec = IJ_statevec + hf_statevec
-            IJ_norm  = np.linalg.norm(IJ_statevec)
-            plus_norm  = np.linalg.norm(plus_statevec)
-
-            if plus_norm > 1e-12:
-                X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
-            else:
-                X_plus = 0.
-            X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
-            X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
-            term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
-            print(term)
-            total += term
-            print('Total:', total)
+        if plus_norm > 1e-12:
+            X_plus = self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator)
+        else:
+            X_plus = 0.
+        X_IJ = self.circuit_operator_stateprep(self, self.theta, IJ_statevec/IJ_norm, operator)
+        X_0 = self.circuit_operator_stateprep(self, self.theta, hf_statevec, operator)
+        term = -(0.5*X_plus*plus_norm**2 - 0.5*X_IJ*IJ_norm**2- 0.5*X_0)
+        print(term)
+        total += term
+        print('Total:', total)
 
     def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
         if triplet:
