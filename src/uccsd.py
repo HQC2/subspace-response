@@ -343,7 +343,7 @@ class uccsd(object):
             statevector[index] += weight*phase
         return statevector
 
-    def V2_contraction(self, integral, I_vector, I_vector_dag, J_vector, J_vector_dag, triplet=False):
+    def V2_contraction(self, integral, I, I_dag, J, J_dag, triplet=False):
         if triplet:
             # todo
             raise NotImplementedError
@@ -373,10 +373,10 @@ class uccsd(object):
                 operator += sign*mo_integral[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
         operator = qml.jordan_wigner(operator)
 
-        op_I = sum([I_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_I_dag = sum([I_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J = sum([J_vector[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J_dag = sum([J_vector_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I = sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I_dag = sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J = sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J_dag = sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
 
         def term(left_op, right_op, operator):
             # |R> = right_op |0>
@@ -409,6 +409,66 @@ class uccsd(object):
         # (.,.) term
         # -<Psi|OJI|Psi>
         total -= term(None, (op_J@op_I).simplify(), operator)
+        return total
+
+    def E3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
+        if triplet:
+            # todo
+            raise NotImplementedError
+            excitation_operators = self.excitation_operators_triplet
+        else:
+            excitation_operators = self.excitation_operators_singlet
+        op_I = sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I_dag = sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J = sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_J_dag = sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_K = sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_K_dag = sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+
+        def term(left_op, right_op, operator):
+            # |R> = right_op |0>
+            # |L> = left_op |0>
+            # compute <L|U'O U|R>
+            L_statevec = self.apply_tensor_op(left_op, self.hf_state)
+            R_statevec = self.apply_tensor_op(right_op, self.hf_state)
+            plus_statevec = L_statevec + R_statevec
+            L_norm = np.linalg.norm(L_statevec)
+            R_norm = np.linalg.norm(R_statevec)
+            plus_norm = np.linalg.norm(plus_statevec)
+            L_expval = L_norm**2*self.circuit_operator_stateprep(self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
+            R_expval = R_norm**2*self.circuit_operator_stateprep(self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
+            plus_expval = plus_norm**2*self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
+            return 0.5*(plus_expval - L_expval - R_expval)
+        
+        total = 0.0
+        # (dagger,dagger,dagger) <Psi|I'J'K'H|Psi>
+        total += term(op_K_dag@op_J_dag@op_I_dag,None,self.H)
+        # (.,dagger,dagger) <Psi|-J'K'HI + J'HK'I + K'HJ'I - HK'J'I |Psi>
+        total -= term(op_K_dag@op_J_dag, op_I, self.H)
+        total += term(op_J_dag,op_K_dag@op_I, self.H)
+        total += term(op_K_dag,op_J_dag@op_I, self.H)
+        total -= term(None,op_K_dag@op_J_dag@op_I, self.H)
+        # (dagger,.,dagger) <Psi|I'JK'H - I'K'HJ + I'HK'J|Psi>
+        total += term(op_K_dag@op_J@op_I_dag, None, self.H)
+        total -= term(op_K_dag@op_I_dag, op_J, self.H)
+        total += term(op_I_dag, op_K_dag@op_J, self.H)
+        # (dagger,dagger,.) <Psi|I'J'KH - I'J'HK|Psi>
+        total += term(op_K@op_J_dag@op_I_dag, None, self.H)
+        total -= term(op_J_dag@op_I_dag, op_K, self.H)
+        # (.,.,dagger) <Psi|K'HJI - HK'JI|Psi>
+        total += term(op_K_dag, op_J@op_I, self.H)
+        total -= term(None, op_K_dag@op_J@op_I, self.H)
+        # (.,dagger,.) <Psi|-J'KHI + J'HKI - HKJ'I|Psi>
+        total -= term(op_K@op_J_dag, op_I, self.H)
+        total += term(op_J_dag, op_K@op_I, self.H)
+        total -= term(None, op_K@op_J_dag@op_I, self.H)
+        # (dagger, ., .) <Psi|I'JKH - I'JHK - I'KHJ + I'HKJ|Psi>
+        total += term(op_K@op_J@op_I_dag, None, self.H)
+        total -= term(op_J@op_I_dag, op_K, self.H)
+        total -= term(op_K@op_I_dag, op_J, self.H)
+        total += term(op_I_dag, op_K@op_J, self.H)
+        # (.,.,.) <Psi|-HKJI|Psi>
+        total -= term(None, op_K@op_J@op_I, self.H)
         return total
 
     def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
@@ -449,5 +509,3 @@ class uccsd(object):
                                         result -= w*J_dag[D_idx]*K[S1_idx]*I[S2_idx]
                                         result += w*K_dag[D_idx]*I[S1_idx]*J[S2_idx]
         return 0.5*result
-
-
