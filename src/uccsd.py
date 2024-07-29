@@ -445,27 +445,27 @@ class uccsd(object):
         total += term(op_K_dag@op_J_dag@op_I_dag,None,self.H)
         # (.,dagger,dagger) <Psi|-J'K'HI + J'HK'I + K'HJ'I - HK'J'I |Psi>
         total -= term(op_K_dag@op_J_dag, op_I, self.H)
-        total += term(op_J_dag,op_K_dag@op_I, self.H)
-        total += term(op_K_dag,op_J_dag@op_I, self.H)
-        total -= term(None,op_K_dag@op_J_dag@op_I, self.H)
+        total += term(op_J_dag,op_K_dag.adjoint()@op_I, self.H)
+        total += term(op_K_dag,op_J_dag.adjoint()@op_I, self.H)
+        total -= term(None,op_K_dag.adjoint()@op_J_dag.adjoint()@op_I, self.H)
         # (dagger,.,dagger) <Psi|I'JK'H - I'K'HJ + I'HK'J|Psi>
-        total += term(op_K_dag@op_J@op_I_dag, None, self.H)
+        total += term(op_K_dag@op_J.adjoint()@op_I_dag, None, self.H)
         total -= term(op_K_dag@op_I_dag, op_J, self.H)
-        total += term(op_I_dag, op_K_dag@op_J, self.H)
+        total += term(op_I_dag, op_K_dag.adjoint()@op_J, self.H)
         # (dagger,dagger,.) <Psi|I'J'KH - I'J'HK|Psi>
-        total += term(op_K@op_J_dag@op_I_dag, None, self.H)
+        total += term(op_K.adjoint()@op_J_dag@op_I_dag, None, self.H)
         total -= term(op_J_dag@op_I_dag, op_K, self.H)
         # (.,.,dagger) <Psi|K'HJI - HK'JI|Psi>
         total += term(op_K_dag, op_J@op_I, self.H)
-        total -= term(None, op_K_dag@op_J@op_I, self.H)
+        total -= term(None, op_K_dag.adjoint()@op_J@op_I, self.H)
         # (.,dagger,.) <Psi|-J'KHI + J'HKI - HKJ'I|Psi>
-        total -= term(op_K@op_J_dag, op_I, self.H)
+        total -= term(op_K.adjoint()@op_J_dag, op_I, self.H)
         total += term(op_J_dag, op_K@op_I, self.H)
-        total -= term(None, op_K@op_J_dag@op_I, self.H)
+        total -= term(None, op_K@op_J_dag.adjoint()@op_I, self.H)
         # (dagger, ., .) <Psi|I'JKH - I'JHK - I'KHJ + I'HKJ|Psi>
-        total += term(op_K@op_J@op_I_dag, None, self.H)
-        total -= term(op_J@op_I_dag, op_K, self.H)
-        total -= term(op_K@op_I_dag, op_J, self.H)
+        total += term(op_K.adjoint()@op_J.adjoint()@op_I_dag, None, self.H)
+        total -= term(op_J.adjoint()@op_I_dag, op_K, self.H)
+        total -= term(op_K.adjoint()@op_I_dag, op_J, self.H)
         total += term(op_I_dag, op_K@op_J, self.H)
         # (.,.,.) <Psi|-HKJI|Psi>
         total -= term(None, op_K@op_J@op_I, self.H)
