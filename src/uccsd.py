@@ -366,11 +366,10 @@ class uccsd(object):
 
         operator = 0.0
         sign = -1 if triplet else 1
-        I = self.inactive_electrons//2
         for p in range(self.qubits//2):
             for q in range(self.qubits//2):
-                operator += mo_integral[I + p, I + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
-                operator += sign*mo_integral[I + p, I + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
+                operator += mo_integral[self.inactive_electrons//2 + p, self.inactive_electrons//2 + q]*qml.FermiC(2*p)*qml.FermiA(2*q)
+                operator += sign*mo_integral[self.inactive_electrons//2 + p, self.inactive_electrons//2 + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
         operator = qml.jordan_wigner(operator)
 
         op_I = sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
@@ -473,7 +472,7 @@ class uccsd(object):
         total += term([op_I_dag], [op_K,op_J], self.H)
         # (.,.,.) <Psi|-HKJI|Psi>
         total -= term([], [op_K,op_J,op_I], self.H)
-        return total
+        return 0.5*total
 
     def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
         if triplet:
@@ -512,4 +511,4 @@ class uccsd(object):
                                         result -= w*I_dag[S1_idx]*K_dag[S2_idx]*J[D_idx]
                                         result -= w*J_dag[D_idx]*K[S1_idx]*I[S2_idx]
                                         result += w*K_dag[D_idx]*I[S1_idx]*J[S2_idx]
-        return 0.5*result
+        return -0.5*result
