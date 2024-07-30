@@ -418,19 +418,23 @@ class uccsd(object):
             excitation_operators = self.excitation_operators_triplet
         else:
             excitation_operators = self.excitation_operators_singlet
-        op_I = sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_I_dag = sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J = sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J_dag = sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_K = sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_K_dag = sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I = qml.matrix(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_I_dag = qml.matrix(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_J = qml.matrix(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_J_dag = qml.matrix(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_K = qml.matrix(sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_K_dag = qml.matrix(sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
 
-        def term(left_op, right_op, operator):
+        def term(left_ops, right_ops, operator):
             # |R> = right_op |0>
             # |L> = left_op |0>
             # compute <L|U'O U|R>
-            L_statevec = self.apply_tensor_op(left_op, self.hf_state)
-            R_statevec = self.apply_tensor_op(right_op, self.hf_state)
+            hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
+            index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
+            hf_statevector[index] = 1
+
+            L_statevec = functools.reduce(np.dot, left_ops + [hf_statevector])
+            R_statevec = functools.reduce(np.dot, right_ops + [hf_statevector])
             plus_statevec = L_statevec + R_statevec
             L_norm = np.linalg.norm(L_statevec)
             R_norm = np.linalg.norm(R_statevec)
@@ -442,33 +446,33 @@ class uccsd(object):
         
         total = 0.0
         # (dagger,dagger,dagger) <Psi|I'J'K'H|Psi>
-        total += term(op_K_dag@op_J_dag@op_I_dag,None,self.H)
+        total += term([op_K_dag,op_J_dag,op_I_dag], [], self.H)
         # (.,dagger,dagger) <Psi|-J'K'HI + J'HK'I + K'HJ'I - HK'J'I |Psi>
-        total -= term(op_K_dag@op_J_dag, op_I, self.H)
-        total += term(op_J_dag,op_K_dag.adjoint()@op_I, self.H)
-        total += term(op_K_dag,op_J_dag.adjoint()@op_I, self.H)
-        total -= term(None,op_K_dag.adjoint()@op_J_dag.adjoint()@op_I, self.H)
+        total -= term([op_K_dag,op_J_dag], [op_I], self.H)
+        total += term([op_J_dag], [op_K_dag.T.conj(),op_I], self.H)
+        total += term([op_K_dag], [op_J_dag.T.conj(),op_I], self.H)
+        total -= term([],[op_K_dag.T.conj(),op_J_dag.T.conj(),op_I], self.H)
         # (dagger,.,dagger) <Psi|I'JK'H - I'K'HJ + I'HK'J|Psi>
-        total += term(op_K_dag@op_J.adjoint()@op_I_dag, None, self.H)
-        total -= term(op_K_dag@op_I_dag, op_J, self.H)
-        total += term(op_I_dag, op_K_dag.adjoint()@op_J, self.H)
+        total += term([op_K_dag,op_J.T.conj(),op_I_dag], [], self.H)
+        total -= term([op_K_dag,op_I_dag], [op_J], self.H)
+        total += term([op_I_dag], [op_K_dag.T.conj(),op_J], self.H)
         # (dagger,dagger,.) <Psi|I'J'KH - I'J'HK|Psi>
-        total += term(op_K.adjoint()@op_J_dag@op_I_dag, None, self.H)
-        total -= term(op_J_dag@op_I_dag, op_K, self.H)
+        total += term([op_K.T.conj(),op_J_dag,op_I_dag], [], self.H)
+        total -= term([op_J_dag,op_I_dag], [op_K], self.H)
         # (.,.,dagger) <Psi|K'HJI - HK'JI|Psi>
-        total += term(op_K_dag, op_J@op_I, self.H)
-        total -= term(None, op_K_dag.adjoint()@op_J@op_I, self.H)
+        total += term([op_K_dag], [op_J,op_I], self.H)
+        total -= term([], [op_K_dag.T.conj(),op_J,op_I], self.H)
         # (.,dagger,.) <Psi|-J'KHI + J'HKI - HKJ'I|Psi>
-        total -= term(op_K.adjoint()@op_J_dag, op_I, self.H)
-        total += term(op_J_dag, op_K@op_I, self.H)
-        total -= term(None, op_K@op_J_dag.adjoint()@op_I, self.H)
+        total -= term([op_K.T.conj(),op_J_dag], [op_I], self.H)
+        total += term([op_J_dag], [op_K,op_I], self.H)
+        total -= term([], [op_K,op_J_dag.T.conj(),op_I], self.H)
         # (dagger, ., .) <Psi|I'JKH - I'JHK - I'KHJ + I'HKJ|Psi>
-        total += term(op_K.adjoint()@op_J.adjoint()@op_I_dag, None, self.H)
-        total -= term(op_J.adjoint()@op_I_dag, op_K, self.H)
-        total -= term(op_K.adjoint()@op_I_dag, op_J, self.H)
-        total += term(op_I_dag, op_K@op_J, self.H)
+        total += term([op_K.T.conj(),op_J.T.conj(),op_I_dag], [], self.H)
+        total -= term([op_J.T.conj(),op_I_dag], [op_K], self.H)
+        total -= term([op_K.T.conj(),op_I_dag], [op_J], self.H)
+        total += term([op_I_dag], [op_K,op_J], self.H)
         # (.,.,.) <Psi|-HKJI|Psi>
-        total -= term(None, op_K@op_J@op_I, self.H)
+        total -= term([], [op_K,op_J,op_I], self.H)
         return total
 
     def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
