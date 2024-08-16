@@ -214,7 +214,7 @@ class uccsd(object):
                 operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
-                operator_matrix = operator.matrix()
+                operator_matrix = operator.matrix(wire_order=range(ucc.qubits))
 
                 operator_gradient = np.zeros_like(parameter_excitation)
                 state_0 = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
