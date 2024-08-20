@@ -6,7 +6,7 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 import pyscf
 import excitations
 import copy
@@ -71,6 +71,14 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            return qml.expval(operator)
+
         self.H = H
         self.qubits = qubits
         self.electrons = electrons
@@ -84,6 +92,7 @@ class uccsd(object):
         self.circuit_operator = circuit_operator
         self.circuit_exc = circuit_exc
         self.circuit_exc_operator = circuit_exc_operator
+        self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
 
 
@@ -213,8 +222,11 @@ class uccsd(object):
             if approach == 'derivative':
                 operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
+            elif approach == 'iH-derivative':
+                operator_gradient = get_gradient(self.circuit_iH_exc_operator, argnum=2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
+                operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
-                operator_matrix = operator.matrix(wire_order=range(ucc.qubits))
+                operator_matrix = operator.matrix(wire_order=range(self.qubits))
 
                 operator_gradient = np.zeros_like(parameter_excitation)
                 state_0 = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
