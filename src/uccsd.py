@@ -6,17 +6,14 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-import periodictable
-import functools
-from uccsd_circuits import UCCSD, UCCSD_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 import pyscf
 import excitations
-import h5py
 import copy
-from functools import partial
+from molecular_hamiltonian import get_molecular_hamiltonian
+import time
 
 import polarizationsolver
-from molecular_hamiltonian import get_molecular_hamiltonian 
 
 def read_xyz(filename):
     elements = []
@@ -40,16 +37,29 @@ def _make_rdm1_on_mo(casdm1, ncore, ncas, nmo):
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None, PE=None):
-        H, qubits = qml.qchem.molecular_hamiltonian(symbols, geometry, charge=charge, method='pyscf', basis=basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
-        hf_filename = f'molecule_pyscf_{basis.strip()}.hdf5'
-        electrons = sum([periodictable.elements.__dict__[symbol].number for symbol in symbols]) - charge
+        atom_str = ''
+        for symbol, coord in zip(symbols, geometry):
+            atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
+        m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
+        mf = pyscf.scf.RHF(m).run()
+        self.m = m
+        self.mf = mf
+        self.PE = None
+        if PE is not None:
+            system = polarizationsolver.readers.parser(polarizationsolver.readers.potreader(PE))
+            self.PE = system
+            self.mf = pyscf.solvent.PE(mf, PE)
+            self.mf.kernel()
+        electrons = sum(m.nelec)
+        orbitals = m.nao
+        active_electrons = active_electrons if active_electrons else electrons
+        active_orbitals = active_orbitals if active_orbitals else orbitals
+        self.inactive_electrons = electrons - active_electrons
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
-        self.inactive_electrons = 0
-        if active_electrons is not None:
-            self.inactive_electrons = electrons - active_electrons
-            electrons = active_electrons
+        H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
         hf_state = qml.qchem.hf_state(electrons, qubits)
+
         excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
         excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
@@ -101,6 +111,14 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            return qml.expval(operator)
+
         self.H = H
         self.qubits = qubits
         self.electrons = electrons
@@ -116,29 +134,11 @@ class uccsd(object):
         self.circuit_exc = circuit_exc
         self.circuit_exc_operator = circuit_exc_operator
         self.circuit_exc_operators = circuit_exc_operators
+        self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
-        self.PE = None
-        if PE is not None:
-            system = polarizationsolver.readers.parser(polarizationsolver.readers.potreader(PE))
-            self.PE = system
-
-        atom_str = ''
-        for symbol, coord in zip(symbols, geometry):
-            atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
-            print(atom_str)
-        m = pyscf.M(atom=atom_str, basis=basis, charge=charge, unit='bohr')
-        mf = pyscf.scf.RHF(m)
-        with h5py.File(hf_filename, 'r') as f:
-            mf.mo_coeff = f['canonical_orbitals'][()]
-            mf.mo_energy = f['orbital_energies'][()]
-            print(mf.mo_energy)
-        self.m = m
-        self.mf = mf
-        if PE is not None:
-            self.mf = pyscf.solvent.PE(mf, PE)
-            self.mf.kernel()
 
     def rdm1_slow(self, params_ground_state, params_excitation=None, triplet=False):
+        t1 = time.time()
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
         k = 0
         for i in range(self.qubits//2):
@@ -153,6 +153,8 @@ class uccsd(object):
                 rdm1_active[i, j] = expval
                 rdm1_active[j, i] = expval
                 k = k + 1
+        t2 = time.time()
+        print('rdm1', t2 - t1)
         return rdm1_active
 
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
@@ -170,6 +172,7 @@ class uccsd(object):
                     if term.arithmetic_depth > 0:
                         coeff, ob = term.terms()
                         if term.arithmetic_depth == 1:
+                            print(ob)
                             ob = qml.operation.Tensor(*ob)
                         else:
                             ob = qml.operation.Tensor(*ob[0])
@@ -199,7 +202,7 @@ class uccsd(object):
             E_pol = 0.
             if self.PE:
                 # get 1RDM and transform to AO
-                dm_mo = self.rdm1(params)
+                dm_mo = self.rdm1_slow(params)
                 dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
                 dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
                 # get electric fields from QM
@@ -244,10 +247,15 @@ class uccsd(object):
                 self.H = H
                 self.v_PE_gs = v_PE
 
-            
+            t1 = time.time()
             energy = self.circuit(self, params)
+            t2 = time.time()
+            print('energy', t2 - t1)
             #print("<v_PE> = ", np.sum(dm_ao * v_PE))
+            t1 = time.time()
             grad = get_gradient(self.circuit)(self, params)
+            t2 = time.time()
+            print('grad', t2 - t1)
             if self.PE:
                 #print('E_PE = ', energy + energy_pe_en + E_pol 
                 #print("<v_PE> (tot) = ", np.sum(dm_ao*(v_PE)))
@@ -415,8 +423,11 @@ class uccsd(object):
             if approach == 'derivative':
                 operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
+            elif approach == 'iH-derivative':
+                operator_gradient = get_gradient(self.circuit_iH_exc_operator, argnum=2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
+                operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
-                operator_matrix = operator.matrix()
+                operator_matrix = operator.matrix(wire_order=range(self.qubits))
 
                 operator_gradient = np.zeros_like(parameter_excitation)
                 state_0 = self.circuit_state(self, self.theta, parameter_excitation, triplet=triplet)
