@@ -10,7 +10,7 @@ from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 import pyscf
 import excitations
 import copy
-from molecular_hamiltonian import get_molecular_hamiltonian
+from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
 import time
 
 import polarizationsolver
@@ -126,6 +126,7 @@ class uccsd(object):
             return qml.expval(operator)
 
         self.H = H
+        self.H_gas = H
         self.qubits = qubits
         self.electrons = electrons
         self.hf_state = hf_state
@@ -165,38 +166,22 @@ class uccsd(object):
 
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
-        k = 0
         operators = []
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
-                fermi = qml.FermiC(2*i)*qml.FermiA(2*j)
-                fermi += qml.FermiC(2*i + 1)*qml.FermiA(2*j + 1)
+                fermi = qml.FermiC(2*i) * qml.FermiA(2*j) 
+                fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
                 operator = qml.jordan_wigner(fermi)
-                coeffs = []
-                obs = []
-                for term in operator.terms()[1]:
-                    if term.arithmetic_depth > 0:
-                        coeff, ob = term.terms()
-                        if term.arithmetic_depth == 1:
-                            print(ob)
-                            ob = qml.operation.Tensor(*ob)
-                        else:
-                            ob = qml.operation.Tensor(*ob[0])
-                    else:
-                        coeff = [1]
-                        ob = term
-                    coeffs.extend(coeff)
-                    obs.append(ob)
-                operators.append(qml.Hamiltonian(np.array(coeffs).astype(np.float64), obs).simplify())
+                operators.append(operator)
         if params_excitation is not None:
-            expectation_values = self.circuit_exc_operators(self, params_ground_state, params_excitation, operators, triplet=triplet)
+            expvals = self.circuit_exc_operator(self, params_ground_state, params_excitation, operators, triplet=triplet)
         else:
-            expectation_values = self.circuit_operators(self, params_ground_state, operators)
+            expvals = self.circuit_operator(self, params_ground_state, operators)
+        k = 0
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
-                expval = expectation_values[k]
-                rdm1_active[i, j] = expval
-                rdm1_active[j, i] = expval
+                rdm1_active[i,j] = expvals[k]
+                rdm1_active[j,i] = expvals[k]
                 k = k + 1
         return rdm1_active
 
@@ -208,7 +193,7 @@ class uccsd(object):
             E_pol = 0.
             if self.PE:
                 # get 1RDM and transform to AO
-                dm_mo = self.rdm1_slow(params)
+                dm_mo = self.rdm1(params)
                 dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
                 dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
                 # get electric fields from QM
@@ -249,52 +234,21 @@ class uccsd(object):
                     E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
                     E_pol = self.PE.E_pol
 
-                H, qubits = get_molecular_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
-                self.H = H
+                H_PE, qubits = get_PE_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                self.H = self.H_gas + H_PE
                 self.v_PE_gs = v_PE
 
-            t1 = time.time()
             energy = self.circuit(self, params)
-            t2 = time.time()
-            print('energy', t2 - t1)
-            #print("<v_PE> = ", np.sum(dm_ao * v_PE))
-            t1 = time.time()
             grad = get_gradient(self.circuit)(self, params)
-            t2 = time.time()
-            print('grad', t2 - t1)
             if self.PE:
-                #print('E_PE = ', energy + energy_pe_en + E_pol 
-                #print("<v_PE> (tot) = ", np.sum(dm_ao*(v_PE)))
                 energy += energy_pe_en + E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
-            #    print("<v_PE> (ind) = ", np.sum(dm_ao*(v_ind)))
-            #else:
-            print('energy = ', energy)#, E_pol_nuc, E_pol, 0.5*np.dot(self.PE.induced_moments[1].ravel(), F_nuc.ravel()))
+            print('energy = ', energy)
             return energy, grad
 
         res = minimize(energy_and_jac, jac=True, x0=self.theta, method=min_method, tol=1e-12)
         print(res)
         self.theta = res.x
 
-    def rdm1(self, params_excitation=None, triplet=False):
-        rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
-        operators = []
-        for i in range(self.qubits//2):
-            for j in range(i, self.qubits//2):
-                fermi = qml.FermiC(2*i) * qml.FermiA(2*j) 
-                fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
-                operator = qml.jordan_wigner(fermi)
-                operators.append(operator)
-        if params_excitation is not None:
-            expvals = self.circuit_exc_operator(self, self.theta, params_excitation, operators, triplet=triplet)
-        else:
-            expvals = self.circuit_operator(self, self.theta, operators)
-        k = 0
-        for i in range(self.qubits//2):
-            for j in range(i, self.qubits//2):
-                rdm1_active[i,j] = expvals[k]
-                rdm1_active[j,i] = expvals[k]
-                k = k + 1
-        return rdm1_active
 
     def hvp(self, v, h=1e-6, scheme='central', triplet=False):
         def grad(x):
@@ -339,8 +293,8 @@ class uccsd(object):
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
                     v_PE += v_ind + v_ind.T
 
-                H, qubits = get_molecular_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
-                self.H = H
+                H_PE, qubits = get_PE_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                self.H = self.H_gas + H_PE
             return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
