@@ -80,7 +80,10 @@ class uccsd(object):
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_operator(self, params_ground_state, operator):
             UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return qml.expval(operator)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_operators(self, params_ground_state, operators):
@@ -93,7 +96,10 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(operator)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operators(self, params_ground_state, params_excitation, operators, triplet=False):
@@ -268,6 +274,27 @@ class uccsd(object):
         res = minimize(energy_and_jac, jac=True, x0=self.theta, method=min_method, tol=1e-12)
         print(res)
         self.theta = res.x
+
+    def rdm1(self, params_excitation=None, triplet=False):
+        rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
+        operators = []
+        for i in range(self.qubits//2):
+            for j in range(i, self.qubits//2):
+                fermi = qml.FermiC(2*i) * qml.FermiA(2*j) 
+                fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
+                operator = qml.jordan_wigner(fermi)
+                operators.append(operator)
+        if params_excitation is not None:
+            expvals = self.circuit_exc_operator(self, self.theta, params_excitation, operators, triplet=triplet)
+        else:
+            expvals = self.circuit_operator(self, self.theta, operators)
+        k = 0
+        for i in range(self.qubits//2):
+            for j in range(i, self.qubits//2):
+                rdm1_active[i,j] = expvals[k]
+                rdm1_active[j,i] = expvals[k]
+                k = k + 1
+        return rdm1_active
 
     def hvp(self, v, h=1e-6, scheme='central', triplet=False):
         def grad(x):
