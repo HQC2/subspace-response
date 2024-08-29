@@ -6,12 +6,13 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc, UCCSD_stateprep
 import pyscf
 import excitations
 import copy
 from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
 import time
+import scipy
 
 import polarizationsolver
 
@@ -58,10 +59,10 @@ class uccsd(object):
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
         H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
-        hf_state = qml.qchem.hf_state(electrons, qubits)
+        hf_state = qml.qchem.hf_state(active_electrons, qubits)
 
-        excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
-        excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
+        excitations_singlet = excitations.spin_adapted_excitations(active_electrons, qubits)
+        excitations_triplet = excitations.spin_adapted_excitations(active_electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
@@ -125,6 +126,14 @@ class uccsd(object):
                 UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.expval(operator)
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_operator_stateprep(self, params_ground_state, statevector, operator, triplet=False):
+            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
         self.H = H
         self.H_gas = H
         self.qubits = qubits
@@ -143,6 +152,7 @@ class uccsd(object):
         self.circuit_exc_operators = circuit_exc_operators
         self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
+        self.circuit_operator_stateprep = circuit_operator_stateprep
 
     def rdm1_slow(self, params_ground_state, params_excitation=None, triplet=False):
         t1 = time.time()
@@ -193,7 +203,11 @@ class uccsd(object):
             E_pol = 0.
             if self.PE:
                 # get 1RDM and transform to AO
+                t1 = time.time()
                 dm_mo = self.rdm1(params)
+                t2 = time.time()
+                print('::: make rdm1 mo :::', t2 - t1)
+                t1 = time.time()
                 dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
                 dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
                 # get electric fields from QM
@@ -234,12 +248,20 @@ class uccsd(object):
                     E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
                     E_pol = self.PE.E_pol
 
-                H_PE, qubits = get_PE_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_PE)
                 self.H = self.H_gas + H_PE
                 self.v_PE_gs = v_PE
-
+                t2 = time.time()
+                print('::: rest of PE hamiltonian build :::', t2 - t1)
+    
+            t1 = time.time()
             energy = self.circuit(self, params)
+            t2 = time.time()
+            print('::: energy circuit eval :::', t2 - t1)
+            t1 = time.time()
             grad = get_gradient(self.circuit)(self, params)
+            t2 = time.time()
+            print('::: gradient circuit eval :::', t2 - t1)
             if self.PE:
                 energy += energy_pe_en + E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
             print('energy = ', energy)
@@ -250,7 +272,7 @@ class uccsd(object):
         self.theta = res.x
 
 
-    def hvp(self, v, h=1e-6, scheme='central', triplet=False):
+    def hvp(self, v, h=1e-5, scheme='central', triplet=False):
         def grad(x):
             if self.PE:
                 # get 1RDM and transform to AO
@@ -259,41 +281,23 @@ class uccsd(object):
                 dm_mo = self.rdm1(self.theta, params_excitation=x)
                 dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
                 delta = dm_mo - dm_mo_gs
-                dm_ao = self.mf.mo_coeff @ (dm_mo_gs+0.5*delta) @ self.mf.mo_coeff.T
+                dm_ao = self.mf.mo_coeff @ (delta) @ self.mf.mo_coeff.T
                 # get electric fields from QM
                 # get induction contribution
                 # modify gas-phase Hamiltonian with v_es + v_ind 
-                v_PE = np.zeros_like(dm_ao)
+                v_PE = self.v_PE_gs
                 fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
 
                 # solve for induced dipoles
-                if 1 in (self.PE.active_permanent_multipole_ranks) or (1 in self.PE.active_induced_multipole_ranks):
-                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
-                if 0 in self.PE.active_permanent_multipole_ranks:
-                    v_PE += -np.sum(pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e')*self.PE.permanent_moments[0], axis=2)
-                # dipoles
-                # field_integrals could maybe be symmetrized in (0,1) dimension
-                if 1 in self.PE.active_permanent_multipole_ranks:
-                    v_dip = -np.sum(field_integrals*self.PE.permanent_moments[1], axis=(2,3))
-                    v_PE += v_dip + v_dip.T
-                # quadrupoles
-                if 2 in self.PE.active_permanent_multipole_ranks:
-                    # remove trace
-                    v_quad = -0.5*np.sum((pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipip1') +  pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipvip1')).transpose(1,2,3,0) * self.PE.permanent_moments[2].reshape(-1,9), axis=(2,3))
-                    v_PE += v_quad + v_quad.T
-
-                # solve for induced dipoles
-                # rhs field = F_nuc + F_el + F_multipole
-                # F_multipole is constructed internally by polarizationsolver
                 if 1 in self.PE.active_induced_multipole_ranks:
-                    F_nuc = polarizationsolver.fields.field(self.PE.coordinates - self.m.atom_coords()[:,None,:], 0, self.m.atom_charges(), 1)
-                    F_rhs = F_nuc + 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
+                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                    F_rhs = 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
                     self.PE.external_field = [[], F_rhs]
-                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12)
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True)
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
                     v_PE += v_ind + v_ind.T
 
-                H_PE, qubits = get_PE_hamiltonian(self, self.electrons, self.qubits//2, v_PE=v_PE)
+                H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_PE)
                 self.H = self.H_gas + H_PE
             return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
@@ -317,6 +321,72 @@ class uccsd(object):
 
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
+
+    def hvp_new(self, v, triplet=False):
+        # hvp via superposition states
+        need_reshape = False
+        if len(v.shape) == 1:
+            v = v.reshape(-1, 1)
+            need_reshape = True
+        hvp = np.zeros_like(v)
+        e_gr = self.circuit(self, self.theta)
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+        for k in range(v.shape[1]):
+            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            for i in range(v.shape[0]):
+                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
+            # todo: support sparse vector in stateprep
+            mvv = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=self.H)
+            for i in range(v.shape[0]):
+                i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
+                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
+                v_plus_i_statevector /= norm
+                mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
+                miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
+                hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
+        if need_reshape:
+            hvp = hvp.reshape(-1)
+        return hvp
+
+    def transition_density(self, v, triplet=False):
+        need_reshape = False
+        if len(v.shape) == 1:
+            v = v.reshape(-1, 1)
+            need_reshape = True
+        D_tr = np.zeros((v.shape[1], self.qubits//2, self.qubits//2))
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+        operators = []
+        for i in range(self.qubits//2):
+            for j in range(self.qubits//2):
+                fermi = qml.FermiC(2*i) * qml.FermiA(2*j) 
+                fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
+                operator = qml.jordan_wigner(fermi)
+                operators.append(operator)
+        D0_expvals = self.circuit_operator(self, self.theta, operators)
+        hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+        for k in range(v.shape[1]):
+            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            for i in range(v.shape[0]):
+                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
+            plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
+            Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
+            D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
+            unpack_idx = 0
+            for i in range(self.qubits//2):
+                for j in range(self.qubits//2):
+                    D_tr[k,i,j] = D0v_expvals[unpack_idx] - 0.5*(D0_expvals[unpack_idx] + Dvv_expvals[unpack_idx])
+                    unpack_idx += 1 
+        if need_reshape:
+            # only a single trial-vector
+            D_tr = D_tr[0]
+        return D_tr
 
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
