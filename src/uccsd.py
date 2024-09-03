@@ -102,14 +102,6 @@ class uccsd(object):
             else:
                 return qml.expval(operator)
 
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_exc_operators(self, params_ground_state, params_excitation, operators, triplet=False):
-            if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return [qml.expval(operator) for operator in operators]
-
         @qml.qnode(dev, diff_method="best")
         def circuit_state(self, params_ground_state, params_excitation, triplet=False):
             if triplet:
@@ -146,16 +138,13 @@ class uccsd(object):
         self.device = dev
         self.circuit = circuit
         self.circuit_operator = circuit_operator
-        self.circuit_operators = circuit_operators
         self.circuit_exc = circuit_exc
         self.circuit_exc_operator = circuit_exc_operator
-        self.circuit_exc_operators = circuit_exc_operators
         self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
         self.circuit_operator_stateprep = circuit_operator_stateprep
 
     def rdm1_slow(self, params_ground_state, params_excitation=None, triplet=False):
-        t1 = time.time()
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
         k = 0
         for i in range(self.qubits//2):
@@ -170,8 +159,6 @@ class uccsd(object):
                 rdm1_active[i, j] = expval
                 rdm1_active[j, i] = expval
                 k = k + 1
-        t2 = time.time()
-        print('rdm1', t2 - t1)
         return rdm1_active
 
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
@@ -203,11 +190,7 @@ class uccsd(object):
             E_pol = 0.
             if self.PE:
                 # get 1RDM and transform to AO
-                t1 = time.time()
                 dm_mo = self.rdm1(params)
-                t2 = time.time()
-                print('::: make rdm1 mo :::', t2 - t1)
-                t1 = time.time()
                 dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
                 dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
                 # get electric fields from QM
@@ -250,18 +233,10 @@ class uccsd(object):
 
                 H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_PE)
                 self.H = self.H_gas + H_PE
-                self.v_PE_gs = v_PE
-                t2 = time.time()
-                print('::: rest of PE hamiltonian build :::', t2 - t1)
+                self.H_PE_gs = H_PE
     
-            t1 = time.time()
             energy = self.circuit(self, params)
-            t2 = time.time()
-            print('::: energy circuit eval :::', t2 - t1)
-            t1 = time.time()
             grad = get_gradient(self.circuit)(self, params)
-            t2 = time.time()
-            print('::: gradient circuit eval :::', t2 - t1)
             if self.PE:
                 energy += energy_pe_en + E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
             print('energy = ', energy)
@@ -273,32 +248,25 @@ class uccsd(object):
 
 
     def hvp(self, v, h=1e-5, scheme='central', triplet=False):
-        def grad(x):
-            if self.PE:
-                # get 1RDM and transform to AO
-                dm_mo_gs = self.rdm1(self.theta)
-                dm_mo_gs = _make_rdm1_on_mo(dm_mo_gs, self.inactive_electrons//2, self.qubits//2, self.m.nao)
-                dm_mo = self.rdm1(self.theta, params_excitation=x)
-                dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
-                delta = dm_mo - dm_mo_gs
-                dm_ao = self.mf.mo_coeff @ (delta) @ self.mf.mo_coeff.T
-                # get electric fields from QM
-                # get induction contribution
-                # modify gas-phase Hamiltonian with v_es + v_ind 
-                v_PE = self.v_PE_gs
+        if self.PE and False:
+            if 1 in self.PE.active_induced_multipole_ranks:
+                # get transition density (MO)
+                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                # transform to AO
+                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
                 fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
-
-                # solve for induced dipoles
-                if 1 in self.PE.active_induced_multipole_ranks:
-                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
-                    F_rhs = 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
-                    self.PE.external_field = [[], F_rhs]
+                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
+                # get induced dipoles and potential for k'th transition density
+                induction_potentials = []
+                for k in range(v.shape[1]):
+                    self.PE.external_field = [[], F_rhs[k]]
                     polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True)
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    v_PE += v_ind + v_ind.T
+                    H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_ind+v_ind.T)
+                    induction_potentials.append(H_PE)
 
-                H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_PE)
-                self.H = self.H_gas + H_PE
+        def grad(x):
             return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
@@ -315,9 +283,11 @@ class uccsd(object):
         hvp = np.zeros_like(v)
         for i in range(v.shape[1]):
             hvp[:, i] = fd_scheme[scheme](grad, h, v[:, i])
+            # dynpol contribution
+            #hvp[:, i] += get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[i], triplet=triplet)
         if need_reshape:
             hvp = hvp.reshape(-1)
-        return hvp
+        return 2.0*hvp
 
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
@@ -334,6 +304,26 @@ class uccsd(object):
             excita = self.excitations_triplet
         else:
             excita = self.excitations_singlet
+
+        if self.PE:
+            if 1 in self.PE.active_induced_multipole_ranks:
+                # get transition density (MO)
+                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                # transform to AO
+                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
+                # get induced dipoles and potential for k'th transition density
+                induction_potentials = []
+                for k in range(v.shape[1]):
+                    self.PE.external_field = [[], F_rhs[k]]
+                    self.PE.induced_moments[1] *= 0.
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_ind+v_ind.T)
+                    induction_potentials.append(H_PE)
+
         for k in range(v.shape[1]):
             v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
             for i in range(v.shape[0]):
@@ -348,6 +338,10 @@ class uccsd(object):
                 mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
                 miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
+            # pe dynpol contribution
+            phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
+            dynpol_contribution = -get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[k], triplet=triplet) * phase
+            hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
@@ -386,6 +380,7 @@ class uccsd(object):
         if need_reshape:
             # only a single trial-vector
             D_tr = D_tr[0]
+        # todo transform active->full space
         return D_tr
 
     def hess_diag_approximate(self, triplet=False):

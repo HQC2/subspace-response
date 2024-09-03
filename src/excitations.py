@@ -61,7 +61,7 @@ def spin_adapted_excitations(electrons, qubits, triplet=False, generalized=False
             i, a = single
             aa = [2*i, 2*a]
             bb = [2*i + 1, 2*a + 1]
-            excitations.append([[aa, bb], [-1.0/np.sqrt(2), -1.0/np.sqrt(2)]])
+            excitations.append([[aa, bb], [1.0/np.sqrt(2), 1.0/np.sqrt(2)]])
     else:
         # triplet
         for k, double in enumerate(space_doubles):
