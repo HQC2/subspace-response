@@ -56,6 +56,7 @@ class uccsd(object):
         active_electrons = active_electrons if active_electrons else electrons
         active_orbitals = active_orbitals if active_orbitals else orbitals
         self.inactive_electrons = electrons - active_electrons
+        self.inactive_orbitals = self.inactive_electrons // 2
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
         H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
@@ -309,6 +310,10 @@ class uccsd(object):
             if 1 in self.PE.active_induced_multipole_ranks:
                 # get transition density (MO)
                 transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                if self.qubits //2 < self.m.nao:
+                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
+                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
+                    transition_densities = full_transition_densities
                 # transform to AO
                 transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
                 fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
