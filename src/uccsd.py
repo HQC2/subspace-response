@@ -59,7 +59,7 @@ class uccsd(object):
         self.inactive_orbitals = self.inactive_electrons // 2
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
-        H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
+        H, qubits = get_molecular_hamiltonian(self)
         hf_state = qml.qchem.hf_state(active_electrons, qubits)
 
         excitations_singlet = excitations.spin_adapted_excitations(active_electrons, qubits)
@@ -232,14 +232,16 @@ class uccsd(object):
                     E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
                     E_pol = self.PE.E_pol
 
-                H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_PE)
+                H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_PE)
                 self.H = self.H_gas + H_PE
                 self.H_PE_gs = H_PE
     
             energy = self.circuit(self, params)
             grad = get_gradient(self.circuit)(self, params)
             if self.PE:
-                energy += energy_pe_en + E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
+                energy += energy_pe_en 
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    energy +=E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
             print('energy = ', energy)
             return energy, grad
 
@@ -249,7 +251,7 @@ class uccsd(object):
 
 
     def hvp(self, v, h=1e-5, scheme='central', triplet=False):
-        if self.PE and False:
+        if self.PE:
             if 1 in self.PE.active_induced_multipole_ranks:
                 # get transition density (MO)
                 transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
@@ -264,7 +266,7 @@ class uccsd(object):
                     self.PE.external_field = [[], F_rhs[k]]
                     polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True)
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_ind+v_ind.T)
+                    H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_ind+v_ind.T)
                     induction_potentials.append(H_PE)
 
         def grad(x):
@@ -326,7 +328,7 @@ class uccsd(object):
                     self.PE.induced_moments[1] *= 0.
                     polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    H_PE, qubits = get_PE_hamiltonian(self, self.active_electrons, self.qubits//2, v_PE=v_ind+v_ind.T)
+                    H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_ind+v_ind.T)
                     induction_potentials.append(H_PE)
 
         for k in range(v.shape[1]):
@@ -344,9 +346,11 @@ class uccsd(object):
                 miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
             # pe dynpol contribution
-            phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
-            dynpol_contribution = -get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[k], triplet=triplet) * phase
-            hvp[:, k] += dynpol_contribution
+            if self.PE:
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
+                    dynpol_contribution = -get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[k], triplet=triplet) * phase
+                    hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
