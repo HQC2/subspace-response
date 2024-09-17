@@ -251,10 +251,18 @@ class uccsd(object):
 
 
     def hvp(self, v, h=1e-5, scheme='central', triplet=False):
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
         if self.PE:
             if 1 in self.PE.active_induced_multipole_ranks:
                 # get transition density (MO)
                 transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                if self.qubits //2 < self.m.nao:
+                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
+                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
+                    transition_densities = full_transition_densities
                 # transform to AO
                 transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
                 fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
@@ -264,7 +272,8 @@ class uccsd(object):
                 induction_potentials = []
                 for k in range(v.shape[1]):
                     self.PE.external_field = [[], F_rhs[k]]
-                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True)
+                    self.PE.induced_moments[1] *= 0.
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
                     H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_ind+v_ind.T)
                     induction_potentials.append(H_PE)
@@ -284,13 +293,16 @@ class uccsd(object):
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
+        phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
         for i in range(v.shape[1]):
-            hvp[:, i] = fd_scheme[scheme](grad, h, v[:, i])
-            # dynpol contribution
-            #hvp[:, i] += get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[i], triplet=triplet)
+            hvp[:, i] = 2.0*fd_scheme[scheme](grad, h, v[:, i])
+            if self.PE:
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    dynpol_contribution = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), phase[i]*induction_potentials[i], triplet=triplet)
+                    hvp[:, i] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
-        return 2.0*hvp
+        return hvp
 
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
