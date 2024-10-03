@@ -145,23 +145,6 @@ class uccsd(object):
         self.circuit_state = circuit_state
         self.circuit_operator_stateprep = circuit_operator_stateprep
 
-    def rdm1_slow(self, params_ground_state, params_excitation=None, triplet=False):
-        rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
-        k = 0
-        for i in range(self.qubits//2):
-            for j in range(i, self.qubits//2):
-                fermi = qml.FermiC(2*i)*qml.FermiA(2*j)
-                fermi += qml.FermiC(2*i + 1)*qml.FermiA(2*j + 1)
-                operator = qml.jordan_wigner(fermi)
-                if params_excitation is not None:
-                    expval = self.circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=triplet)
-                else:
-                    expval = self.circuit_operator(self, params_ground_state, operator)
-                rdm1_active[i, j] = expval
-                rdm1_active[j, i] = expval
-                k = k + 1
-        return rdm1_active
-
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
         operators = []
@@ -178,8 +161,8 @@ class uccsd(object):
         k = 0
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
-                rdm1_active[i,j] = expvals[k]
-                rdm1_active[j,i] = expvals[k]
+                rdm1_active[i,j] = expvals[k].real
+                rdm1_active[j,i] = expvals[k].real
                 k = k + 1
         return rdm1_active
 
@@ -391,12 +374,15 @@ class uccsd(object):
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
             plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
+            print(v_statevector)
+            print(plus_statevector)
+            print(operators)
             Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
             D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
             unpack_idx = 0
             for i in range(self.qubits//2):
                 for j in range(self.qubits//2):
-                    D_tr[k,i,j] = D0v_expvals[unpack_idx] - 0.5*(D0_expvals[unpack_idx] + Dvv_expvals[unpack_idx])
+                    D_tr[k,i,j] = D0v_expvals[unpack_idx].real - 0.5*(D0_expvals[unpack_idx].real + Dvv_expvals[unpack_idx].real)
                     unpack_idx += 1 
         if need_reshape:
             # only a single trial-vector

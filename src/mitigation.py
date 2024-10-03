@@ -8,50 +8,62 @@ import pennylane as qml
 from uccsd_circuits import UCCSD
 import numpy as np
 
-def bits(target_bitstring, device, ucc):
+def bits(target_bitstring, wires, device, ucc):
     @qml.qnode(device)
     def circuit():
         # we make "null" circuit with theta=0, which does nothing except accumulate noise
-        # we need to use numerically large enough thetas so that gates are not pruned
         # we prepare the state from an empty HF reference, so no need to cancel with X gates after
-        tiny_theta = np.zeros_like(ucc.theta)
-        tiny_theta[:] = 1e-9
-        UCCSD(tiny_theta, range(ucc.qubits), ucc.excitations_ground_state, ucc.hf_state*0)
+        UCCSD(np.zeros_like(ucc.theta), range(ucc.qubits), ucc.excitations_ground_state, ucc.hf_state*0)
+        I = functools.reduce(lambda a,b: a@b, [qml.Identity(i) for i in wires])
         for i, bit in enumerate(target_bitstring):
+            wire = wires[i]
             if bit:
-                qml.X(i)
-        return qml.probs()
+                qml.X(wire)
+        return qml.probs(op=I)
     return circuit()
-
-#@qml.qnode(dev)
-def operator_probs(ucc, operator):
-    UCCSD(ucc.theta, range(self.qubits), self.excitations_ground_state, self.hf_state)
-    return qml.probs(op=operator)
 
 def bin_array(num, m):
     return np.array(list(np.binary_repr(num).zfill(m))).astype(np.int8)
 
-def get_confusion_matrix(ucc, device):
-    measured = np.zeros((2**ucc.qubits, 2**ucc.qubits))
-    for i in range(2**ucc.qubits):
-        target_bitstring = bin_array(i, ucc.qubits)
-        measured[:, i] = bits(target_bitstring, device, ucc)
+def get_confusion_matrix(ucc, device, wires=None):
+    if not wires:
+        wires = range(ucc.qubits)
+    N = len(wires)
+    measured = np.zeros((2**N, 2**N))
+    I = functools.reduce(lambda a,b: a@b, [qml.Identity(i) for i in wires])
+    for i in range(2**N):
+        target_bitstring = bin_array(i, len(wires))
+        measured[:, i] = bits(target_bitstring, wires, device, ucc)
     return measured
 
 @qml.transform
 def rem_mitigate(tape, confusion):
     probs_tape = tape.copy()
-    probs_tape.measurements.pop(0)
+    print('measurements:', probs_tape.measurements)
+    print('observables:', probs_tape.observables)
+    while probs_tape.measurements:
+        probs_tape.measurements.pop(0)
+    print('measurements:', probs_tape.measurements)
+    print('observables:', probs_tape.observables)
     qubits = len(tape.wires)
-#    I = functools.reduce(lambda a,b: a@b, [qml.Identity(i) for i in range(qubits)])
+    pauli_ops = set()
     for observable in tape.observables:
         for coeff, pauli in zip(*observable.terms()):
-            probs_tape.measurements.append(qml.probs(op=pauli))
-
+            pauli_ops |= {pauli}
+    pauli_ops = list(pauli_ops)
+    for pauli in pauli_ops:
+        probs_tape.measurements.append(qml.probs(op=pauli))
+    
     def post_processing_fn(results):
-        mitigated_expectation = 0.0
+        pauli_to_result = {}
+        for pauli, result in zip(pauli_ops, results[0]):
+            pauli_to_result[pauli] = result
+        
+        mitigated_expectation_values = []
         for observable in tape.observables:
-            for coeff, pauli, result in zip(*observable.terms(), results[0]):
+            mitigated_expectation = 0.0
+            for coeff, pauli in zip(*observable.terms()):
+                result = pauli_to_result[pauli]
                 print(f'{coeff=}')
                 print(f'{pauli=}')
                 print(f'{result=}')
@@ -62,10 +74,12 @@ def rem_mitigate(tape, confusion):
                 trace_indices = tuple(list(trace_wires) + [qubits + w for w in trace_wires])
                 N = 2**(len(tape.wires) - len(trace_wires))
                 confusion_traced = confusion.reshape([2]*2*qubits).sum(axis=trace_indices).reshape(N,N) / 2**len(trace_wires)
-                print(confusion_traced)
-                print(result)
-                mitigated_expectation += coeff*np.dot(np.linalg.solve(confusion_traced, result), pauli.eigvals())
-        return mitigated_expectation
+                mitigated_expectation += coeff*np.dot(np.linalg.inv(confusion_traced)@result, pauli.eigvals())
+            mitigated_expectation_values.append(mitigated_expectation)
+        if len(mitigated_expectation_values) == 1:
+            # unpack for single expectation value
+            mitigated_expectation_values = mitigated_expectation_values[0]
+        return mitigated_expectation_values
 
     return [probs_tape], post_processing_fn
 
