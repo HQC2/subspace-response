@@ -31,10 +31,10 @@ class uccsd(object):
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
         H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
-        hf_state = qml.qchem.hf_state(electrons, qubits)
+        hf_state = qml.qchem.hf_state(active_electrons, qubits)
 
-        excitations_singlet = excitations.spin_adapted_excitations(electrons, qubits)
-        excitations_triplet = excitations.spin_adapted_excitations(electrons, qubits, triplet=True)
+        excitations_singlet = excitations.spin_adapted_excitations(active_electrons, qubits)
+        excitations_triplet = excitations.spin_adapted_excitations(active_electrons, qubits, triplet=True)
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
