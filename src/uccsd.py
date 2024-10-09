@@ -374,9 +374,6 @@ class uccsd(object):
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
             plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
-            print(v_statevector)
-            print(plus_statevector)
-            print(operators)
             Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
             D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
             unpack_idx = 0
@@ -494,6 +491,40 @@ class uccsd(object):
                     diff_state = (state_plus - state_minus)/(2*h)
                     operator_gradient[i] = 2*diff_state.conj() @ operator_matrix @ state_0
                 operator_gradients.append(operator_gradient)
+            elif approach == 'super':
+                # <0|O|i>
+                if triplet:
+                    excita = self.excitations_triplet
+                else:
+                    excita = self.excitations_singlet
+                hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+                hf_expval = self.circuit_operator(self, self.theta, operator)
+                operator_gradient = np.zeros_like(parameter_excitation)
+                for i in range(len(parameter_excitation)):
+                    i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                    plus_statevector = (hf_statevector + i_statevector)/np.sqrt(2)
+                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
+                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
+                # sign?
+                operator_gradients.append(-operator_gradient)
+            elif approach == 'super-imag':
+                # <0|O|i> as above, but for imaginary operator
+                if triplet:
+                    excita = self.excitations_triplet
+                else:
+                    excita = self.excitations_singlet
+                hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+                hf_expval = self.circuit_operator(self, self.theta, operator)
+                operator_gradient = np.zeros_like(parameter_excitation)
+                for i in range(len(parameter_excitation)):
+                    i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                    plus_statevector = (hf_statevector + 1j*i_statevector)/np.sqrt(2)
+                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
+                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
+                # sign might need extra fixing here
+                operator_gradients.append(-operator_gradient)
             else:
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
