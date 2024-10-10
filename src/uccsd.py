@@ -258,8 +258,7 @@ class uccsd(object):
                     self.PE.induced_moments[1] *= 0.
                     polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_ind+v_ind.T)
-                    induction_potentials.append(H_PE)
+                    induction_potentials.append(v_ind+v_ind.T)
 
         def grad(x):
             return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
@@ -276,13 +275,12 @@ class uccsd(object):
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
-        phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
-        for i in range(v.shape[1]):
-            hvp[:, i] = 2.0*fd_scheme[scheme](grad, h, v[:, i])
+        for k in range(v.shape[1]):
+            hvp[:, k] = 2.0*fd_scheme[scheme](grad, h, v[:, k])
             if self.PE:
                 if 1 in self.PE.active_induced_multipole_ranks:
-                    dynpol_contribution = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), phase[i]*induction_potentials[i], triplet=triplet)
-                    hvp[:, i] += dynpol_contribution
+                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
+                    hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
@@ -323,8 +321,7 @@ class uccsd(object):
                     self.PE.induced_moments[1] *= 0.
                     polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
                     v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_ind+v_ind.T)
-                    induction_potentials.append(H_PE)
+                    induction_potentials.append(v_ind+v_ind.T)
 
         for k in range(v.shape[1]):
             v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
@@ -343,8 +340,7 @@ class uccsd(object):
             # pe dynpol contribution
             if self.PE:
                 if 1 in self.PE.active_induced_multipole_ranks:
-                    phase = np.array([1 if len(excita[i][0][0]) == 4 else -1 for i in range(v.shape[0])])
-                    dynpol_contribution = -get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, np.zeros(v.shape[0]), induction_potentials[k], triplet=triplet) * phase
+                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
                     hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
