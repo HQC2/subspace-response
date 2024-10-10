@@ -501,7 +501,7 @@ class uccsd(object):
                     plus_statevector = (hf_statevector + i_statevector)/np.sqrt(2)
                     i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
                     plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
-                    operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
+                    operator_gradient[i] = (plus_expval - 0.5 * (i_expval + hf_expval)).real
                 # sign?
                 operator_gradients.append(-operator_gradient)
             elif approach == 'super-imag':

@@ -113,7 +113,7 @@ class UCCSD_exc(Operation):
                 if len(excitation) == 2:
                     r, p = excitation
                     s_wires = list(range(r, p + 1))
-                    op_list.append(qml.FermionicSingleExcitation(weights_excitation[i]*excitation_weight, wires=s_wires))
+                    op_list.append(qml.FermionicSingleExcitation(-weights_excitation[i]*excitation_weight, wires=s_wires))
                 elif len(excitation) == 4:
                     s, r, q, p = excitation
                     w1 = list(range(s, r + 1))
@@ -188,7 +188,7 @@ class UCCSD_iH_exc(Operation):
                 if len(excitation) == 2:
                     r, p = excitation
                     s_wires = list(range(r, p + 1))
-                    op_list.append(iHSingleExcitation(weights_excitation[i]*excitation_weight, wires=s_wires))
+                    op_list.append(iHSingleExcitation(-weights_excitation[i]*excitation_weight, wires=s_wires))
                 elif len(excitation) == 4:
                     s, r, q, p = excitation
                     w1 = list(range(s, r + 1))
