@@ -239,7 +239,7 @@ class uccsd(object):
         else:
             excita = self.excitations_singlet
         if self.PE:
-            if 1 in self.PE.active_induced_multipole_ranks:
+            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
                 # get transition density (MO)
                 transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
                 if self.qubits //2 < self.m.nao:
@@ -278,7 +278,7 @@ class uccsd(object):
         for k in range(v.shape[1]):
             hvp[:, k] = 2.0*fd_scheme[scheme](grad, h, v[:, k])
             if self.PE:
-                if 1 in self.PE.active_induced_multipole_ranks:
+                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
                     dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
                     hvp[:, k] += dynpol_contribution
         if need_reshape:
@@ -302,7 +302,7 @@ class uccsd(object):
             excita = self.excitations_singlet
 
         if self.PE:
-            if 1 in self.PE.active_induced_multipole_ranks:
+            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
                 # get transition density (MO)
                 transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
                 if self.qubits //2 < self.m.nao:
@@ -339,7 +339,7 @@ class uccsd(object):
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
             # pe dynpol contribution
             if self.PE:
-                if 1 in self.PE.active_induced_multipole_ranks:
+                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
                     dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
                     hvp[:, k] += dynpol_contribution
         if need_reshape:
