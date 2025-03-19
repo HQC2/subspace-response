@@ -6,16 +6,38 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc, UCCSD_stateprep
 import pyscf
 import excitations
 import copy
-from molecular_hamiltonian import get_molecular_hamiltonian
+from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
+import time
+import scipy
 
+import polarizationsolver
+
+def read_xyz(filename):
+    elements = []
+    coordinates = []
+    with open(filename, 'r') as f:
+        N = int(f.readline())
+        f.readline()
+        for _ in range(N):
+            element, x, y, z, *_ = f.readline().split()
+            elements.append(element)
+            coordinates.append([float(x), float(y), float(z)])
+    return elements, np.array(coordinates)
+
+def _make_rdm1_on_mo(casdm1, ncore, ncas, nmo):
+    nocc = ncas + ncore
+    dm1 = np.zeros((nmo,nmo))
+    idx = np.arange(ncore)
+    dm1[idx,idx] = 2
+    dm1[ncore:nocc,ncore:nocc] = casdm1
+    return dm1
 
 class uccsd(object):
-
-    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
+    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None, PE=None):
         atom_str = ''
         for symbol, coord in zip(symbols, geometry):
             atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
@@ -23,14 +45,21 @@ class uccsd(object):
         mf = pyscf.scf.RHF(m).run()
         self.m = m
         self.mf = mf
+        self.PE = None
+        if PE is not None:
+            system = polarizationsolver.readers.parser(polarizationsolver.readers.potreader(PE))
+            self.PE = system
+            self.mf = pyscf.solvent.PE(mf, PE)
+            self.mf.kernel()
         electrons = sum(m.nelec)
         orbitals = m.nao
         active_electrons = active_electrons if active_electrons else electrons
         active_orbitals = active_orbitals if active_orbitals else orbitals
         self.inactive_electrons = electrons - active_electrons
+        self.inactive_orbitals = self.inactive_electrons // 2
         self.active_electrons = active_electrons
         self.active_orbitals = active_orbitals
-        H, qubits = get_molecular_hamiltonian(self, active_electrons=active_electrons, active_orbitals=active_orbitals)
+        H, qubits = get_molecular_hamiltonian(self)
         hf_state = qml.qchem.hf_state(active_electrons, qubits)
 
         excitations_singlet = excitations.spin_adapted_excitations(active_electrons, qubits)
@@ -59,6 +88,11 @@ class uccsd(object):
                 return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
+        def circuit_operators(self, params_ground_state, operators):
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
+            return [qml.expval(operator) for operator in operators]
+
+        @qml.qnode(dev, diff_method="adjoint")
         def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
@@ -85,7 +119,16 @@ class uccsd(object):
                 UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.expval(operator)
 
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_operator_stateprep(self, params_ground_state, statevector, operator, triplet=False):
+            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
         self.H = H
+        self.H_gas = H
         self.qubits = qubits
         self.electrons = electrons
         self.hf_state = hf_state
@@ -100,25 +143,9 @@ class uccsd(object):
         self.circuit_exc_operator = circuit_exc_operator
         self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
+        self.circuit_operator_stateprep = circuit_operator_stateprep
 
-
-    def ground_state(self, min_method='slsqp'):
-
-        def energy(params):
-            params = qml.numpy.array(params)
-            energy = self.circuit(self, params)
-            print('energy = ', energy)
-            return energy
-
-        def jac(params):
-            params = qml.numpy.array(params)
-            grad = get_gradient(self.circuit)(self, params)
-            return grad
-
-        res = minimize(energy, jac=jac, x0=self.theta, method=min_method, tol=1e-12)
-        self.theta = res.x
-
-    def rdm1(self, params_excitation=None, triplet=False):
+    def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
         operators = []
         for i in range(self.qubits//2):
@@ -128,19 +155,113 @@ class uccsd(object):
                 operator = qml.jordan_wigner(fermi)
                 operators.append(operator)
         if params_excitation is not None:
-            expvals = self.circuit_exc_operator(self, self.theta, params_excitation, operators, triplet=triplet)
+            expvals = self.circuit_exc_operator(self, params_ground_state, params_excitation, operators, triplet=triplet)
         else:
-            expvals = self.circuit_operator(self, self.theta, operators)
+            expvals = self.circuit_operator(self, params_ground_state, operators)
         k = 0
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
-                rdm1_active[i,j] = expvals[k]
-                rdm1_active[j,i] = expvals[k]
+                rdm1_active[i,j] = expvals[k].real
+                rdm1_active[j,i] = expvals[k].real
                 k = k + 1
         return rdm1_active
 
-    def hvp(self, v, h=1e-6, scheme='central', triplet=False):
-        grad = lambda x: get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+    def ground_state(self, min_method='slsqp'):
+        def energy_and_jac(params):
+            params = qml.numpy.array(params)
+            energy_pe_en = 0.
+            E_pol_nuc = 0.
+            E_pol = 0.
+            if self.PE:
+                # get 1RDM and transform to AO
+                dm_mo = self.rdm1(params)
+                dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
+                dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
+                # get electric fields from QM
+                # get induction contribution
+                # modify gas-phase Hamiltonian with v_es + v_ind 
+                v_PE = np.zeros_like(dm_ao)
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                # charges
+                if 1 in (self.PE.active_permanent_multipole_ranks) or (1 in self.PE.active_induced_multipole_ranks):
+                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                if 0 in self.PE.active_permanent_multipole_ranks:
+                    v_PE += -np.sum(pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e')*self.PE.permanent_moments[0], axis=2)
+                    energy_pe_en = -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 0, self.PE.permanent_moments[0], 0) * self.m.atom_charges()).sum()
+                # dipoles
+                # field_integrals could maybe be symmetrized in (0,1) dimension
+                if 1 in self.PE.active_permanent_multipole_ranks:
+                    v_dip = -np.sum(field_integrals*self.PE.permanent_moments[1], axis=(2,3))
+                    v_PE += v_dip + v_dip.T
+                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.permanent_moments[1], 0) * self.m.atom_charges()).sum()
+                # quadrupoles
+                if 2 in self.PE.active_permanent_multipole_ranks:
+                    # remove trace
+                    self.PE.permanent_moments[2] -= np.eye(3)[None, :, :] * np.einsum('qii->q', self.PE.permanent_moments[2])[:,None, None]/3
+                    v_quad = -0.5*np.sum((pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipip1') +  pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipvip1')).transpose(1,2,3,0) * self.PE.permanent_moments[2].reshape(-1,9), axis=(2,3))
+                    v_PE += v_quad + v_quad.T
+                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 2, self.PE.permanent_moments[2], 0) * self.m.atom_charges()).sum()
+
+                # solve for induced dipoles
+                # rhs field = F_nuc + F_el + F_multipole
+                # F_multipole is constructed internally by polarizationsolver
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    F_nuc = polarizationsolver.fields.field(self.PE.coordinates - self.m.atom_coords()[:,None,:], 0, self.m.atom_charges(), 1)
+                    F_rhs = F_nuc + 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
+                    self.PE.external_field = [[], F_rhs]
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12)
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    v_PE += v_ind + v_ind.T
+                    E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
+                    E_pol = self.PE.E_pol
+
+                H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_PE)
+                self.H = self.H_gas + H_PE
+                self.H_PE_gs = H_PE
+    
+            energy = self.circuit(self, params)
+            grad = get_gradient(self.circuit)(self, params)
+            if self.PE:
+                energy += energy_pe_en 
+                if 1 in self.PE.active_induced_multipole_ranks:
+                    energy +=E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
+            print('energy = ', energy)
+            return energy, grad
+
+        res = minimize(energy_and_jac, jac=True, x0=self.theta, method=min_method, tol=1e-12)
+        print(res)
+        self.theta = res.x
+
+
+    def hvp(self, v, h=1e-5, scheme='central', triplet=False):
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+        if self.PE:
+            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
+                # get transition density (MO)
+                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                if self.qubits //2 < self.m.nao:
+                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
+                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
+                    transition_densities = full_transition_densities
+                # transform to AO
+                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
+                # get induced dipoles and potential for k'th transition density
+                induction_potentials = []
+                for k in range(v.shape[1]):
+                    self.PE.external_field = [[], F_rhs[k]]
+                    self.PE.induced_moments[1] *= 0.
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    induction_potentials.append(v_ind+v_ind.T)
+
+        def grad(x):
+            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
             'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
@@ -154,14 +275,113 @@ class uccsd(object):
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
-        for i in range(v.shape[1]):
-            hvp[:, i] = fd_scheme[scheme](grad, h, v[:, i])
+        for k in range(v.shape[1]):
+            hvp[:, k] = 2.0*fd_scheme[scheme](grad, h, v[:, k])
+            if self.PE:
+                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
+                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
+                    hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
 
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
+
+    def hvp_new(self, v, triplet=False):
+        # hvp via superposition states
+        need_reshape = False
+        if len(v.shape) == 1:
+            v = v.reshape(-1, 1)
+            need_reshape = True
+        hvp = np.zeros_like(v)
+        e_gr = self.circuit(self, self.theta)
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+
+        if self.PE:
+            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
+                # get transition density (MO)
+                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
+                if self.qubits //2 < self.m.nao:
+                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
+                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
+                    transition_densities = full_transition_densities
+                # transform to AO
+                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
+                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
+                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
+                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
+                # get induced dipoles and potential for k'th transition density
+                induction_potentials = []
+                for k in range(v.shape[1]):
+                    self.PE.external_field = [[], F_rhs[k]]
+                    self.PE.induced_moments[1] *= 0.
+                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
+                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
+                    induction_potentials.append(v_ind+v_ind.T)
+
+        for k in range(v.shape[1]):
+            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            for i in range(v.shape[0]):
+                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
+            # todo: support sparse vector in stateprep
+            mvv = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=self.H)
+            for i in range(v.shape[0]):
+                i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
+                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
+                v_plus_i_statevector /= norm
+                mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
+                miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
+                hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
+            # pe dynpol contribution
+            if self.PE:
+                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
+                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
+                    hvp[:, k] += dynpol_contribution
+        if need_reshape:
+            hvp = hvp.reshape(-1)
+        return hvp
+
+    def transition_density(self, v, triplet=False):
+        need_reshape = False
+        if len(v.shape) == 1:
+            v = v.reshape(-1, 1)
+            need_reshape = True
+        D_tr = np.zeros((v.shape[1], self.qubits//2, self.qubits//2))
+        if triplet:
+            excita = self.excitations_triplet
+        else:
+            excita = self.excitations_singlet
+        operators = []
+        for i in range(self.qubits//2):
+            for j in range(self.qubits//2):
+                fermi = qml.FermiC(2*i) * qml.FermiA(2*j) 
+                fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
+                operator = qml.jordan_wigner(fermi)
+                operators.append(operator)
+        D0_expvals = self.circuit_operator(self, self.theta, operators)
+        hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+        for k in range(v.shape[1]):
+            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            for i in range(v.shape[0]):
+                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
+            plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
+            Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
+            D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
+            unpack_idx = 0
+            for i in range(self.qubits//2):
+                for j in range(self.qubits//2):
+                    D_tr[k,i,j] = D0v_expvals[unpack_idx].real - 0.5*(D0_expvals[unpack_idx].real + Dvv_expvals[unpack_idx].real)
+                    unpack_idx += 1 
+        if need_reshape:
+            # only a single trial-vector
+            D_tr = D_tr[0]
+        # todo transform active->full space
+        return D_tr
 
     def hess_diag_approximate(self, triplet=False):
         orbital_energies = self.mf.mo_energy
@@ -267,6 +487,40 @@ class uccsd(object):
                     diff_state = (state_plus - state_minus)/(2*h)
                     operator_gradient[i] = 2*diff_state.conj() @ operator_matrix @ state_0
                 operator_gradients.append(operator_gradient)
+            elif approach == 'super':
+                # <0|O|i>
+                if triplet:
+                    excita = self.excitations_triplet
+                else:
+                    excita = self.excitations_singlet
+                hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+                hf_expval = self.circuit_operator(self, self.theta, operator)
+                operator_gradient = np.zeros_like(parameter_excitation)
+                for i in range(len(parameter_excitation)):
+                    i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                    plus_statevector = (hf_statevector + i_statevector)/np.sqrt(2)
+                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
+                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    operator_gradient[i] = (plus_expval - 0.5 * (i_expval + hf_expval)).real
+                # sign?
+                operator_gradients.append(-operator_gradient)
+            elif approach == 'super-imag':
+                # <0|O|i> as above, but for imaginary operator
+                if triplet:
+                    excita = self.excitations_triplet
+                else:
+                    excita = self.excitations_singlet
+                hf_statevector = excitations.occupation_to_statevector(self.hf_state)
+                hf_expval = self.circuit_operator(self, self.theta, operator)
+                operator_gradient = np.zeros_like(parameter_excitation)
+                for i in range(len(parameter_excitation)):
+                    i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
+                    plus_statevector = (hf_statevector + 1j*i_statevector)/np.sqrt(2)
+                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
+                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
+                # sign might need extra fixing here
+                operator_gradients.append(-operator_gradient)
             else:
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
