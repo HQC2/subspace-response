@@ -20,7 +20,6 @@ import numpy as np
 import pennylane as qml
 from pennylane.operation import Operation, AnyWires
 from pennylane.ops import BasisState
-
 from operators import iHSingleExcitation, iHDoubleExcitation
 
 
@@ -47,6 +46,7 @@ class UCCSD(Operation):
         op_list = []
 
         op_list.append(BasisState(init_state, wires=wires))
+
         for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
             for excitation, excitation_weight in zip(excitations, excitation_weights):
                 if len(excitation) == 2:
@@ -113,7 +113,7 @@ class UCCSD_exc(Operation):
                 if len(excitation) == 2:
                     r, p = excitation
                     s_wires = list(range(r, p + 1))
-                    op_list.append(qml.FermionicSingleExcitation(weights_excitation[i]*excitation_weight, wires=s_wires))
+                    op_list.append(qml.FermionicSingleExcitation(-weights_excitation[i]*excitation_weight, wires=s_wires))
                 elif len(excitation) == 4:
                     s, r, q, p = excitation
                     w1 = list(range(s, r + 1))
@@ -134,87 +134,6 @@ class UCCSD_exc(Operation):
                     w1 = list(range(s, r + 1))
                     w2 = list(range(q, p + 1))
                     op_list.append(qml.FermionicDoubleExcitation(weights_ground_state[i]*excitation_weight, wires1=w1, wires2=w2))
-                else:
-                    raise ValueError
-        return op_list
-
-class UCCSD_stateprep(Operation):
-    num_wires = AnyWires
-    grad_method = None
-
-    def __init__(
-        self,
-        weights_ground_state,
-        statevector,
-        wires,
-        excitations_ground_state,
-    ):
-        self._hyperparameters = {"excitations_ground_state": excitations_ground_state}
-
-        super().__init__(weights_ground_state, statevector, wires=wires)
-
-    @property
-    def num_params(self):
-        return 2
-
-    @staticmethod
-    def compute_decomposition(
-        weights_ground_state,
-        statevector,
-        wires,
-        excitations_ground_state,
-    ):  # pylint: disable=arguments-differ
-        op_list = []
-        op_list.append(qml.MottonenStatePreparation(statevector, wires=wires))
-
-        # ground-state
-        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
-            for excitation, excitation_weight in zip(excitations, excitation_weights):
-                if len(excitation) == 2:
-                    r, p = excitation
-                    s_wires = list(range(r, p + 1))
-                    op_list.append(qml.FermionicSingleExcitation(weights_ground_state[i]*excitation_weight, wires=s_wires))
-                elif len(excitation) == 4:
-                    s, r, q, p = excitation
-                    w1 = list(range(s, r + 1))
-                    w2 = list(range(q, p + 1))
-                    op_list.append(qml.FermionicDoubleExcitation(weights_ground_state[i]*excitation_weight, wires1=w1, wires2=w2))
-                else:
-                    raise ValueError
-        return op_list
-
-class UCCSD_U(Operation):
-    num_wires = AnyWires
-    grad_method = None
-
-    def __init__(self, weights, wires, excitations_ground_state, init_state):
-        shape = qml.math.shape(weights)
-        init_state = qml.math.toarray(init_state)
-
-        if init_state.dtype != np.dtype("int"):
-            raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
-
-        self._hyperparameters = {"init_state": init_state, "excitations_ground_state": excitations_ground_state}
-        super().__init__(weights, wires=wires)
-
-    @property
-    def num_params(self):
-        return 1
-
-    @staticmethod
-    def compute_decomposition(weights, wires, excitations_ground_state, init_state):  # pylint: disable=arguments-differ
-        op_list = []
-        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
-            for excitation, excitation_weight in zip(excitations, excitation_weights):
-                if len(excitation) == 2:
-                    r, p = excitation
-                    s_wires = list(range(r, p + 1))
-                    op_list.append(qml.FermionicSingleExcitation(weights[i]*excitation_weight, wires=s_wires))
-                elif len(excitation) == 4:
-                    s, r, q, p = excitation
-                    w1 = list(range(s, r + 1))
-                    w2 = list(range(q, p + 1))
-                    op_list.append(qml.FermionicDoubleExcitation(weights[i]*excitation_weight, wires1=w1, wires2=w2))
                 else:
                     raise ValueError
         return op_list
@@ -269,7 +188,7 @@ class UCCSD_iH_exc(Operation):
                 if len(excitation) == 2:
                     r, p = excitation
                     s_wires = list(range(r, p + 1))
-                    op_list.append(iHSingleExcitation(weights_excitation[i]*excitation_weight, wires=s_wires))
+                    op_list.append(iHSingleExcitation(-weights_excitation[i]*excitation_weight, wires=s_wires))
                 elif len(excitation) == 4:
                     s, r, q, p = excitation
                     w1 = list(range(s, r + 1))
@@ -277,6 +196,87 @@ class UCCSD_iH_exc(Operation):
                     op_list.append(iHDoubleExcitation(weights_excitation[i]*excitation_weight, wires1=w1, wires2=w2))
                 else:
                     raise ValueError
+
+        # ground-state
+        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
+            for excitation, excitation_weight in zip(excitations, excitation_weights):
+                if len(excitation) == 2:
+                    r, p = excitation
+                    s_wires = list(range(r, p + 1))
+                    op_list.append(qml.FermionicSingleExcitation(weights_ground_state[i]*excitation_weight, wires=s_wires))
+                elif len(excitation) == 4:
+                    s, r, q, p = excitation
+                    w1 = list(range(s, r + 1))
+                    w2 = list(range(q, p + 1))
+                    op_list.append(qml.FermionicDoubleExcitation(weights_ground_state[i]*excitation_weight, wires1=w1, wires2=w2))
+                else:
+                    raise ValueError
+        return op_list
+
+class UCCSD_U(Operation):
+    num_wires = AnyWires
+    grad_method = None
+
+    def __init__(self, weights, wires, excitations_ground_state, init_state):
+        shape = qml.math.shape(weights)
+        init_state = qml.math.toarray(init_state)
+
+        if init_state.dtype != np.dtype("int"):
+            raise ValueError(f"Elements of 'init_state' must be integers; got {init_state.dtype}")
+
+        self._hyperparameters = {"init_state": init_state, "excitations_ground_state": excitations_ground_state}
+        super().__init__(weights, wires=wires)
+
+    @property
+    def num_params(self):
+        return 1
+
+    @staticmethod
+    def compute_decomposition(weights, wires, excitations_ground_state, init_state):  # pylint: disable=arguments-differ
+        op_list = []
+        for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):
+            for excitation, excitation_weight in zip(excitations, excitation_weights):
+                if len(excitation) == 2:
+                    r, p = excitation
+                    s_wires = list(range(r, p + 1))
+                    op_list.append(qml.FermionicSingleExcitation(weights[i]*excitation_weight, wires=s_wires))
+                elif len(excitation) == 4:
+                    s, r, q, p = excitation
+                    w1 = list(range(s, r + 1))
+                    w2 = list(range(q, p + 1))
+                    op_list.append(qml.FermionicDoubleExcitation(weights[i]*excitation_weight, wires1=w1, wires2=w2))
+                else:
+                    raise ValueError
+        return op_list
+
+class UCCSD_stateprep(Operation):
+    num_wires = AnyWires
+    grad_method = None
+
+    def __init__(
+        self,
+        weights_ground_state,
+        statevector,
+        wires,
+        excitations_ground_state,
+    ):
+        self._hyperparameters = {"excitations_ground_state": excitations_ground_state}
+
+        super().__init__(weights_ground_state, statevector, wires=wires)
+
+    @property
+    def num_params(self):
+        return 2
+
+    @staticmethod
+    def compute_decomposition(
+        weights_ground_state,
+        statevector,
+        wires,
+        excitations_ground_state,
+    ):  # pylint: disable=arguments-differ
+        op_list = []
+        op_list.append(qml.MottonenStatePreparation(statevector, wires=wires))
 
         # ground-state
         for i, (excitations, excitation_weights) in enumerate(excitations_ground_state):

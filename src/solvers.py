@@ -30,19 +30,24 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
         X = V @ Z
         AX = AV @ Z
         r = (AX - L[None, :]*X)
+        print(f'{r.shape}')
         print(f'Iter    Root    Residual        Eigenvalue (au, eV)')
         for k in range(len(L)):
             print(f'{i+1}       {k+1}       {np.linalg.norm(r[:,k]):.6e}    {L[k]:.6f} {L[k]*27.2114:.6f}')
         if (all(np.linalg.norm(r, axis=0) < tol)):
+            print(f'At solution, AV dimension: {AV.shape}')
             return L, X
         delta = np.array([1/(L[k] - hdiag)*r[:, k] for k in range(len(L))]).T
-        delta /= np.linalg.norm(delta, axis=0)
+        delta_norms = np.linalg.norm(delta, axis=0)
+        delta /= delta_norms
 
         new_vs = []
         for k in range(len(L)):
             q = delta[:, k] - V @ (V.T @ delta[:, k])
             qnorm = np.linalg.norm(q)
-            if qnorm > 1e-3:
+            residual_norm = np.linalg.norm(r[:,k])
+            print(f'State={k+1} {residual_norm=} {qnorm=}')
+            if qnorm > 1e-3 and residual_norm > tol:
                 vp = q/qnorm
                 V = np.hstack([V, vp[:, None]])
                 new_vs.append(vp)
@@ -119,6 +124,7 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, tol=1e-
         S = S - 1j*gamma*I
 
     diagonal_guess = b/(hdiag)
+    diagonal_guess /= np.linalg.norm(diagonal_guess)
     if history is not None:
         V = history['V']
         AV = history['AV']
