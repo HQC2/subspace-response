@@ -14,6 +14,7 @@ from pennylane._grad import grad as get_gradient
 import excitations
 from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
 from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc, UCCSD_stateprep
+from hashlib import sha1
 
 import polarizationsolver
 
@@ -579,55 +580,9 @@ class uccsd(object):
                 raise ValueError('Invalid property gradient approach')
         return np.array(operator_gradients).reshape(*out_shape, -1)
 
-    def apply_tensor_op(self, op, basis_state):
-        statevector = np.zeros(2**len(basis_state), dtype=np.complex128)
-        if op is None:
-            # identity operator, return basis state
-            index = np.sum((basis_state)*2**(np.arange(self.qubits)[::-1]))
-            statevector[index] = 1
-            return statevector
-        phase_map = {
-                ('X', 0): 1,
-                ('X', 1): 1,
-                ('Y', 0): 1j,
-                ('Y', 1): -1j,
-                ('Z', 0): 1,
-                ('Z', 1): -1,
-                }
-        flip_map = {
-                ('X', 0): 1,
-                ('X', 1): 1,
-                ('Y', 0): 1,
-                ('Y', 1): 1,
-                ('Z', 0): 0,
-                ('Z', 1): 0,
-                }
-        flip = np.zeros_like(basis_state)
-        for weight, pauli in zip(*op.terms()):
-            if pauli.label() == 'I':
-                index = np.sum((basis_state)*2**(np.arange(self.qubits)[::-1]))
-                statevector[index] += weight
-                continue
-            # Z accumulates (-1) phase on |1> qubits
-            # X,Y flips bit
-            # Y accumulates (i/-i) phase on (|0>/|1>) 
-            phase = 1
-            flip[:] = 0
-            if pauli.arithmetic_depth > 0:
-                operands = pauli.operands
-            else:
-                operands = [pauli]
-            for operand in operands:
-                qubit = operand.wires[0]
-                qubit_state = basis_state[qubit]
-                label = operand.label()
-                flip[qubit] = flip_map[(label, qubit_state)]
-                phase *= phase_map[(label, qubit_state)]
-            index = np.sum((basis_state ^ flip)*2**(np.arange(self.qubits)[::-1]))
-            statevector[index] += weight*phase
-        return statevector
-
-    def V2_contraction(self, integral, I, I_dag, J, J_dag, triplet=False):
+    def V2_contraction(self, integral, I, I_dag, J, J_dag, triplet=False, termcache={}):
+        if self.PE is not None:
+            raise NotImplementedError
         if triplet:
             # todo
             raise NotImplementedError
@@ -656,45 +611,58 @@ class uccsd(object):
                 operator += sign*mo_integral[self.inactive_electrons//2 + p, self.inactive_electrons//2 + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
         operator = qml.jordan_wigner(operator)
 
-        op_I = sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_I_dag = sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J = sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
-        op_J_dag = sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify()
+        op_I = qml.matrix(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
+        op_I_dag = qml.matrix(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
+        op_J = qml.matrix(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
+        op_J_dag = qml.matrix(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
+        integral_hash = sha1(mo_integral.view(np.uint8)).hexdigest()
 
-        def term(left_op, right_op, operator):
+        def term(left_ops, right_ops, operator, cache=termcache):
             # |R> = right_op |0>
             # |L> = left_op |0>
             # compute <L|U'O U|R>
-            L_statevec = self.apply_tensor_op(left_op, self.hf_state)
-            R_statevec = self.apply_tensor_op(right_op, self.hf_state)
+            def lazycalc(f, *args, cache=termcache):
+                # look only at statevec arg
+                key = sha1(np.round(args[2], 6).view(np.uint8)).hexdigest() + integral_hash
+                if not key in cache:
+                    cache[key] = f(*args)
+                return cache[key]
+            hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
+            index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
+            hf_statevector[index] = 1
+
+            L_statevec = functools.reduce(np.dot, left_ops + [hf_statevector])
+            R_statevec = functools.reduce(np.dot, right_ops + [hf_statevector])
             plus_statevec = L_statevec + R_statevec
             L_norm = np.linalg.norm(L_statevec)
             R_norm = np.linalg.norm(R_statevec)
             plus_norm = np.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*self.circuit_operator_stateprep(self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
-            R_expval = R_norm**2*self.circuit_operator_stateprep(self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
-            plus_expval = plus_norm**2*self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
+            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
+            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
+            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
 
         # (dagger,dagger) term
         # -<Psi|I'J'O|Psi>
         total = 0.0
-        total -= term((op_J_dag @ op_I_dag).simplify(), None, operator)
+        total -= term([op_J_dag, op_I_dag], [], operator)
         
         # (dagger,.) term
         # <Psi|I'OJ - I'JO|Psi>
-        total += term(op_I_dag, op_J, operator) - term((op_J.adjoint() @ op_I_dag).simplify(), None, operator)
+        total += term([op_I_dag], [op_J], operator) - term([op_J.T.conj(), op_I_dag], [], operator)
 
         # (.,dagger) term
         # <Psi|J'OI - OJ'I|Psi>
-        total += term(op_J_dag, op_I, operator) - term(None, (op_J_dag.adjoint() @ op_I).simplify(), operator)
+        total += term([op_J_dag], [op_I], operator) - term([], [op_J_dag.T.conj(), op_I], operator)
 
         # (.,.) term
         # -<Psi|OJI|Psi>
-        total -= term(None, (op_J@op_I).simplify(), operator)
+        total -= term([], [op_J,op_I], operator)
         return total
 
-    def E3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
+    def E3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False, termcache={}):
+        if self.PE is not None:
+            raise NotImplementedError
         if triplet:
             # todo
             raise NotImplementedError
@@ -712,6 +680,12 @@ class uccsd(object):
             # |R> = right_op |0>
             # |L> = left_op |0>
             # compute <L|U'O U|R>
+            def lazycalc(f, *args, cache=termcache):
+                # look only at statevec arg ([2])
+                key = sha1(np.round(args[2], 6).view(np.uint8)).hexdigest()
+                if not key in cache:
+                    cache[key] = f(*args)
+                return cache[key]
             hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
             hf_statevector[index] = 1
@@ -722,9 +696,9 @@ class uccsd(object):
             L_norm = np.linalg.norm(L_statevec)
             R_norm = np.linalg.norm(R_statevec)
             plus_norm = np.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*self.circuit_operator_stateprep(self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
-            R_expval = R_norm**2*self.circuit_operator_stateprep(self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
-            plus_expval = plus_norm**2*self.circuit_operator_stateprep(self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
+            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
+            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
+            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
         
         total = 0.0

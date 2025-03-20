@@ -26,14 +26,15 @@ def beta_term(ucc, A, B, C, omega_B, omega_C):
     V_A = ucc.property_gradient(A)
     V_B = ucc.property_gradient(B)
     V_C = ucc.property_gradient(C)
+    
+    history = None
+    resp_a, history = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=False, history=history, omega=(omega_B+omega_C))
+    resp_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=False, history=history, omega=omega_B)
+    resp_c, history = solvers.davidson_response(ucc.hvp, V_C, hdiag, verbose=False, history=history, omega=omega_C)
 
-    resp_a = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=False, omega=(omega_B+omega_C))[0].real
-    resp_b = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=False, omega=omega_B)[0].real
-    resp_c = solvers.davidson_response(ucc.hvp, V_C, hdiag, verbose=False, omega=omega_C)[0].real
-
-    resp_a_minus = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=False, omega=-(omega_B+omega_C))[0].real
-    resp_b_minus = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=False, omega=-omega_B)[0].real
-    resp_c_minus = solvers.davidson_response(ucc.hvp, -V_C, hdiag, verbose=False, omega=-omega_C)[0].real
+    resp_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=False, history=history, omega=-(omega_B+omega_C))
+    resp_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=False, history=history, omega=-omega_B)
+    resp_c_minus, history = solvers.davidson_response(ucc.hvp, -V_C, hdiag, verbose=False, history=history, omega=-omega_C)
 
     V2_aBc = ucc.V2_contraction(B, resp_a_minus, resp_a, resp_c, resp_c_minus)
     V2_aCb = ucc.V2_contraction(C, resp_a_minus, resp_a, resp_b, resp_b_minus)
