@@ -622,10 +622,13 @@ class uccsd(object):
             # |L> = left_op |0>
             # compute <L|U'O U|R>
             def lazycalc(f, *args, cache=termcache):
-                # look only at statevec arg
-                key = sha1(np.round(args[2], 6).view(np.uint8)).hexdigest() + integral_hash
-                if not key in cache:
+                # look only at statevec arg ([2])
+                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest()
+                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest()
+                if not ((key in cache) or (minuskey in cache)):
                     cache[key] = f(*args)
+                    cache['arg:' + key] = args[2]
+                key = key if key in cache else minuskey
                 return cache[key]
             hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
@@ -682,9 +685,12 @@ class uccsd(object):
             # compute <L|U'O U|R>
             def lazycalc(f, *args, cache=termcache):
                 # look only at statevec arg ([2])
-                key = sha1(np.round(args[2], 6).view(np.uint8)).hexdigest()
-                if not key in cache:
+                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest()
+                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest()
+                if not ((key in cache) or (minuskey in cache)):
                     cache[key] = f(*args)
+                    cache['arg:' + key] = args[2]
+                key = key if key in cache else minuskey
                 return cache[key]
             hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))

@@ -6,14 +6,12 @@ import pennylane as qml
 import numpy as np
 
 
-symbols = ['H', 'H', 'H', 'H']
+symbols = ['Li', 'H']
 geometry = qml.numpy.array([
 [0.0, 0.0, 0.0],
-[0.0, 0.0, 2.0],
-[2.0, 0.0, 2.0],
-[1.0, 0.0, 0.0],
+[0.0, 0.0, 1.59],
                  ], requires_grad=False)*1.8897259886
-charge = 2
+charge = 0
 basis = 'STO-3G'
 
 ucc = uccsd.uccsd(symbols, geometry, charge, basis)
@@ -26,7 +24,10 @@ omega, X = solvers.davidson_liu(ucc.hvp, hdiag, roots)
 
 # davidson_response returns (respose, history)
 intx, inty, intz = ucc.m.intor('int1e_r')
-def S0f_transition_moment(ucc, A, B, omega_f, Xf):
+def S0f_transition_moment(ucc, A, B, omega_f, Xf, histcache={}):
+    # zero by symmetry?
+    if np.allclose(A, 0.) or np.allclose(B, 0.):
+        return 0.
     V_A = ucc.property_gradient(A)
     V_B = ucc.property_gradient(B)
 
@@ -34,11 +35,12 @@ def S0f_transition_moment(ucc, A, B, omega_f, Xf):
     zero = np.zeros_like(Xf)
 
     
-    history = None
-    N_a, history = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=False, history=history, omega=omega_f-omega_1)
-    N_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=False, history=history, omega=-omega_1)
-    N_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=False, history=history, omega=-(omega_f-omega_1))
-    N_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=False, history=history, omega=-(-omega_1))
+    history = histcache if histcache else None
+    N_a, history = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=True, history=history, omega=omega_f-omega_1)
+    N_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=True, history=history, omega=-omega_1)
+    N_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=True, history=history, omega=-(omega_f-omega_1))
+    N_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=True, history=history, omega=-(-omega_1))
+    histcache.update(history)
 
     V2_NaBX = -ucc.V2_contraction(B, N_a, N_a_minus, Xf, zero) 
     V2_NbAX = 0.5*(ucc.V2_contraction(A, N_b_minus, N_b, Xf, zero) + ucc.V2_contraction(A, Xf, zero, N_b_minus, N_b))
