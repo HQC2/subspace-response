@@ -611,10 +611,10 @@ class uccsd(object):
                 operator += sign*mo_integral[self.inactive_electrons//2 + p, self.inactive_electrons//2 + q]*qml.FermiC(2*p + 1)*qml.FermiA(2*q + 1)
         operator = qml.jordan_wigner(operator)
 
-        op_I = qml.matrix(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
-        op_I_dag = qml.matrix(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
-        op_J = qml.matrix(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
-        op_J_dag = qml.matrix(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify(), wire_order=range(self.qubits))
+        op_I = scipy.sparse.csc_array(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify().sparse_matrix(wire_order=range(self.qubits)))
+        op_I_dag = scipy.sparse.csc_array(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify().sparse_matrix(wire_order=range(self.qubits)))
+        op_J = scipy.sparse.csc_array(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify().sparse_matrix(wire_order=range(self.qubits)))
+        op_J_dag = scipy.sparse.csc_array(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).simplify().sparse_matrix(wire_order=range(self.qubits)))
         integral_hash = sha1(mo_integral.view(np.uint8)).hexdigest()
 
         def term(left_ops, right_ops, operator, cache=termcache):
@@ -623,26 +623,29 @@ class uccsd(object):
             # compute <L|U'O U|R>
             def lazycalc(f, *args, cache=termcache):
                 # look only at statevec arg ([2])
-                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest()
-                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest()
+                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest() + integral_hash
+                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest() + integral_hash
                 if not ((key in cache) or (minuskey in cache)):
                     cache[key] = f(*args)
                     cache['arg:' + key] = args[2]
                 key = key if key in cache else minuskey
                 return cache[key]
-            hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
+            hf_statevector = scipy.sparse.lil_array((2**self.qubits, 1), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
-            hf_statevector[index] = 1
-
-            L_statevec = functools.reduce(np.dot, left_ops + [hf_statevector])
-            R_statevec = functools.reduce(np.dot, right_ops + [hf_statevector])
+            hf_statevector[index] = 1.0
+            L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevector])
+            R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevector])
+            L_norm = scipy.sparse.linalg.norm(L_statevec)
+            R_norm = scipy.sparse.linalg.norm(R_statevec)
+            # return early in case |R> or <L| vanishes
+            # (because <R|O|L> = 0)
+            if (L_norm < 1e-9) or (R_norm < 1e-9):
+                return 0.
             plus_statevec = L_statevec + R_statevec
-            L_norm = np.linalg.norm(L_statevec)
-            R_norm = np.linalg.norm(R_statevec)
-            plus_norm = np.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
-            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
-            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
+            plus_norm = scipy.sparse.linalg.norm(plus_statevec)
+            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (L_statevec/L_norm).toarray().ravel(), operator)
+            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (R_statevec/R_norm).toarray().ravel(), operator)
+            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (plus_statevec/plus_norm).toarray().ravel(), operator) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
 
         # (dagger,dagger) term
@@ -672,12 +675,12 @@ class uccsd(object):
             excitation_operators = self.excitation_operators_triplet
         else:
             excitation_operators = self.excitation_operators_singlet
-        op_I = qml.matrix(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
-        op_I_dag = qml.matrix(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
-        op_J = qml.matrix(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
-        op_J_dag = qml.matrix(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
-        op_K = qml.matrix(sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
-        op_K_dag = qml.matrix(sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]), wire_order=range(self.qubits))
+        op_I = scipy.sparse.csc_array(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
+        op_I_dag = scipy.sparse.csc_array(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
+        op_J = scipy.sparse.csc_array(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
+        op_J_dag = scipy.sparse.csc_array(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
+        op_K = scipy.sparse.csc_array(sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
+        op_K_dag = scipy.sparse.csc_array(sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
 
         def term(left_ops, right_ops, operator):
             # |R> = right_op |0>
@@ -692,19 +695,22 @@ class uccsd(object):
                     cache['arg:' + key] = args[2]
                 key = key if key in cache else minuskey
                 return cache[key]
-            hf_statevector = np.zeros(2**len(self.hf_state), dtype=np.complex128)
+            hf_statevector = scipy.sparse.lil_array((2**self.qubits, 1), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
-            hf_statevector[index] = 1
-
-            L_statevec = functools.reduce(np.dot, left_ops + [hf_statevector])
-            R_statevec = functools.reduce(np.dot, right_ops + [hf_statevector])
+            hf_statevector[index] = 1.0
+            L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevector])
+            R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevector])
+            L_norm = scipy.sparse.linalg.norm(L_statevec)
+            R_norm = scipy.sparse.linalg.norm(R_statevec)
+            # return early in case |R> or <L| vanishes
+            # (because <R|O|L> = 0)
+            if (L_norm < 1e-9) or (R_norm < 1e-9):
+                return 0.
             plus_statevec = L_statevec + R_statevec
-            L_norm = np.linalg.norm(L_statevec)
-            R_norm = np.linalg.norm(R_statevec)
-            plus_norm = np.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, L_statevec/L_norm, operator) if L_norm > 1e-9 else 0.
-            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, R_statevec/R_norm, operator) if R_norm > 1e-9 else 0.
-            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, plus_statevec/plus_norm, operator) if plus_norm > 1e-9 else 0.
+            plus_norm = scipy.sparse.linalg.norm(plus_statevec)
+            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (L_statevec/L_norm).toarray().ravel(), operator)
+            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (R_statevec/R_norm).toarray().ravel(), operator)
+            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (plus_statevec/plus_norm).toarray().ravel(), operator) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
         
         total = 0.0
