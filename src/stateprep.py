@@ -3,9 +3,10 @@
 # Implemented by Oskar Graulund Lentz Rasmussen
 # implementation following
 # 10.1109/DAC18074.2021.9586240
-import numpy as np
-import random
 from math import atan2
+import random
+import scipy
+import numpy as np
 import pennylane as qml
 
 # Utility functions, modify S in-place
@@ -142,6 +143,8 @@ def Algorithm1(S, coeffs):
     rotationAngle = -2 * atan2(cx1, cx2)
 
     if len(dif_qubits) != 0:
+        c = np.cos(rotationAngle/2)
+        s = np.sin(rotationAngle/2)
         U = np.array([[c,-s], [s, c]])
         qml.ControlledQubitUnitary(U, wires=dif_qubits + [dif])
     elif len(dif_qubits) == 0:
@@ -158,16 +161,6 @@ def Algorithm1(S, coeffs):
 
 def Algorithm2(inputStates, inputCoeffs):
     noq = len(inputStates[0])
-
-    # Input validation
-    if len(inputStates) != len(inputCoeffs):
-        raise ValueError("Number of coefficients and number of input states do not match") 
-    if len(np.unique(inputStates)) != len(inputStates):
-        raise ValueError("Repeated basis states")
-    norm = np.linalg.norm(inputCoeffs)
-    if np.abs(norm - 1) > 1e-3:
-        raise ValueError("Wrong normalization on inputCoeffs")
-
     coeffs = inputCoeffs.copy()
     S = inputStates.copy()
 
@@ -178,5 +171,9 @@ def Algorithm2(inputStates, inputCoeffs):
         if S[0][i] == '1':
             qml.X(i)
 
-def stateprep(inputStates, inputCoeffs):
-    qml.adjoint(Algorithm2)(inputStates, inputCoeffs)
+def stateprep(statevector):
+    assert scipy.sparse.issparse(statevector)
+    assert statevector.shape[0] == 1 # row vector
+    assert np.isclose(np.linalg.norm(statevector.data), 1.0)
+    num_qubits = int(np.log2(statevector.shape[1]))
+    qml.adjoint(Algorithm2)([f'{index:0{num_qubits}b}' for index in statevector.indices], list(statevector.data))
