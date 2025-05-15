@@ -172,8 +172,14 @@ def Algorithm2(inputStates, inputCoeffs):
             qml.X(i)
 
 def stateprep(statevector):
-    assert scipy.sparse.issparse(statevector)
-    assert statevector.shape[0] == 1 # row vector
-    assert np.isclose(np.linalg.norm(statevector.data), 1.0)
-    num_qubits = int(np.log2(statevector.shape[1]))
+    if not scipy.sparse.issparse(statevector):
+        raise ValueError(f'Only sparse state vectors are supported. Found {type(statevector)=}')
+    if not (1 in statevector.shape):
+        raise ValueError(f'Only one statevector (row or column) allowed, {statevector.shape=}.')
+    if not len(statevector.indptr) == 2:
+        raise ValueError(f'Bad choice of csr/csc array. Use a (N,1) csc or a (1,N) csr array.')
+    norm = np.linalg.norm(statevector.data)
+    if not np.isclose(norm, 1):
+        raise ValueError(f'Invalid normalization {norm=}')
+    num_qubits = int(np.log2(statevector.shape[0]*statevector.shape[1]))
     qml.adjoint(Algorithm2)([f'{index:0{num_qubits}b}' for index in statevector.indices], list(statevector.data))

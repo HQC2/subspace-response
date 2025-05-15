@@ -103,13 +103,13 @@ def occupation_to_statevector(bitstring):
     # bitstring should be an array of [0,1] integers, for example [1,1,0,0,0,0,0,0]
     num_qubits = len(bitstring)
     index = sum(bitstring * 2**np.arange(num_qubits-1, -1, -1))
-    statevec = scipy.sparse.lil_matrix((2**num_qubits, 1))
+    statevec = scipy.sparse.lil_array((2**num_qubits, 1))
     statevec[index] = 1
     return statevec
 
 def excitation_to_statevector(ref_state, excitations, weights):
     num_qubits = len(ref_state)
-    statevec = scipy.sparse.lil_matrix((2**num_qubits, 1))
+    statevec = scipy.sparse.lil_array((2**num_qubits, 1))
     exc_vector = np.zeros_like(ref_state)
     for exc, w in zip(excitations, weights):
         # we flip bits according to exc
@@ -132,7 +132,7 @@ def excitation_to_statevector(ref_state, excitations, weights):
             phase *= (-1)**(ref_state[:c].sum())
             exc_vector[c] = 1
         statevec += w * phase * occupation_to_statevector(exc_vector)
-    return -statevec
+    return -statevec.tocsc()
 
 def excitations_to_operators(excitations):
     excitation_operators = []

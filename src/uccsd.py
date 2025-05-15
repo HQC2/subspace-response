@@ -13,8 +13,9 @@ from scipy.optimize import minimize
 from pennylane._grad import grad as get_gradient
 import excitations
 from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
-from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc, UCCSD_stateprep
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 from hashlib import sha1
+from stateprep import stateprep
 
 import polarizationsolver
 
@@ -37,6 +38,18 @@ def _make_rdm1_on_mo(casdm1, ncore, ncas, nmo):
     dm1[idx,idx] = 2
     dm1[ncore:nocc,ncore:nocc] = casdm1
     return dm1
+
+def lazycalc(f, *args, integral_hash='', cache={}):
+    # look only at statevec arg ([2])
+    assert isinstance(args[2], scipy.sparse.sparray)
+    statevec = args[2]
+    key = sha1((np.round(args[2].data, 6)+0).view(np.uint8)).hexdigest() + sha1(args[2].indices.view(np.uint8)).hexdigest() + '_' + integral_hash
+    minuskey = sha1((np.round(-args[2].data, 6)+0).view(np.uint8)).hexdigest() + sha1(args[2].indices.view(np.uint8)).hexdigest() + '_' + integral_hash
+    if not ((key in cache) or (minuskey in cache)):
+        cache[key] = f(*args)
+        cache['arg:' + key] = args[2]
+    key = key if key in cache else minuskey
+    return cache[key]
 
 class uccsd(object):
     def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None, PE=None):
@@ -69,30 +82,7 @@ class uccsd(object):
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
-        def circuit(self, params_ground_state):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
-            if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_stateprep(self, params_ground_state, statevector):
-            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operator_stateprep(self, params_ground_state, statevector, operator, triplet=False):
-            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
-            return qml.expval(operator)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operator(self, params_ground_state, operator):
+        def circuit(self, params_ground_state, operator):
             UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
             if isinstance(operator, list):
                 return [qml.expval(op) for op in operator]
@@ -100,16 +90,31 @@ class uccsd(object):
                 return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operators(self, params_ground_state, operators):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return [qml.expval(operator) for operator in operators]
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
+        def circuit_exc(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc(self, params_ground_state, params_excitation, operator, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
+        @qml.qnode(dev, diff_method="best")
+        def circuit_stateprep(self, params_ground_state, statevector, operator):
+            stateprep(statevector)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state*0)
             if isinstance(operator, list):
                 return [qml.expval(op) for op in operator]
             else:
@@ -123,30 +128,6 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
 
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_iH_exc(self, params_ground_state, params_excitation, triplet=False):
-            if triplet:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_iH_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
-            if triplet:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(operator)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operator_stateprep(self, params_ground_state, statevector, operator, triplet=False):
-            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
-            if isinstance(operator, list):
-                return [qml.expval(op) for op in operator]
-            else:
-                return qml.expval(operator)
-
         self.H = H
         self.H_gas = H
         self.qubits = qubits
@@ -159,16 +140,10 @@ class uccsd(object):
         self.theta = qml.numpy.zeros(len(self.excitations_ground_state))
         self.device = dev
         self.circuit = circuit
-        self.circuit_operator = circuit_operator
         self.circuit_exc = circuit_exc
-        self.circuit_iH_exc = circuit_iH_exc
-        self.circuit_iH_exc_operator = circuit_iH_exc_operator
+        self.circuit_iH_exc= circuit_iH_exc
         self.circuit_stateprep = circuit_stateprep
-        self.circuit_operator_stateprep = circuit_operator_stateprep
-        self.circuit_exc_operator = circuit_exc_operator
-        self.circuit_iH_exc_operator = circuit_iH_exc_operator
         self.circuit_state = circuit_state
-        self.circuit_operator_stateprep = circuit_operator_stateprep
 
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
@@ -180,9 +155,9 @@ class uccsd(object):
                 operator = qml.jordan_wigner(fermi)
                 operators.append(operator)
         if params_excitation is not None:
-            expvals = self.circuit_exc_operator(self, params_ground_state, params_excitation, operators, triplet=triplet)
+            expvals = self.circuit_exc(self, params_ground_state, params_excitation, operators, triplet=triplet)
         else:
-            expvals = self.circuit_operator(self, params_ground_state, operators)
+            expvals = self.circuit(self, params_ground_state, operators)
         k = 0
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
@@ -244,8 +219,8 @@ class uccsd(object):
                 self.H = self.H_gas + H_PE
                 self.H_PE_gs = H_PE
     
-            energy = self.circuit(self, params)
-            grad = get_gradient(self.circuit)(self, params)
+            energy = self.circuit(self, params, self.H)
+            grad = get_gradient(self.circuit)(self, params, self.H)
             if self.PE:
                 energy += energy_pe_en 
                 if 1 in self.PE.active_induced_multipole_ranks:
@@ -286,7 +261,7 @@ class uccsd(object):
                     induction_potentials.append(v_ind+v_ind.T)
 
         def grad(x):
-            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, self.H, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
             'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
@@ -310,36 +285,6 @@ class uccsd(object):
             hvp = hvp.reshape(-1)
         return hvp
 
-    def hvp_new(self, v, triplet=False):
-        need_reshape = False
-        if len(v.shape) == 1:
-            v = v.reshape(-1, 1)
-            need_reshape = True
-        hvp = np.zeros_like(v)
-        e_gr = self.circuit(self, self.theta)
-        if triplet:
-            excita = self.excitations_triplet
-        else:
-            excita = self.excitations_singlet
-        for k in range(v.shape[1]):
-            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
-            for i in range(v.shape[0]):
-                v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
-            # todo: support sparse vector in stateprep
-            mvv = self.circuit_exc_stateprep(self, self.theta, v_statevector.toarray().ravel())
-            data = []
-            for i in range(v.shape[0]):
-                i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
-                v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
-                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
-                v_plus_i_statevector /= norm
-                mii = self.circuit_exc_stateprep(self, self.theta, i_statevector.toarray().ravel())
-                miv = self.circuit_exc_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel()) * norm**2
-                hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
-        if need_reshape:
-            hvp = hvp.reshape(-1)
-        return hvp
-
     def hvp_triplet(self, v, h=1e-6, scheme='central'):
         return self.hvp(v, h=h, scheme=scheme, triplet=True)
 
@@ -350,7 +295,7 @@ class uccsd(object):
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
-        e_gr = self.circuit(self, self.theta)
+        e_gr = self.circuit(self, self.theta, self.H)
         if triplet:
             excita = self.excitations_triplet
         else:
@@ -379,18 +324,17 @@ class uccsd(object):
                     induction_potentials.append(v_ind+v_ind.T)
 
         for k in range(v.shape[1]):
-            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            v_statevector = scipy.sparse.csc_array((2**self.qubits, 1))
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
-            # todo: support sparse vector in stateprep
-            mvv = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=self.H)
+            mvv = self.circuit_stateprep(self, self.theta, v_statevector, operator=self.H)
             for i in range(v.shape[0]):
                 i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                 v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
-                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
+                norm = scipy.sparse.linalg.norm(v_plus_i_statevector)
                 v_plus_i_statevector /= norm
-                mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
-                miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
+                mii = self.circuit_stateprep(self, self.theta, i_statevector, operator=self.H)
+                miv = self.circuit_stateprep(self, self.theta, v_plus_i_statevector, operator=self.H) * norm**2
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
             # pe dynpol contribution
             if self.PE:
@@ -418,15 +362,15 @@ class uccsd(object):
                 fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
                 operator = qml.jordan_wigner(fermi)
                 operators.append(operator)
-        D0_expvals = self.circuit_operator(self, self.theta, operators)
+        D0_expvals = self.circuit(self, self.theta, operators)
         hf_statevector = excitations.occupation_to_statevector(self.hf_state)
         for k in range(v.shape[1]):
-            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            v_statevector = scipy.sparse.csc_array((2**self.qubits, 1))
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
             plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
-            Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
-            D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
+            Dvv_expvals = self.circuit_stateprep(self, self.theta, v_statevector, operator=operators)
+            D0v_expvals = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operators)
             unpack_idx = 0
             for i in range(self.qubits//2):
                 for j in range(self.qubits//2):
@@ -485,7 +429,7 @@ class uccsd(object):
                 num_inactive = self.inactive_electrons//2
                 for i in range(num_inactive):
                     term += 2*component[i, i]
-            expectation_values.append(self.circuit_operator(self, self.theta, operator) + term)
+            expectation_values.append(self.circuit(self, self.theta, operator) + term)
         return np.array(expectation_values).reshape(out_shape)
 
     def property_gradient(self, integral, approach='derivative', triplet=False):
@@ -522,10 +466,10 @@ class uccsd(object):
             operator = qml.jordan_wigner(operator)
 
             if approach == 'derivative':
-                operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
+                operator_gradient = get_gradient(self.circuit_exc, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'iH-derivative':
-                operator_gradient = get_gradient(self.circuit_iH_exc_operator, argnum=2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
+                operator_gradient = get_gradient(self.circuit_iH_exc, argnum=2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
                 operator_matrix = operator.matrix(wire_order=range(self.qubits))
@@ -549,13 +493,13 @@ class uccsd(object):
                 else:
                     excita = self.excitations_singlet
                 hf_statevector = excitations.occupation_to_statevector(self.hf_state)
-                hf_expval = self.circuit_operator(self, self.theta, operator)
+                hf_expval = self.circuit(self, self.theta, operator)
                 operator_gradient = np.zeros_like(parameter_excitation)
                 for i in range(len(parameter_excitation)):
                     i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                     plus_statevector = (hf_statevector + i_statevector)/np.sqrt(2)
-                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
-                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    i_expval = self.circuit_stateprep(self, self.theta, i_statevector, operator=operator)
+                    plus_expval = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operator)
                     operator_gradient[i] = (plus_expval - 0.5 * (i_expval + hf_expval)).real
                 # sign?
                 operator_gradients.append(-operator_gradient)
@@ -566,13 +510,13 @@ class uccsd(object):
                 else:
                     excita = self.excitations_singlet
                 hf_statevector = excitations.occupation_to_statevector(self.hf_state)
-                hf_expval = self.circuit_operator(self, self.theta, operator)
+                hf_expval = self.circuit(self, self.theta, operator)
                 operator_gradient = np.zeros_like(parameter_excitation)
                 for i in range(len(parameter_excitation)):
                     i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                     plus_statevector = (hf_statevector + 1j*i_statevector)/np.sqrt(2)
-                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
-                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    i_expval = self.circuit_stateprep(self, self.theta, i_statevector, operator=operator)
+                    plus_expval = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operator)
                     operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
                 # sign might need extra fixing here
                 operator_gradients.append(-operator_gradient)
@@ -621,20 +565,10 @@ class uccsd(object):
             # |R> = right_op |0>
             # |L> = left_op |0>
             # compute <L|U'O U|R>
-            def lazycalc(f, *args, cache=termcache):
-                # look only at statevec arg ([2])
-                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest() + integral_hash
-                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest() + integral_hash
-                if not ((key in cache) or (minuskey in cache)):
-                    cache[key] = f(*args)
-                    cache['arg:' + key] = args[2]
-                key = key if key in cache else minuskey
-                return cache[key]
-            hf_statevector = scipy.sparse.lil_array((2**self.qubits, 1), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
-            hf_statevector[index] = 1.0
-            L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevector])
-            R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevector])
+            hf_statevec = scipy.sparse.csc_array((np.array([1.0]), (np.array([index]),np.zeros(1))), shape=(2**self.qubits, 1), dtype=np.complex128)
+            L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevec]).T
+            R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevec]).T
             L_norm = scipy.sparse.linalg.norm(L_statevec)
             R_norm = scipy.sparse.linalg.norm(R_statevec)
             # return early in case |R> or <L| vanishes
@@ -643,9 +577,9 @@ class uccsd(object):
                 return 0.
             plus_statevec = L_statevec + R_statevec
             plus_norm = scipy.sparse.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (L_statevec/L_norm).toarray().ravel(), operator)
-            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (R_statevec/R_norm).toarray().ravel(), operator)
-            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (plus_statevec/plus_norm).toarray().ravel(), operator) if plus_norm > 1e-9 else 0.
+            L_expval = L_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (L_statevec/L_norm), operator, integral_hash=integral_hash)
+            R_expval = R_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (R_statevec/R_norm), operator, integral_hash=integral_hash)
+            plus_expval = plus_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (plus_statevec/plus_norm), operator, integral_hash=integral_hash) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
 
         # (dagger,dagger) term
@@ -655,11 +589,11 @@ class uccsd(object):
         
         # (dagger,.) term
         # <Psi|I'OJ - I'JO|Psi>
-        total += term([op_I_dag], [op_J], operator) - term([op_J.T.conj(), op_I_dag], [], operator)
+        total += term([op_I_dag], [op_J], operator) - term([op_J.T.conj().tocsc(), op_I_dag], [], operator)
 
         # (.,dagger) term
         # <Psi|J'OI - OJ'I|Psi>
-        total += term([op_J_dag], [op_I], operator) - term([], [op_J_dag.T.conj(), op_I], operator)
+        total += term([op_J_dag], [op_I], operator) - term([], [op_J_dag.T.conj().tocsc(), op_I], operator)
 
         # (.,.) term
         # -<Psi|OJI|Psi>
@@ -686,18 +620,8 @@ class uccsd(object):
             # |R> = right_op |0>
             # |L> = left_op |0>
             # compute <L|U'O U|R>
-            def lazycalc(f, *args, cache=termcache):
-                # look only at statevec arg ([2])
-                key = sha1((np.round(args[2], 6)+0).view(np.uint8)).hexdigest()
-                minuskey = sha1((np.round(-args[2], 6)+0).view(np.uint8)).hexdigest()
-                if not ((key in cache) or (minuskey in cache)):
-                    cache[key] = f(*args)
-                    cache['arg:' + key] = args[2]
-                key = key if key in cache else minuskey
-                return cache[key]
-            hf_statevector = scipy.sparse.lil_array((2**self.qubits, 1), dtype=np.complex128)
             index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
-            hf_statevector[index] = 1.0
+            hf_statevector = scipy.sparse.csc_array((np.array([1.0]), (np.array([index]), np.zeros(1))), shape=(2**self.qubits, 1), dtype=np.complex128)
             L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevector])
             R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevector])
             L_norm = scipy.sparse.linalg.norm(L_statevec)
@@ -708,9 +632,9 @@ class uccsd(object):
                 return 0.
             plus_statevec = L_statevec + R_statevec
             plus_norm = scipy.sparse.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (L_statevec/L_norm).toarray().ravel(), operator)
-            R_expval = R_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (R_statevec/R_norm).toarray().ravel(), operator)
-            plus_expval = plus_norm**2*lazycalc(self.circuit_operator_stateprep, self, self.theta, (plus_statevec/plus_norm).toarray().ravel(), operator) if plus_norm > 1e-9 else 0.
+            L_expval = L_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (L_statevec/L_norm), operator, integral_hash='hamiltonian')
+            R_expval = R_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (R_statevec/R_norm), operator, integral_hash='hamiltonian')
+            plus_expval = plus_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (plus_statevec/plus_norm), operator, integral_hash='hamiltonian') if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
         
         total = 0.0
@@ -718,27 +642,27 @@ class uccsd(object):
         total += term([op_K_dag,op_J_dag,op_I_dag], [], self.H)
         # (.,dagger,dagger) <Psi|-J'K'HI + J'HK'I + K'HJ'I - HK'J'I |Psi>
         total -= term([op_K_dag,op_J_dag], [op_I], self.H)
-        total += term([op_J_dag], [op_K_dag.T.conj(),op_I], self.H)
-        total += term([op_K_dag], [op_J_dag.T.conj(),op_I], self.H)
-        total -= term([],[op_K_dag.T.conj(),op_J_dag.T.conj(),op_I], self.H)
+        total += term([op_J_dag], [op_K_dag.T.conj().tocsc(),op_I], self.H)
+        total += term([op_K_dag], [op_J_dag.T.conj().tocsc(),op_I], self.H)
+        total -= term([],[op_K_dag.T.conj().tocsc(),op_J_dag.T.conj().tocsc(),op_I], self.H)
         # (dagger,.,dagger) <Psi|I'JK'H - I'K'HJ + I'HK'J|Psi>
-        total += term([op_K_dag,op_J.T.conj(),op_I_dag], [], self.H)
+        total += term([op_K_dag,op_J.T.conj().tocsc(),op_I_dag], [], self.H)
         total -= term([op_K_dag,op_I_dag], [op_J], self.H)
-        total += term([op_I_dag], [op_K_dag.T.conj(),op_J], self.H)
+        total += term([op_I_dag], [op_K_dag.T.conj().tocsc(),op_J], self.H)
         # (dagger,dagger,.) <Psi|I'J'KH - I'J'HK|Psi>
-        total += term([op_K.T.conj(),op_J_dag,op_I_dag], [], self.H)
+        total += term([op_K.T.conj().tocsc(),op_J_dag,op_I_dag], [], self.H)
         total -= term([op_J_dag,op_I_dag], [op_K], self.H)
         # (.,.,dagger) <Psi|K'HJI - HK'JI|Psi>
         total += term([op_K_dag], [op_J,op_I], self.H)
-        total -= term([], [op_K_dag.T.conj(),op_J,op_I], self.H)
+        total -= term([], [op_K_dag.T.conj().tocsc(),op_J,op_I], self.H)
         # (.,dagger,.) <Psi|-J'KHI + J'HKI - HKJ'I|Psi>
-        total -= term([op_K.T.conj(),op_J_dag], [op_I], self.H)
+        total -= term([op_K.T.conj().tocsc(),op_J_dag], [op_I], self.H)
         total += term([op_J_dag], [op_K,op_I], self.H)
-        total -= term([], [op_K,op_J_dag.T.conj(),op_I], self.H)
+        total -= term([], [op_K,op_J_dag.T.conj().tocsc(),op_I], self.H)
         # (dagger, ., .) <Psi|I'JKH - I'JHK - I'KHJ + I'HKJ|Psi>
-        total += term([op_K.T.conj(),op_J.T.conj(),op_I_dag], [], self.H)
-        total -= term([op_J.T.conj(),op_I_dag], [op_K], self.H)
-        total -= term([op_K.T.conj(),op_I_dag], [op_J], self.H)
+        total += term([op_K.T.conj().tocsc(),op_J.T.conj().tocsc(),op_I_dag], [], self.H)
+        total -= term([op_J.T.conj().tocsc(),op_I_dag], [op_K], self.H)
+        total -= term([op_K.T.conj().tocsc(),op_I_dag], [op_J], self.H)
         total += term([op_I_dag], [op_K,op_J], self.H)
         # (.,.,.) <Psi|-HKJI|Psi>
         total -= term([], [op_K,op_J,op_I], self.H)
@@ -775,7 +699,6 @@ class uccsd(object):
                                         #  K'JI
                                         phase = 1 if k1>k2 else -1
                                         phase *= 1 if c1>c2 else -1
-                                        #print(phase, k1>k2, c1>c2)
                                         w = phase*wS1*wS2*wD
                                         result += w*I_dag[S1_idx]*J_dag[S2_idx]*K[D_idx]
                                         result -= w*I_dag[S1_idx]*K_dag[S2_idx]*J[D_idx]
