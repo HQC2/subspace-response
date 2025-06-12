@@ -4,22 +4,29 @@ import uccsd
 import solvers
 import pennylane as qml
 import numpy as np
+import sys
 
+active_electrons = None
+active_orbitals = None
 
-symbols = ['Li', 'H']
-geometry = qml.numpy.array([
-[0.0, 0.0, 0.0],
-[0.0, 0.0, 1.59],
-                 ], requires_grad=False)*1.8897259886
-charge = 0
+with open(sys.argv[1], 'r') as f:
+    f.readline()
+    charge, mult, active_electrons, active_orbitals = f.readline().split()
+    #charge, mult, *_ = f.readline().split()
+    charge = int(charge)
+    active_electrons = int(active_electrons)
+    active_orbitals = int(active_orbitals)
+symbols, geometry = uccsd.read_xyz(sys.argv[1])
+geometry /= 0.529177249 # expect bohr
 basis = 'STO-3G'
 
-ucc = uccsd.uccsd(symbols, geometry, charge, basis)
+
+ucc = uccsd.uccsd(symbols, geometry, charge, basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
 ucc.ground_state()
 hdiag = ucc.hess_diag_approximate()
 
 # solve for omega and excitation vectors
-roots = 1
+roots = 5
 omega, X = solvers.davidson_liu(ucc.hvp, hdiag, roots)
 
 # davidson_response returns (respose, history)
@@ -40,7 +47,8 @@ def S0f_transition_moment(ucc, A, B, omega_f, Xf, histcache={}):
     N_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=True, history=history, omega=-omega_1)
     N_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=True, history=history, omega=-(omega_f-omega_1))
     N_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=True, history=history, omega=-(-omega_1))
-    histcache.update(history)
+    if history is not None:
+        histcache.update(history)
 
     V2_NaBX = -ucc.V2_contraction(B, N_a, N_a_minus, Xf, zero) 
     V2_NbAX = 0.5*(ucc.V2_contraction(A, N_b_minus, N_b, Xf, zero) + ucc.V2_contraction(A, Xf, zero, N_b_minus, N_b))

@@ -22,4 +22,4 @@ ucc = uccsd.uccsd(symbols, geometry, charge, basis)
 ucc.ground_state()
 
 hdiag = ucc.hess_diag_approximate()
-w,v = solvers.davidson_liu(ucc.hvp, hdiag, 2, tol=1e-3)
+w,v = solvers.davidson_liu(ucc.hvp_new, hdiag, 2, tol=1e-3)

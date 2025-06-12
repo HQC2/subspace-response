@@ -14,20 +14,24 @@ def spin_adapted_excitations(electrons, qubits, triplet=False, generalized=False
     vir_start = nocc
     vir_end = nbas
     if generalized:
+        occ_start = 0
         occ_end = nbas
         vir_start = 0
+        vir_end = nbas
 
     for i in range(occ_start, occ_end):
         for a in range(max(i + 1, vir_start), vir_end):
-            space_singles.append([i, a])
+            if i != a:
+                space_singles.append([i, a])
     for i in range(occ_start, occ_end):
         for j in range(i, occ_end):
             for a in range(max(i, j, vir_start), vir_end):
                 for b in range(a, vir_end):
-                    space_doubles.append([i, j, a, b])
+                    ijab = [i, j, a, b]
+                    if (ijab.count(i) <= 2) and (ijab.count(b) <= 2) and (j!=a):
+                        space_doubles.append([i, j, a, b])
     # form spin-orbital excitations
     excitations = []
-
     if not triplet:
         # singlet operators
         # doubles
@@ -96,6 +100,21 @@ def spin_adapted_excitations(electrons, qubits, triplet=False, generalized=False
             aa = [2*i, 2*a]
             bb = [2*i + 1, 2*a + 1]
             excitations.append([[aa, bb], [1, -1]])
+    return excitations
+
+def tups_excitations(electrons, qubits, layers):
+    excitations = []
+    for _ in range(layers):
+        for I in range(0, qubits, 4):
+            ia,ib,aa,ab = range(I, I+4)
+            excitations.append([[[ia,aa], [ib, ab]], [1.0/np.sqrt(2), 1.0/np.sqrt(2)]])
+            excitations.append([[[ia,ib,aa,ab]], [1.0]])
+            excitations.append([[[ia,aa], [ib, ab]], [1.0/np.sqrt(2), 1.0/np.sqrt(2)]])
+        for I in range(2, qubits-2, 4):
+            ia,ib,aa,ab = range(I, I+4)
+            excitations.append([[[ia,aa], [ib, ab]], [1.0/np.sqrt(2), 1.0/np.sqrt(2)]])
+            excitations.append([[[ia,ib,aa,ab]], [1.0]])
+            excitations.append([[[ia,aa], [ib, ab]], [1.0/np.sqrt(2), 1.0/np.sqrt(2)]])
     return excitations
 
 def occupation_to_statevector(bitstring):

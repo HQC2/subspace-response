@@ -6,46 +6,22 @@ import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
 from uccsd import UCCSD
-import solvers
 import excitations
 
-symbols = ['H', 'H', 'H', 'H']
-geometry = qml.numpy.array([
-[0.0,  0.0,  0.0],
-[0.0,  0.0,  2.0],
-[1.5,  0.0,  0.0],
-[1.5,  0.0,  2.0],
-]
-                 , requires_grad=False)
-
-symbols = ['Li', 'H']
-geometry = qml.numpy.array([
-[0.0,  0.0         ,  0.],
-[0., 0., 1.6717072740],
-                 ], requires_grad=False)*1.8897259886 * 2
-#symbols = ['O', 'H', 'H']
-#geometry = qml.numpy.array([
-#[0.0,  0.0         ,  0.1035174918],
-#[0.0,  0.7955612117, -0.4640237459],
-#[0.0, -0.7955612117, -0.4640237459],
-#], requires_grad=False) * 1.8897259886
-
-basis = 'STO-3G'
-charge = 0
-
 class adaptwfn(uccsd.uccsd):
-    def __init__(self, symbols, geometry, charge, basis):
-        super().__init__(symbols, geometry, charge, basis)
+    def __init__(self, symbols, geometry, charge, basis, **kwargs):
+        super().__init__(symbols, geometry, charge, basis, **kwargs)
 
-    def ground_state(self, adapt_tol=1e-5):
+    def ground_state(self, adapt_tol=1e-3):
         # 1) define operator pool
         pool = excitations.spin_adapted_excitations(self.electrons, self.qubits, generalized=True)
         self.excitations_ground_state = []
         self.theta = []
         
-        grad_norm = adapt_tol + 1
+        max_grad_norm = adapt_tol + 1
         adapt_iter = 1
-        while grad_norm > adapt_tol:
+        last_energy = 0. 
+        while max_grad_norm > adapt_tol:
             print(f'Adapt iteration: {adapt_iter}')
             # 2) get gradients of all operators in pool, terminate if below grad_tol
             previous_excitations_ground_state = self.excitations_ground_state
@@ -59,13 +35,14 @@ class adaptwfn(uccsd.uccsd):
             self.circuit = circuit
 
             gradient = get_gradient(self.circuit, argnum=1)(self, params)
-            grad_norm = np.linalg.norm(gradient)
+            max_grad_norm = np.max(np.abs((gradient)))
             gradient_pool = gradient[len(previous_excitations_ground_state):]
-            add_idx = np.argmax(np.abs(gradient_pool))
+#            add_idx = np.argmax(np.abs(gradient_pool))
+            add_indices = np.where(np.abs(gradient_pool) > adapt_tol)[0]
 
             # 3) grow circuit
-            self.excitations_ground_state = previous_excitations_ground_state + [pool[add_idx]]
-            self.theta = qml.numpy.array(list(self.theta) + [0.])
+            self.excitations_ground_state = previous_excitations_ground_state + [pool[add_idx] for add_idx in add_indices]
+            self.theta = qml.numpy.array(list(self.theta) + [0.]*len(add_indices))
             self.num_params = len(self.theta)
 
             @qml.qnode(self.device, diff_method="adjoint")
@@ -87,19 +64,14 @@ class adaptwfn(uccsd.uccsd):
                 return grad
             
             res = minimize(energy, jac=jac, x0=self.theta, method='slsqp', tol=1e-12)
-            self.theta = res.x
+            
+            # prune zero parameters
+            zero_theta = np.abs(res.x) < 1e-9
+            prune_idx = np.where(zero_theta)[0]
+            for index in sorted(prune_idx, reverse=True):
+                self.excitations_ground_state.pop(index)
+            self.theta = res.x[~zero_theta]
+
             adapt_iter += 1
-
-
-wfn = adaptwfn(symbols, geometry, charge, basis)
-#wfn = uccsd.uccsd(symbols, geometry, charge, basis)
-wfn.ground_state()
-
-hdiag = wfn.hess_diag_approximate()
-
-dipx, dipy, dipz = wfn.property_gradient('int1e_r')
-# davidson_response returns (respose, history)
-resp_x, resp_y, resp_z = [solvers.davidson_response(wfn.hvp, dip, hdiag)[0] for dip in [dipx, dipy, dipz]]
-print('alpha_xx', np.dot(dipx, resp_x).real)
-print('alpha_yy', np.dot(dipy, resp_y).real)
-print('alpha_zz', np.dot(dipz, resp_z).real)
+            print(f'DeltaE= {res.fun - last_energy:.6e} Added: {add_indices} Removed {prune_idx}')
+            last_energy = res.fun

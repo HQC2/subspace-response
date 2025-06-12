@@ -24,6 +24,7 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
     AV = hvp(V)
     for i in range(100):
         S = V.T @ AV
+        S = 0.5*(S + S.T)
         L, Z = np.linalg.eigh(S)
         L = L[:roots]
         Z = Z[:, :roots]
