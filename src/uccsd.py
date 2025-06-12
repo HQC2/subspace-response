@@ -581,127 +581,49 @@ class uccsd(object):
             R_expval = R_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (R_statevec/R_norm), operator, integral_hash=integral_hash)
             plus_expval = plus_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (plus_statevec/plus_norm), operator, integral_hash=integral_hash) if plus_norm > 1e-9 else 0.
             return 0.5*(plus_expval - L_expval - R_expval)
-
-        # (dagger,dagger) term
-        # -<Psi|I'J'O|Psi>
-        total = 0.0
-        total -= term([op_J_dag, op_I_dag], [], operator)
         
+        index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
+        hf_statevec = scipy.sparse.csc_array((np.array([1.0]), (np.array([index]),np.zeros(1))), shape=(2**self.qubits, 1), dtype=np.complex128)
+        expval = lazycalc(self.circuit_stateprep, self, self.theta, hf_statevec, operator, integral_hash=integral_hash)
+        total = 0.0
         # (dagger,.) term
-        # <Psi|I'OJ - I'JO|Psi>
-        total += term([op_I_dag], [op_J], operator) - term([op_J.T.conj().tocsc(), op_I_dag], [], operator)
+        # <Psi|I'OJ|Psi>
+        total += term([op_I_dag], [op_J], operator)
+        total -= expval * np.dot(J, I_dag)
 
         # (.,dagger) term
-        # <Psi|J'OI - OJ'I|Psi>
-        total += term([op_J_dag], [op_I], operator) - term([], [op_J_dag.T.conj().tocsc(), op_I], operator)
-
-        # (.,.) term
-        # -<Psi|OJI|Psi>
-        total -= term([], [op_J,op_I], operator)
+        # <Psi|J'OI|Psi>
+        total += term([op_J_dag], [op_I], operator)
+        total -= expval * np.dot(J_dag, I)
         return total
 
-    def E3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False, termcache={}):
+    def E3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
         if self.PE is not None:
             raise NotImplementedError
         if triplet:
             # todo
             raise NotImplementedError
-            excitation_operators = self.excitation_operators_triplet
+            excitation_operators = self.excitations_triplet
         else:
-            excitation_operators = self.excitation_operators_singlet
-        op_I = scipy.sparse.csc_array(sum([I[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-        op_I_dag = scipy.sparse.csc_array(sum([I_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-        op_J = scipy.sparse.csc_array(sum([J[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-        op_J_dag = scipy.sparse.csc_array(sum([J_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-        op_K = scipy.sparse.csc_array(sum([K[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-        op_K_dag = scipy.sparse.csc_array(sum([K_dag[i] * excitation_operators[i] for i in range(len(excitation_operators))]).sparse_matrix(wire_order=range(self.qubits)))
-
-        def term(left_ops, right_ops, operator):
-            # |R> = right_op |0>
-            # |L> = left_op |0>
-            # compute <L|U'O U|R>
-            index = np.sum((self.hf_state)*2**(np.arange(self.qubits)[::-1]))
-            hf_statevector = scipy.sparse.csc_array((np.array([1.0]), (np.array([index]), np.zeros(1))), shape=(2**self.qubits, 1), dtype=np.complex128)
-            L_statevec = functools.reduce(scipy.sparse.csc_array.dot, left_ops +  [hf_statevector])
-            R_statevec = functools.reduce(scipy.sparse.csc_array.dot, right_ops + [hf_statevector])
-            L_norm = scipy.sparse.linalg.norm(L_statevec)
-            R_norm = scipy.sparse.linalg.norm(R_statevec)
-            # return early in case |R> or <L| vanishes
-            # (because <R|O|L> = 0)
-            if (L_norm < 1e-9) or (R_norm < 1e-9):
-                return 0.
-            plus_statevec = L_statevec + R_statevec
-            plus_norm = scipy.sparse.linalg.norm(plus_statevec)
-            L_expval = L_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (L_statevec/L_norm), operator, integral_hash='hamiltonian')
-            R_expval = R_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (R_statevec/R_norm), operator, integral_hash='hamiltonian')
-            plus_expval = plus_norm**2*lazycalc(self.circuit_stateprep, self, self.theta, (plus_statevec/plus_norm), operator, integral_hash='hamiltonian') if plus_norm > 1e-9 else 0.
-            return 0.5*(plus_expval - L_expval - R_expval)
-        
+            excitation_operators = self.excitations_singlet
+        residuals = np.zeros(len(excitation_operators))
+        hf_statevector = excitations.occupation_to_statevector(self.hf_state).tocsc()
+        E_gr = self.circuit_stateprep(self, self.theta, hf_statevector, operator=self.H)
+        for i in range(len(excitation_operators)):
+            # <HF|U' H U Gi |HF>; 
+            # |R> = |Gi>, <L| = <HF|
+            i_statevector = excitations.excitation_to_statevector(self.hf_state, *excitation_operators[i]).tocsc()
+            plus_statevector = (hf_statevector + i_statevector) / np.sqrt(2)
+            H_ii = self.circuit_stateprep(self, self.theta, i_statevector, operator=self.H)
+            H_plus = self.circuit_stateprep(self, self.theta, plus_statevector, operator=self.H)
+            residuals[i] = H_plus - 0.5*(H_ii + E_gr)
         total = 0.0
-        # (dagger,dagger,dagger) <Psi|I'J'K'H|Psi>
-        total += term([op_K_dag,op_J_dag,op_I_dag], [], self.H)
-        # (.,dagger,dagger) <Psi|-J'K'HI + J'HK'I + K'HJ'I - HK'J'I |Psi>
-        total -= term([op_K_dag,op_J_dag], [op_I], self.H)
-        total += term([op_J_dag], [op_K_dag.T.conj().tocsc(),op_I], self.H)
-        total += term([op_K_dag], [op_J_dag.T.conj().tocsc(),op_I], self.H)
-        total -= term([],[op_K_dag.T.conj().tocsc(),op_J_dag.T.conj().tocsc(),op_I], self.H)
-        # (dagger,.,dagger) <Psi|I'JK'H - I'K'HJ + I'HK'J|Psi>
-        total += term([op_K_dag,op_J.T.conj().tocsc(),op_I_dag], [], self.H)
-        total -= term([op_K_dag,op_I_dag], [op_J], self.H)
-        total += term([op_I_dag], [op_K_dag.T.conj().tocsc(),op_J], self.H)
-        # (dagger,dagger,.) <Psi|I'J'KH - I'J'HK|Psi>
-        total += term([op_K.T.conj().tocsc(),op_J_dag,op_I_dag], [], self.H)
-        total -= term([op_J_dag,op_I_dag], [op_K], self.H)
-        # (.,.,dagger) <Psi|K'HJI - HK'JI|Psi>
-        total += term([op_K_dag], [op_J,op_I], self.H)
-        total -= term([], [op_K_dag.T.conj().tocsc(),op_J,op_I], self.H)
-        # (.,dagger,.) <Psi|-J'KHI + J'HKI - HKJ'I|Psi>
-        total -= term([op_K.T.conj().tocsc(),op_J_dag], [op_I], self.H)
-        total += term([op_J_dag], [op_K,op_I], self.H)
-        total -= term([], [op_K,op_J_dag.T.conj().tocsc(),op_I], self.H)
-        # (dagger, ., .) <Psi|I'JKH - I'JHK - I'KHJ + I'HKJ|Psi>
-        total += term([op_K.T.conj().tocsc(),op_J.T.conj().tocsc(),op_I_dag], [], self.H)
-        total -= term([op_J.T.conj().tocsc(),op_I_dag], [op_K], self.H)
-        total -= term([op_K.T.conj().tocsc(),op_I_dag], [op_J], self.H)
-        total += term([op_I_dag], [op_K,op_J], self.H)
-        # (.,.,.) <Psi|-HKJI|Psi>
-        total -= term([], [op_K,op_J,op_I], self.H)
+        # I J_dag K_dag, r_j δ_ik + r_k δ_ij
+        total += np.dot(residuals, J_dag) * np.dot(I, K_dag) + np.dot(residuals, K_dag) * np.dot(I, J_dag) 
+        # I_dag J K_dag, r_k δ_ij + r_i δ_jk
+        total += np.dot(residuals, K_dag) * np.dot(I_dag, J) + np.dot(residuals, I_dag) * np.dot(J, K_dag) 
+        # I J_dag K,     r_i δ_jk + r_k δ_ij
+        total -= np.dot(residuals, I) * np.dot(J_dag, K) + np.dot(residuals, K) * np.dot(I, J_dag) 
+        # I_dag J K      r_k δ_ij + r_j δ_ik
+        total -= np.dot(residuals, K) * np.dot(I_dag, J) + np.dot(residuals, J) * np.dot(I_dag, K) 
         return 0.5*total
-
-    def S3_contraction(self, I, I_dag, J, J_dag, K, K_dag, triplet=False):
-        if triplet:
-            excitations = self.excitations_triplet
-        else:
-            excitations = self.excitations_singlet
-
-        excitation_rank = np.array([len(excitation[0][0])//2 for excitation in excitations]) 
-        singles = np.where(excitation_rank == 1)[0]
-        doubles = np.where(excitation_rank == 2)[0]
-
-        result = 0.0
-        for D_idx in doubles:
-            for (D_exc, wD) in zip(*excitations[D_idx]):
-                i,j,a,b = D_exc
-                for S1_idx in singles:
-                    for (S1_exc, wS1) in zip(*excitations[S1_idx]):
-                        k1, c1 = S1_exc
-                        # (ia,jb), (ib,ja), (ja,ib), (jb,ia)
-                        # first index is ia,ib,ja, or jb
-                        if (k1==i or k1==j) and (c1==a or c1==b):
-                            k, c = set([i,j,a,b]).difference([k1,c1])
-                            for S2_idx in singles:
-                                for (S2_exc, wS2) in zip(*excitations[S2_idx]):
-                                    k2, c2 = S2_exc
-                                    if (k2==k) and (c2==c):
-                                        #  I'J'K
-                                        # -I'K'J
-                                        # -J'KI
-                                        #  K'JI
-                                        phase = 1 if k1>k2 else -1
-                                        phase *= 1 if c1>c2 else -1
-                                        w = phase*wS1*wS2*wD
-                                        result += w*I_dag[S1_idx]*J_dag[S2_idx]*K[D_idx]
-                                        result -= w*I_dag[S1_idx]*K_dag[S2_idx]*J[D_idx]
-                                        result -= w*J_dag[D_idx]*K[S1_idx]*I[S2_idx]
-                                        result += w*K_dag[D_idx]*I[S1_idx]*J[S2_idx]
-        return -0.5*result
