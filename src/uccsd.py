@@ -608,14 +608,14 @@ class uccsd(object):
             excitation_operators = self.excitations_singlet
         residuals = np.zeros(len(excitation_operators))
         hf_statevector = excitations.occupation_to_statevector(self.hf_state).tocsc()
-        E_gr = self.circuit_stateprep(self, self.theta, hf_statevector, operator=self.H)
+        E_gr = lazycalc(self.circuit_stateprep, self, self.theta, hf_statevector, self.H, integral_hash='hamiltonian')
         for i in range(len(excitation_operators)):
             # <HF|U' H U Gi |HF>; 
             # |R> = |Gi>, <L| = <HF|
             i_statevector = excitations.excitation_to_statevector(self.hf_state, *excitation_operators[i]).tocsc()
             plus_statevector = (hf_statevector + i_statevector) / np.sqrt(2)
-            H_ii = self.circuit_stateprep(self, self.theta, i_statevector, operator=self.H)
-            H_plus = self.circuit_stateprep(self, self.theta, plus_statevector, operator=self.H)
+            H_ii = lazycalc(self.circuit_stateprep, self, self.theta, i_statevector, self.H, integral_hash='hamiltonian')
+            H_plus = lazycalc(self.circuit_stateprep, self, self.theta, plus_statevector, self.H, integral_hash='hamiltonian')
             residuals[i] = H_plus - 0.5*(H_ii + E_gr)
         total = 0.0
         # I J_dag K_dag, r_j δ_ik + r_k δ_ij
