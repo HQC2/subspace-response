@@ -12,7 +12,7 @@ class adaptwfn(uccsd.uccsd):
     def __init__(self, symbols, geometry, charge, basis, **kwargs):
         super().__init__(symbols, geometry, charge, basis, **kwargs)
 
-    def ground_state(self, adapt_tol=1e-3):
+    def ground_state(self, adapt_tol=1e-3, energy_tol=5e-7):
         # 1) define operator pool
         pool = excitations.spin_adapted_excitations(self.electrons, self.qubits, generalized=True)
         self.excitations_ground_state = []
@@ -28,13 +28,7 @@ class adaptwfn(uccsd.uccsd):
             self.excitations_ground_state = self.excitations_ground_state + pool
             params = qml.numpy.array(list(self.theta) + [0.]*len(pool))
 
-            @qml.qnode(self.device, diff_method="adjoint")
-            def circuit(self, params_ground_state):
-                UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-                return qml.expval(self.H)
-            self.circuit = circuit
-
-            gradient = get_gradient(self.circuit, argnum=1)(self, params)
+            gradient = get_gradient(self.circuit, argnum=1)(self, params, self.H)
             max_grad_norm = np.max(np.abs((gradient)))
             gradient_pool = gradient[len(previous_excitations_ground_state):]
 #            add_idx = np.argmax(np.abs(gradient_pool))
@@ -45,22 +39,16 @@ class adaptwfn(uccsd.uccsd):
             self.theta = qml.numpy.array(list(self.theta) + [0.]*len(add_indices))
             self.num_params = len(self.theta)
 
-            @qml.qnode(self.device, diff_method="adjoint")
-            def circuit(self, params_ground_state):
-                UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-                return qml.expval(self.H)
-            self.circuit = circuit
-
             # 4) optimize parameters
             def energy(params):
                 params = qml.numpy.array(params)
-                energy = self.circuit(self, params)
+                energy = self.circuit(self, params, self.H)
                 print('energy = ', energy, flush=True)
                 return energy
 
             def jac(params):
                 params = qml.numpy.array(params)
-                grad = get_gradient(self.circuit)(self, params)
+                grad = get_gradient(self.circuit)(self, params, self.H)
                 return grad
             
             res = minimize(energy, jac=jac, x0=self.theta, method='slsqp', tol=1e-12)
@@ -73,5 +61,8 @@ class adaptwfn(uccsd.uccsd):
             self.theta = res.x[~zero_theta]
 
             adapt_iter += 1
+            deltaE = res.fun - last_energy
             print(f'DeltaE= {res.fun - last_energy:.6e} Added: {add_indices} Removed {prune_idx}')
+            if np.abs(deltaE) < energy_tol:
+                break
             last_energy = res.fun
