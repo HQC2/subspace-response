@@ -33,13 +33,13 @@ def beta_term(ucc, A, B, C, omega_B, omega_C):
     V_C = ucc.property_gradient(C)
     
     history = None
-    resp_a, history = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=False, history=history, omega=(omega_B+omega_C))
-    resp_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=False, history=history, omega=omega_B)
-    resp_c, history = solvers.davidson_response(ucc.hvp, V_C, hdiag, verbose=False, history=history, omega=omega_C)
+    resp_a, history = solvers.davidson_response(ucc.hvp_new, V_A, hdiag, verbose=False, history=history, omega=(omega_B+omega_C))
+    resp_b, history = solvers.davidson_response(ucc.hvp_new, V_B, hdiag, verbose=False, history=history, omega=omega_B)
+    resp_c, history = solvers.davidson_response(ucc.hvp_new, V_C, hdiag, verbose=False, history=history, omega=omega_C)
 
-    resp_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=False, history=history, omega=-(omega_B+omega_C))
-    resp_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=False, history=history, omega=-omega_B)
-    resp_c_minus, history = solvers.davidson_response(ucc.hvp, -V_C, hdiag, verbose=False, history=history, omega=-omega_C)
+    resp_a_minus, history = solvers.davidson_response(ucc.hvp_new, -V_A, hdiag, verbose=False, history=history, omega=-(omega_B+omega_C))
+    resp_b_minus, history = solvers.davidson_response(ucc.hvp_new, -V_B, hdiag, verbose=False, history=history, omega=-omega_B)
+    resp_c_minus, history = solvers.davidson_response(ucc.hvp_new, -V_C, hdiag, verbose=False, history=history, omega=-omega_C)
 
     V2_aBc = ucc.V2_contraction(B, resp_a_minus, resp_a, resp_c, resp_c_minus)
     V2_aCb = ucc.V2_contraction(C, resp_a_minus, resp_a, resp_b, resp_b_minus)
@@ -55,4 +55,4 @@ def beta_term(ucc, A, B, C, omega_B, omega_C):
     print('A@E3_jml@B@C', E3_acb)
     return V2_aBc + V2_aCb + V2_bAc + E3_abc + E3_acb
 
-print(beta_term(ucc, intz, intz, intz, 0.1, 0.3))
+print(beta_term(ucc, intz, intz, intz, 0.0, 0.0))

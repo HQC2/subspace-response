@@ -18,7 +18,7 @@ with open(sys.argv[1], 'r') as f:
     active_orbitals = int(active_orbitals)
 symbols, geometry = uccsd.read_xyz(sys.argv[1])
 geometry /= 0.529177249 # expect bohr
-basis = 'STO-3G'
+basis = 'cc-pVDZ'
 
 
 ucc = uccsd.uccsd(symbols, geometry, charge, basis, active_electrons=active_electrons, active_orbitals=active_orbitals)
@@ -26,8 +26,8 @@ ucc.ground_state()
 hdiag = ucc.hess_diag_approximate()
 
 # solve for omega and excitation vectors
-roots = 5
-omega, X = solvers.davidson_liu(ucc.hvp, hdiag, roots)
+roots = 2
+omega, X = solvers.davidson_liu(ucc.hvp_new, hdiag, roots)
 
 # davidson_response returns (respose, history)
 intx, inty, intz = ucc.m.intor('int1e_r')
@@ -43,10 +43,10 @@ def S0f_transition_moment(ucc, A, B, omega_f, Xf, histcache={}):
 
     
     history = histcache if histcache else None
-    N_a, history = solvers.davidson_response(ucc.hvp, V_A, hdiag, verbose=True, history=history, omega=omega_f-omega_1)
-    N_b, history = solvers.davidson_response(ucc.hvp, V_B, hdiag, verbose=True, history=history, omega=-omega_1)
-    N_a_minus, history = solvers.davidson_response(ucc.hvp, -V_A, hdiag, verbose=True, history=history, omega=-(omega_f-omega_1))
-    N_b_minus, history = solvers.davidson_response(ucc.hvp, -V_B, hdiag, verbose=True, history=history, omega=-(-omega_1))
+    N_a, history = solvers.davidson_response(ucc.hvp_new, V_A, hdiag, verbose=True, history=history, omega=omega_f-omega_1)
+    N_b, history = solvers.davidson_response(ucc.hvp_new, V_B, hdiag, verbose=True, history=history, omega=-omega_1)
+    N_a_minus, history = solvers.davidson_response(ucc.hvp_new, -V_A, hdiag, verbose=True, history=history, omega=-(omega_f-omega_1))
+    N_b_minus, history = solvers.davidson_response(ucc.hvp_new, -V_B, hdiag, verbose=True, history=history, omega=-(-omega_1))
     if history is not None:
         histcache.update(history)
 
@@ -56,10 +56,7 @@ def S0f_transition_moment(ucc, A, B, omega_f, Xf, histcache={}):
     E3_NaNbX = ucc.E3_contraction(N_a, N_a_minus, N_b_minus, N_b, Xf, zero)
     E3_NaXNb = ucc.E3_contraction(N_a, N_a_minus, Xf, zero, N_b_minus, N_b)
 
-    S3_NaNbX = ucc.S3_contraction(N_a, N_a_minus, N_b_minus, N_b, Xf, zero)
-    S3_NaXNb = ucc.S3_contraction(N_a, N_a_minus, Xf, zero, N_b_minus, N_b)
-
-    S = V2_NaBX + V2_NbAX + E3_NaNbX + E3_NaXNb - omega_1*S3_NaNbX + omega_f*S3_NaXNb
+    S = V2_NaBX + V2_NbAX + E3_NaNbX + E3_NaXNb
     return S
 
 # loop over excited states
