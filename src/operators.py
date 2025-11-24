@@ -1,11 +1,11 @@
 import numpy as np
 import pennylane as qml
-from pennylane.operation import Operation, AnyWires
+from pennylane.operation import Operation
 from pennylane.ops import RZ, RX, CNOT, Hadamard
 
 
 class iHSingleExcitation(Operation):
-    num_wires = AnyWires
+    num_wires = None
     grad_method = "A"
     parameter_frequencies = [(0.5, 1.0)]
 
@@ -32,7 +32,7 @@ class iHSingleExcitation(Operation):
         return op_list
 
 class iHDoubleExcitation(Operation):
-    num_wires = AnyWires
+    num_wires = None
     grad_method = "A"
     parameter_frequencies = [(0.5, 1.0)]
 

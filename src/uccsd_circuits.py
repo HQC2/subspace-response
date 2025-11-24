@@ -18,13 +18,13 @@ Based on pennylane/templates/subroutines/uccsd.py
 """
 import numpy as np
 import pennylane as qml
-from pennylane.operation import Operation, AnyWires
+from pennylane.operation import Operation
 from pennylane.ops import BasisState
 from operators import iHSingleExcitation, iHDoubleExcitation
 
 
 class UCCSD(Operation):
-    num_wires = AnyWires
+    num_wires = None
     grad_method = None
 
     def __init__(self, weights, wires, excitations_ground_state, init_state):
@@ -64,7 +64,7 @@ class UCCSD(Operation):
 
 
 class UCCSD_exc(Operation):
-    num_wires = AnyWires
+    num_wires = None
     grad_method = None
 
     def __init__(
@@ -139,7 +139,7 @@ class UCCSD_exc(Operation):
         return op_list
 
 class UCCSD_iH_exc(Operation):
-    num_wires = AnyWires
+    num_wires = None
     grad_method = None
 
     def __init__(
