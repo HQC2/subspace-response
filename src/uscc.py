@@ -38,11 +38,14 @@ class USCCSelector:
     amplitudes are expanded into monomial coefficients sum_mu theta_mu*c_mu,m.
     This is a first-order proposal surrogate, not a CI coefficient estimator.
     """
-    def __init__(self, integrals, max_rank=4, orbital_irreps=None, exhaustive=False):
+    def __init__(self, integrals, max_rank=4, orbital_irreps=None, exhaustive=False, growth='paper'):
         if not isinstance(max_rank, int) or max_rank < 1:
             raise ValueError('max_rank must be a positive integer')
         if orbital_irreps is not None and (len(orbital_irreps) != integrals.qubits//2 or any(not isinstance(i, (int, np.integer)) or i < 0 for i in orbital_irreps)):
             raise ValueError('Expected nonnegative Abelian XOR irrep IDs')
+        if growth not in ('paper','recursive') or (growth == 'paper' and max_rank > 4):
+            raise ValueError('Use recursive growth to extend USCC beyond quadruples')
+        self.growth = growth
         self.integrals = integrals
         self.max_rank = min(max_rank, integrals.electrons, integrals.qubits-integrals.electrons)
         self.requested_max_rank = max_rank
@@ -75,6 +78,8 @@ class USCCSelector:
         scores = self.base_scores()
         amplitudes = {}
         for excitation, theta in zip(excitations, parameters):
+            if self.growth == 'paper' and excitation.rank > 2:
+                continue
             for term in excitation.terms:
                 key = term.holes, term.particles
                 amplitudes[key] = amplitudes.get(key, 0.) + float(theta)*term.coefficient
@@ -114,17 +119,25 @@ class USCC:
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False, backend='sector', growth='paper', sector_threads=None):
+        if backend not in ('sector','pennylane'):
+            raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
             raise ValueError('seed must be sd or screened')
         if not isinstance(trotter_steps, int) or trotter_steps < 1:
             raise ValueError('trotter_steps must be a positive integer')
+        if sector_threads is not None and (type(sector_threads) is not int or sector_threads < 1):
+            raise ValueError('sector_threads must be a positive integer or None')
+        self.sector_threads = sector_threads
         self.integrals = integrals
         self.H = integrals.hamiltonian()
+        self._integral_hamiltonian = self.H
+        self.backend = backend
+        self._simulator = None
         self.qubits = integrals.qubits
         self.hf_state = np.array([1]*integrals.electrons+[0]*(self.qubits-integrals.electrons), dtype=int)
         self.metadata = {} if metadata is None else metadata
-        self.selector = USCCSelector(integrals, max_rank, orbital_irreps, exhaustive)
+        self.selector = USCCSelector(integrals, max_rank, orbital_irreps, exhaustive, growth)
         self.seed = seed
         self.trotter_steps = trotter_steps
         self.device_name = device
@@ -138,7 +151,7 @@ class USCC:
         self.initialized = False
         self.needs_optimization = False
         self.stop_reason = 'not_started'
-        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300)
+        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='slsqp')
 
         @qml.qnode(self.device, diff_method='adjoint')
         def expectation_circuit(parameters, operator, vector=None):
@@ -212,24 +225,57 @@ class USCC:
         self.provenance = {}
         self.stop_reason = 'not_started'
 
+    def _sector_simulator(self):
+        if self._simulator is None:
+            from uscc_simulator import SectorSimulator
+            self._simulator = SectorSimulator(self.integrals, sector_threads=self.sector_threads)
+        return self._simulator
+
+    def _sector_state(self, parameters, statevector):
+        simulator = self._sector_simulator()
+        initial = None if statevector is None else simulator.project_input(statevector)
+        if statevector is not None and initial is None:
+            return None  # Preserve full-register support for other sectors.
+        return simulator.state(parameters,self.excitations,self.trotter_steps,initial)
+
     def expectation(self, operator=None, parameters=None, statevector=None):
-        return self.circuit(self.theta if parameters is None else parameters, self.H if operator is None else operator, statevector)
+        parameters = self.theta if parameters is None else parameters
+        operator = self.H if operator is None else operator
+        if self.backend == 'sector':
+            state = self._sector_state(parameters,statevector)
+            if state is not None:
+                simulator = self._sector_simulator()
+                def measure(op):
+                    if op is self._integral_hamiltonian:
+                        return np.vdot(state,simulator.apply_hamiltonian(state)).real
+                    return simulator.expectation(state,op)
+                return [measure(op) for op in operator] if isinstance(operator,list) else measure(operator)
+        return self.circuit(parameters,operator,statevector)
 
     def state(self, parameters=None, statevector=None):
-        return self.circuit_state(self.theta if parameters is None else parameters, statevector)
+        parameters = self.theta if parameters is None else parameters
+        if self.backend == 'sector':
+            state = self._sector_state(parameters,statevector)
+            if state is not None:
+                return self._sector_simulator().full_state(state)
+        return self.circuit_state(parameters,statevector)
 
     def energy_and_gradient(self, parameters):
+        if self.backend == 'sector':
+            hamiltonian = None if self.H is self._integral_hamiltonian else self.H
+            return self._sector_simulator().energy_and_gradient(parameters,self.excitations,self.trotter_steps,hamiltonian)
         parameters = qml.numpy.array(parameters, requires_grad=True)
         if not len(parameters):
             return float(self.expectation(parameters=parameters)), np.zeros(0)
         gradient_function = qml.grad(self.circuit, 0)
         gradient = gradient_function(parameters, self.H)
-        gradient = np.asarray(gradient, dtype=float)
-        energy = float(gradient_function.forward)
-        print(energy, np.linalg.norm(gradient))
-        return energy, gradient
+        return float(gradient_function.forward), np.asarray(gradient,dtype=float)
 
     def diagnostics(self):
+        if self.backend == 'sector':
+            simulator = self._sector_simulator()
+            state = simulator.state(self.theta,self.excitations,self.trotter_steps)
+            return dict(particle_number=float(self.integrals.electrons*np.vdot(state,state).real), spin_z=0., spin_squared=simulator.spin_squared(state))
         operators = [qml.qchem.particle_number(self.qubits), qml.qchem.spinz(self.qubits), qml.qchem.spin2(self.integrals.electrons, self.qubits)]
         number, sz, s2 = self.expectation(operators)
         return dict(particle_number=float(number), spin_z=float(sz), spin_squared=float(s2))
@@ -253,28 +299,43 @@ class USCC:
         self.needs_optimization = bool(added) or self.needs_optimization
         return added, False
 
-    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300):
+    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='slsqp'):
         if gradient_tolerance <= 0 or energy_tolerance <= 0 or maxiter < 1:
             raise ValueError('Optimization tolerances and iteration count must be positive')
+        if method.lower() not in ('slsqp','bfgs'):
+            raise ValueError('Optimizer must be slsqp or bfgs')
         initial = self.theta.copy()
         old_energy, old_gradient = self.energy_and_gradient(initial)
+        last = [initial.copy(), (old_energy,old_gradient)]
+        evaluations = 1
+        def objective(parameters):
+            nonlocal evaluations
+            if not np.array_equal(parameters,last[0]):
+                last[:] = [np.array(parameters,copy=True),self.energy_and_gradient(parameters)]
+                evaluations += 1
+            return last[1]
         if not len(initial) or np.linalg.norm(old_gradient) <= gradient_tolerance:
             result = dict(success=True, message='Initial point converged', iterations=0)
             energy, gradient = old_energy, old_gradient
         else:
-            res = minimize(self.energy_and_gradient, initial, method='slsqp', jac=True, options=dict(gtol=gradient_tolerance, norm=2, maxiter=maxiter))
-            energy, gradient = self.energy_and_gradient(res.x) if np.all(np.isfinite(res.x)) else (np.inf, old_gradient)
+            options = dict(maxiter=maxiter)
+            if method.lower() == 'slsqp':
+                options['ftol'] = energy_tolerance
+            else:
+                options.update(gtol=gradient_tolerance,norm=2)
+            res = minimize(objective,initial,method=method,jac=True,options=options)
+            energy, gradient = objective(res.x) if np.all(np.isfinite(res.x)) else (np.inf,old_gradient)
             accepted = bool(np.isfinite(energy) and np.all(np.isfinite(gradient)) and energy <= old_energy+energy_tolerance and (res.success or np.linalg.norm(gradient) <= gradient_tolerance))
             if accepted:
                 self.theta = np.asarray(res.x, dtype=float)
             else:
                 energy, gradient = old_energy, old_gradient
             result = dict(success=accepted, message=str(res.message), iterations=int(res.nit))
-        result.update(energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
+        result.update(evaluations=evaluations, optimizer=method, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
         self.needs_optimization = not result['success']
         return result
 
-    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, energy_tolerance=None, maxiter=None, callback=None):
+    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None):
         if thresholds is None:
             thresholds = self.schedule if self.schedule is not None else (1e-2,1e-3,1e-4)
         thresholds = tuple(float(x) for x in thresholds)
@@ -285,7 +346,7 @@ class USCC:
         if self.schedule is not None and tuple(self.schedule) != thresholds:
             raise ValueError('A restart must use the saved threshold schedule')
         self.schedule = thresholds
-        for name, value in dict(gradient_tolerance=gradient_tolerance, energy_tolerance=energy_tolerance, maxiter=maxiter).items():
+        for name, value in dict(gradient_tolerance=gradient_tolerance, energy_tolerance=energy_tolerance, maxiter=maxiter, method=optimizer).items():
             if value is not None:
                 self.optimization_settings[name] = value
         def record(event):
@@ -341,7 +402,7 @@ class USCC:
                 return self.result()
 
     def result(self):
-        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, exhaustive=self.selector.exhaustive, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **self.resources(), **self.diagnostics(), history=list(self.history))
+        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, exhaustive=self.selector.exhaustive, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank, growth=self.selector.growth), **self.resources(), **self.diagnostics(), history=list(self.history))
 
     def _fingerprint(self):
         digest = sha256()
@@ -354,19 +415,25 @@ class USCC:
         filename = Path(filename)
         filename.parent.mkdir(parents=True, exist_ok=True)
         data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
-                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings)
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive, backend=self.backend, growth=self.selector.growth, sector_threads=self.sector_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
         temporary.replace(filename)
 
     @classmethod
-    def from_checkpoint(cls, filename, *, device=None):
+    def from_checkpoint(cls, filename, *, device=None, backend=None, sector_threads=None):
         data = json.loads(Path(filename).read_text())
         if data.get('version') != FORMAT_VERSION or data.get('convention') != CONVENTION:
             raise ValueError('Unsupported checkpoint schema or excitation convention')
         config = dict(data['config'])
+        config.setdefault('growth','recursive')  # Preserve legacy screening semantics.
+        config.setdefault('backend','pennylane')  # Legacy checkpoints retain their backend.
+        if backend is not None:
+            config['backend'] = backend
         if device is not None:
             config['device'] = device
+        if sector_threads is not None:
+            config['sector_threads'] = sector_threads
         model = cls(ActiveSpaceIntegrals(**data['integrals']), metadata=data['metadata'], **config)
         if model._fingerprint() != data['fingerprint']:
             raise ValueError('Checkpoint integral/orbital fingerprint mismatch')

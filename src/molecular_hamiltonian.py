@@ -14,7 +14,7 @@ from excitations import ExcitationTerm
 
 @dataclass(frozen=True)
 class ActiveSpaceIntegrals:
-    """Effective active Hamiltonian: h[p,q], g[p,q,r,s]=(p r|q s).
+    """Effective active Hamiltonian: h[p,q], g[p,q,r,s]=(p s|q r).
 
     spinorb_from_spatial supplies the tensor V in
     H = constant + h[p,q] a†p aq + (1/2) V[p,q,r,s] a†p a†q ar as.
