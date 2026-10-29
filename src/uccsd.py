@@ -14,8 +14,6 @@ from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
 import time
 import scipy
 
-import polarizationsolver
-
 def read_xyz(filename):
     elements = []
     coordinates = []
@@ -45,12 +43,6 @@ class uccsd(object):
         mf = pyscf.scf.RHF(m).run()
         self.m = m
         self.mf = mf
-        self.PE = None
-        if PE is not None:
-            system = polarizationsolver.readers.parser(polarizationsolver.readers.potreader(PE))
-            self.PE = system
-            self.mf = pyscf.solvent.PE(mf, PE)
-            self.mf.kernel()
         electrons = sum(m.nelec)
         orbitals = m.nao
         active_electrons = active_electrons if active_electrons else electrons
@@ -169,62 +161,8 @@ class uccsd(object):
     def ground_state(self, min_method='slsqp'):
         def energy_and_jac(params):
             params = qml.numpy.array(params)
-            energy_pe_en = 0.
-            E_pol_nuc = 0.
-            E_pol = 0.
-            if self.PE:
-                # get 1RDM and transform to AO
-                dm_mo = self.rdm1(params)
-                dm_mo = _make_rdm1_on_mo(dm_mo, self.inactive_electrons//2, self.qubits//2, self.m.nao)
-                dm_ao = self.mf.mo_coeff @ dm_mo @ self.mf.mo_coeff.T
-                # get electric fields from QM
-                # get induction contribution
-                # modify gas-phase Hamiltonian with v_es + v_ind 
-                v_PE = np.zeros_like(dm_ao)
-                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
-                # charges
-                if 1 in (self.PE.active_permanent_multipole_ranks) or (1 in self.PE.active_induced_multipole_ranks):
-                    field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
-                if 0 in self.PE.active_permanent_multipole_ranks:
-                    v_PE += -np.sum(pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e')*self.PE.permanent_moments[0], axis=2)
-                    energy_pe_en = -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 0, self.PE.permanent_moments[0], 0) * self.m.atom_charges()).sum()
-                # dipoles
-                # field_integrals could maybe be symmetrized in (0,1) dimension
-                if 1 in self.PE.active_permanent_multipole_ranks:
-                    v_dip = -np.sum(field_integrals*self.PE.permanent_moments[1], axis=(2,3))
-                    v_PE += v_dip + v_dip.T
-                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.permanent_moments[1], 0) * self.m.atom_charges()).sum()
-                # quadrupoles
-                if 2 in self.PE.active_permanent_multipole_ranks:
-                    # remove trace
-                    self.PE.permanent_moments[2] -= np.eye(3)[None, :, :] * np.einsum('qii->q', self.PE.permanent_moments[2])[:,None, None]/3
-                    v_quad = -0.5*np.sum((pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipip1') +  pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ipvip1')).transpose(1,2,3,0) * self.PE.permanent_moments[2].reshape(-1,9), axis=(2,3))
-                    v_PE += v_quad + v_quad.T
-                    energy_pe_en += -(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 2, self.PE.permanent_moments[2], 0) * self.m.atom_charges()).sum()
-
-                # solve for induced dipoles
-                # rhs field = F_nuc + F_el + F_multipole
-                # F_multipole is constructed internally by polarizationsolver
-                if 1 in self.PE.active_induced_multipole_ranks:
-                    F_nuc = polarizationsolver.fields.field(self.PE.coordinates - self.m.atom_coords()[:,None,:], 0, self.m.atom_charges(), 1)
-                    F_rhs = F_nuc + 2*np.einsum('mn,mnpx->px', dm_ao, field_integrals)
-                    self.PE.external_field = [[], F_rhs]
-                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12)
-                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    v_PE += v_ind + v_ind.T
-                    E_pol_nuc =  -0.5*(polarizationsolver.fields.field(self.m.atom_coords() - self.PE.coordinates[:,None,:], 1, self.PE.induced_moments[1], 0) * self.m.atom_charges()).sum()
-                    E_pol = self.PE.E_pol
-
-                H_PE, qubits = get_PE_hamiltonian(self, v_PE=v_PE)
-                self.H = self.H_gas + H_PE
-                self.H_PE_gs = H_PE
-    
             energy = self.circuit(self, params)
             grad = get_gradient(self.circuit)(self, params)
-            if self.PE:
-                energy += energy_pe_en 
-                if 1 in self.PE.active_induced_multipole_ranks:
-                    energy +=E_pol - np.dot((v_ind+v_ind.T).ravel(), dm_ao.ravel())
             print('energy = ', energy)
             return energy, grad
 
@@ -238,27 +176,6 @@ class uccsd(object):
             excita = self.excitations_triplet
         else:
             excita = self.excitations_singlet
-        if self.PE:
-            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
-                # get transition density (MO)
-                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
-                if self.qubits //2 < self.m.nao:
-                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
-                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
-                    transition_densities = full_transition_densities
-                # transform to AO
-                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
-                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
-                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
-                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
-                # get induced dipoles and potential for k'th transition density
-                induction_potentials = []
-                for k in range(v.shape[1]):
-                    self.PE.external_field = [[], F_rhs[k]]
-                    self.PE.induced_moments[1] *= 0.
-                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
-                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    induction_potentials.append(v_ind+v_ind.T)
 
         def grad(x):
             return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
@@ -277,10 +194,6 @@ class uccsd(object):
         hvp = np.zeros_like(v)
         for k in range(v.shape[1]):
             hvp[:, k] = 2.0*fd_scheme[scheme](grad, h, v[:, k])
-            if self.PE:
-                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
-                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
-                    hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
@@ -301,28 +214,6 @@ class uccsd(object):
         else:
             excita = self.excitations_singlet
 
-        if self.PE:
-            if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
-                # get transition density (MO)
-                transition_densities = self.transition_density(v, triplet=triplet) # todo skip triplet?
-                if self.qubits //2 < self.m.nao:
-                    full_transition_densities = np.zeros((v.shape[1], self.m.nao, self.m.nao))
-                    full_transition_densities[:, self.inactive_orbitals:self.inactive_orbitals+self.active_orbitals, self.inactive_orbitals:+self.inactive_orbitals+self.active_orbitals] = transition_densities
-                    transition_densities = full_transition_densities
-                # transform to AO
-                transition_densities = self.mf.mo_coeff @ transition_densities @ self.mf.mo_coeff.T
-                fakemol = pyscf.gto.fakemol_for_charges(self.PE.coordinates)
-                field_integrals = pyscf.df.incore.aux_e2(self.m, fakemol, 'int3c2e_ip1').transpose(1,2,3,0) 
-                F_rhs = 2*np.einsum('kmn,mnpx->kpx', transition_densities, field_integrals)
-                # get induced dipoles and potential for k'th transition density
-                induction_potentials = []
-                for k in range(v.shape[1]):
-                    self.PE.external_field = [[], F_rhs[k]]
-                    self.PE.induced_moments[1] *= 0.
-                    polarizationsolver.solvers.iterative_solver(self.PE, tol=1e-12, skip_permanent=True, scheme='GS')
-                    v_ind = -np.sum(field_integrals*self.PE.induced_moments[1], axis=(2,3))
-                    induction_potentials.append(v_ind+v_ind.T)
-
         for k in range(v.shape[1]):
             v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
             for i in range(v.shape[0]):
@@ -337,11 +228,6 @@ class uccsd(object):
                 mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
                 miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
-            # pe dynpol contribution
-            if self.PE:
-                if 1 in self.PE.active_induced_multipole_ranks and not self.PE.GSPOL:
-                    dynpol_contribution = -self.property_gradient(induction_potentials[k], approach='super')
-                    hvp[:, k] += dynpol_contribution
         if need_reshape:
             hvp = hvp.reshape(-1)
         return hvp
