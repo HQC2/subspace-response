@@ -16,7 +16,6 @@ from excitations import Excitation, singlet_excitations, singlet_excitations_for
 from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integrals
 from stateprep import stateprep
 from ucc_circuits import apply_ucc
-from operators import excitation_pauli_terms
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -130,8 +129,10 @@ class USCC:
             raise ValueError('sector_threads must be a positive integer or None')
         self.sector_threads = sector_threads
         self.integrals = integrals
-        self.H = integrals.hamiltonian()
-        self._integral_hamiltonian = self.H
+        # The sector path uses spatial integrals directly. Materialize its JW
+        # observable only when a caller actually requests H or a circuit.
+        self._H = None
+        self._integral_hamiltonian = None
         self.backend = backend
         self._simulator = None
         self.qubits = integrals.qubits
@@ -178,6 +179,17 @@ class USCC:
             return qml.state()
         self.circuit = expectation_circuit
         self.circuit_state = state_circuit
+
+    @property
+    def H(self):
+        if self._H is None:
+            self._H = self.integrals.hamiltonian()
+            self._integral_hamiltonian = self._H
+        return self._H
+
+    @H.setter
+    def H(self, operator):
+        self._H = operator
 
     @classmethod
     def from_molecule(cls, symbols, geometry, charge=0, basis='sto-3g', *, unit='bohr', active_electrons=None, active_orbitals=None, **kwargs):
@@ -240,17 +252,17 @@ class USCC:
 
     def expectation(self, operator=None, parameters=None, statevector=None):
         parameters = self.theta if parameters is None else parameters
-        operator = self.H if operator is None else operator
         if self.backend == 'sector':
             state = self._sector_state(parameters,statevector)
             if state is not None:
                 simulator = self._sector_simulator()
+                operator = self._H if operator is None else operator
                 def measure(op):
                     if op is self._integral_hamiltonian:
                         return np.vdot(state,simulator.apply_hamiltonian(state)).real
                     return simulator.expectation(state,op)
                 return [measure(op) for op in operator] if isinstance(operator,list) else measure(operator)
-        return self.circuit(parameters,operator,statevector)
+        return self.circuit(parameters,self.H if operator is None else operator,statevector)
 
     def state(self, parameters=None, statevector=None):
         parameters = self.theta if parameters is None else parameters
@@ -262,7 +274,7 @@ class USCC:
 
     def energy_and_gradient(self, parameters):
         if self.backend == 'sector':
-            hamiltonian = None if self.H is self._integral_hamiltonian else self.H
+            hamiltonian = None if self._H is self._integral_hamiltonian else self.H
             return self._sector_simulator().energy_and_gradient(parameters,self.excitations,self.trotter_steps,hamiltonian)
         parameters = qml.numpy.array(parameters, requires_grad=True)
         if not len(parameters):
@@ -281,13 +293,23 @@ class USCC:
         return dict(particle_number=float(number), spin_z=float(sz), spin_squared=float(s2))
 
     def resources(self):
-        terms = [item for e in self.excitations for t in e.terms for item in excitation_pauli_terms(t.holes, t.particles, self.qubits)]
-        return dict(parameters=len(self.theta), ranks={str(r):sum(e.rank == r for e in self.excitations) for r in range(1,self.selector.requested_max_rank+1)}, pauli_rotations=len(terms)*self.trotter_steps, estimated_parity_cnots=sum(2*max(sum(p != 'I' for p in word)-1,0) for _,word in terms)*self.trotter_steps)
+        # A rank-r pure excitation has 2**(2*r-1) JW Pauli words. Every word
+        # has X/Y at the endpoints and the same Z support between alternating
+        # sorted endpoint pairs. Count that support without expanding words.
+        rotations, cnots = 0, 0
+        for excitation in self.excitations:
+            for term in excitation.terms:
+                modes = sorted(term.holes + term.particles)
+                count = 1 << (2*term.rank-1)
+                support = sum(b-a+1 for a,b in zip(modes[::2],modes[1::2]))
+                rotations += count
+                cnots += count*2*(support-1)
+        return dict(parameters=len(self.theta), ranks={str(r):sum(e.rank == r for e in self.excitations) for r in range(1,self.selector.requested_max_rank+1)}, pauli_rotations=rotations*self.trotter_steps, estimated_parity_cnots=cnots*self.trotter_steps)
 
     def _append_blocks(self, proposals, max_operators=None):
         added = []
+        present = {e.id for e in self.excitations}
         for block, score, reason in proposals:
-            present = {e.id for e in self.excitations}
             generators = tuple(e for e in singlet_excitations_for_block(*block) if e.id not in present)
             if max_operators is not None and len(self.excitations)+len(generators) > max_operators:
                 self.needs_optimization = bool(added) or self.needs_optimization
@@ -296,6 +318,7 @@ class USCC:
             self.theta = np.pad(self.theta, (0,len(generators)))
             self.provenance[block_id(block)] = dict(score=float(score), source=reason)
             added.extend(e.id for e in generators)
+            present.update(e.id for e in generators)
         self.needs_optimization = bool(added) or self.needs_optimization
         return added, False
 

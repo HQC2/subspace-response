@@ -14,7 +14,7 @@ from excitations import ExcitationTerm, apply_fermion_word
 
 
 class SectorSimulator:
-    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None):
+    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None, use_numba=True):
         if sector_threads is not None and (type(sector_threads) is not int or sector_threads < 1):
             raise ValueError('sector_threads must be a positive integer or None')
         self.sector_threads = sector_threads
@@ -23,6 +23,12 @@ class SectorSimulator:
         self.n_orbitals = self.n_modes//2
         self.n_alpha = self.n_beta = integrals.electrons//2
         self.dimension = comb(self.n_orbitals, self.n_alpha)**2
+        self._forward = self._reverse = None
+        # Compiled loops are the default when the optional dependency exists.
+        # False retains the NumPy oracle without importing the compiler.
+        if use_numba:
+            from uscc_kernels import forward, reverse
+            self._forward, self._reverse = forward, reverse
         strings = cistring.make_strings(range(self.n_orbitals), self.n_alpha)
         determinants, phases = [], []
         # PySCF uses alpha-major, beta-minor CI coefficients with all alpha
@@ -41,6 +47,8 @@ class SectorSimulator:
                 determinants.append(index)
                 phases.append((-1)**inversions)
         self.indices = np.array(determinants, dtype=np.int64)
+        self._index_order = np.argsort(self.indices)
+        self._sorted_indices = self.indices[self._index_order]
         self.address = {int(index): i for i,index in enumerate(self.indices)}
         self.phases = np.array(phases, dtype=float)
         # Stored g[p,q,r,s] = (p s|q r), matching OpenFermion a†p a†q ar as.
@@ -58,11 +66,14 @@ class SectorSimulator:
         else:
             with lib.with_omp_threads(self.sector_threads):
                 self.effective_eri = direct_spin1.absorb_h1e(integrals.one_body, self.chemist_eri, self.n_orbitals, (self.n_alpha,self.n_beta), .5)
+            links = cistring.gen_linkstr_index_trilidx(range(self.n_orbitals),self.n_alpha)
+            self._link_index = (links,links)
         self.initial = np.zeros(self.dimension)
         hf_index = ((1 << integrals.electrons)-1) << (self.n_modes-integrals.electrons)
         self.initial[self.address[hf_index]] = 1.
         self._pairs = {}
         self._plan = ()
+        self._packed_plan = None
         self._excitations = None
         self._steps = None
         self._spin_matrix = None
@@ -75,7 +86,7 @@ class SectorSimulator:
         # PySCF's real-integral contraction also handles complex vectors via
         # separate real/imaginary contractions (never a dense sector matrix).
         def contract(part):
-            return np.asarray(direct_spin1.contract_2e(self.effective_eri, np.ascontiguousarray(part), self.n_orbitals, (self.n_alpha,self.n_beta))).ravel()
+            return np.asarray(direct_spin1.contract_2e(self.effective_eri, np.ascontiguousarray(part), self.n_orbitals, (self.n_alpha,self.n_beta), link_index=self._link_index)).ravel()
         # None honors PySCF's ambient OpenMP setting. Explicit counts are scoped
         # to these calls, including both components of a complex state.
         with lib.with_omp_threads(self.sector_threads):
@@ -88,15 +99,31 @@ class SectorSimulator:
         key = holes, particles
         if key not in self._pairs:
             term = ExcitationTerm(holes,particles)
-            source, target, signs = [], [], []
-            for col,index in enumerate(self.indices):
-                result = term.apply(int(index), self.n_modes)
-                if result is not None:
-                    destination = self.address.get(result[0])
-                    if destination is None:
-                        raise ValueError('Excitation leaves the fixed spin/electron sector')
-                    source.append(col); target.append(destination); signs.append(result[1])
-            self._pairs[key] = (np.array(source,dtype=int),np.array(target,dtype=int),np.array(signs))
+            if max(holes+particles) >= self.n_modes:
+                raise ValueError('Fermion mode outside the register')
+            hole_mask = sum(1 << (self.n_modes-h-1) for h in holes)
+            particle_mask = sum(1 << (self.n_modes-p-1) for p in particles)
+            flip_mask = hole_mask | particle_mask
+            source = np.flatnonzero((self.indices & flip_mask) == hole_mask)
+            destinations = self.indices[source] ^ flip_mask
+            positions = np.searchsorted(self._sorted_indices,destinations)
+            if np.any(positions == self.dimension) or np.any(self._sorted_indices[positions] != destinations):
+                raise ValueError('Excitation leaves the fixed spin/electron sector')
+            target = self._index_order[positions]
+            # Fermion signs are parity of a fixed mask of the initial index,
+            # plus the signs caused by earlier toggles in the operator word.
+            parity_mask, toggled, constant = 0, 0, 0
+            for mode in holes+tuple(reversed(particles)):
+                prefix = ((1 << self.n_modes)-1) ^ ((1 << (self.n_modes-mode))-1)
+                parity_mask ^= prefix
+                constant ^= (toggled & prefix).bit_count() & 1
+                toggled ^= 1 << (self.n_modes-mode-1)
+            parity = self.indices[source] & parity_mask
+            # XOR folding supports NumPy versions without bitwise_count.
+            for shift in (32,16,8,4,2,1):
+                parity ^= parity >> shift
+            signs = 1.-2*((parity ^ constant) & 1)
+            self._pairs[key] = (source,target,signs)
         return self._pairs[key]
 
     def plan(self, excitations, steps):
@@ -104,9 +131,30 @@ class SectorSimulator:
             if not isinstance(steps,int) or steps < 1:
                 raise ValueError('trotter_steps must be a positive integer')
             self._plan = tuple((i,term.coefficient/steps,*self.pairs(term.holes,term.particles)) for i,excitation in enumerate(excitations) for _ in range(steps) for term in excitation.terms)
+            self._packed_plan = None
             # Keep references so object IDs cannot be recycled under the cache.
             self._excitations, self._steps = tuple(excitations), steps
         return self._plan
+
+    def packed_plan(self):
+        if self._packed_plan is None:
+            parameter_ids, scales, starts, stops = [], [], [], []
+            sources, targets, signs, offsets = [], [], [], {}
+            offset = 0
+            for parameter,scale,source,target,sign in self._plan:
+                # Reuse pair storage across spin couplings and Trotter steps.
+                key = id(source)
+                if key not in offsets:
+                    offsets[key] = offset, offset+len(source)
+                    offset += len(source)
+                    sources.append(source); targets.append(target); signs.append(sign)
+                start,stop = offsets[key]
+                parameter_ids.append(parameter); scales.append(scale)
+                starts.append(start); stops.append(stop)
+            def concatenate(arrays,dtype):
+                return np.concatenate(arrays).astype(dtype,copy=False) if arrays else np.empty(0,dtype=dtype)
+            self._packed_plan = (np.array(parameter_ids,dtype=int),np.array(scales),np.array(starts,dtype=int),np.array(stops,dtype=int),concatenate(sources,int),concatenate(targets,int),concatenate(signs,float))
+        return self._packed_plan
 
     @staticmethod
     def rotate(state, source, target, cosine, signed_sine):
@@ -119,7 +167,11 @@ class SectorSimulator:
         if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
             raise ValueError('Expected one finite parameter per excitation')
         state = self.initial.copy() if initial is None else np.array(initial,dtype=np.result_type(initial,float),copy=True)
-        for i,scale,source,target,sign in self.plan(excitations,steps):
+        plan = self.plan(excitations,steps)
+        if self._forward is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')):
+            self._forward(parameters,state,*self.packed_plan())
+            return state
+        for i,scale,source,target,sign in plan:
             angle = parameters[i]*scale
             self.rotate(state,source,target,np.cos(angle),sign*np.sin(angle))
         return state
@@ -129,6 +181,9 @@ class SectorSimulator:
         costate = self.apply_hamiltonian(state) if hamiltonian is None else self.observable_matrix(hamiltonian) @ state
         energy = float(np.vdot(state,costate).real)
         gradient = np.zeros(len(parameters))
+        if self._reverse is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')) and costate.dtype in (np.dtype('float64'),np.dtype('complex128')):
+            self._reverse(np.asarray(parameters,dtype=float),state,costate,gradient,*self.packed_plan())
+            return energy,gradient
         # Reverse both the state and costate: no tape or per-gate state storage.
         # dU/dtheta = scale*(tau-tau†)*U, evaluated before undoing each gate.
         for i,scale,source,target,sign in reversed(self.plan(excitations,steps)):
