@@ -6,13 +6,14 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc, UCCSD_stateprep
+from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 import pyscf
 import excitations
 import copy
 from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
 import time
 import scipy
+from stateprep import stateprep
 
 def read_xyz(filename):
     elements = []
@@ -59,20 +60,7 @@ class uccsd(object):
         dev = qml.device("lightning.qubit", wires=qubits)
 
         @qml.qnode(dev, diff_method="adjoint")
-        def circuit(self, params_ground_state):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_exc(self, params_ground_state, params_excitation, triplet=False):
-            if triplet:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(self.H)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operator(self, params_ground_state, operator):
+        def circuit(self, params_ground_state, operator):
             UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
             if isinstance(operator, list):
                 return [qml.expval(op) for op in operator]
@@ -80,16 +68,31 @@ class uccsd(object):
                 return qml.expval(operator)
 
         @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operators(self, params_ground_state, operators):
-            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-            return [qml.expval(operator) for operator in operators]
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
+        def circuit_exc(self, params_ground_state, params_excitation, operator, triplet=False):
             if triplet:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
             else:
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
+        @qml.qnode(dev, diff_method="adjoint")
+        def circuit_iH_exc(self, params_ground_state, params_excitation, operator, triplet=False):
+            if triplet:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
+            else:
+                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            else:
+                return qml.expval(operator)
+
+        @qml.qnode(dev, diff_method="best")
+        def circuit_stateprep(self, params_ground_state, statevector, operator):
+            stateprep(statevector)
+            UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state*0)
             if isinstance(operator, list):
                 return [qml.expval(op) for op in operator]
             else:
@@ -103,22 +106,6 @@ class uccsd(object):
                 UCCSD_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
             return qml.state()
 
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_iH_exc_operator(self, params_ground_state, params_excitation, operator, triplet=False):
-            if triplet:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_triplet=self.excitations_triplet)
-            else:
-                UCCSD_iH_exc(params_ground_state, params_excitation, range(self.qubits), self.excitations_ground_state, self.hf_state, excitations_singlet=self.excitations_singlet)
-            return qml.expval(operator)
-
-        @qml.qnode(dev, diff_method="adjoint")
-        def circuit_operator_stateprep(self, params_ground_state, statevector, operator, triplet=False):
-            UCCSD_stateprep(params_ground_state, statevector, range(self.qubits), self.excitations_ground_state)
-            if isinstance(operator, list):
-                return [qml.expval(op) for op in operator]
-            else:
-                return qml.expval(operator)
-
         self.H = H
         self.H_gas = H
         self.qubits = qubits
@@ -130,12 +117,10 @@ class uccsd(object):
         self.theta = qml.numpy.zeros(len(self.excitations_ground_state))
         self.device = dev
         self.circuit = circuit
-        self.circuit_operator = circuit_operator
         self.circuit_exc = circuit_exc
-        self.circuit_exc_operator = circuit_exc_operator
-        self.circuit_iH_exc_operator = circuit_iH_exc_operator
+        self.circuit_iH_exc = circuit_iH_exc
         self.circuit_state = circuit_state
-        self.circuit_operator_stateprep = circuit_operator_stateprep
+        self.circuit_stateprep = circuit_stateprep
 
     def rdm1(self, params_ground_state, params_excitation=None, triplet=False):
         rdm1_active = np.zeros((self.qubits//2, self.qubits//2))
@@ -147,9 +132,9 @@ class uccsd(object):
                 operator = qml.jordan_wigner(fermi)
                 operators.append(operator)
         if params_excitation is not None:
-            expvals = self.circuit_exc_operator(self, params_ground_state, params_excitation, operators, triplet=triplet)
+            expvals = self.circuit_exc(self, params_ground_state, params_excitation, operators, triplet=triplet)
         else:
-            expvals = self.circuit_operator(self, params_ground_state, operators)
+            expvals = self.circuit(self, params_ground_state, operators)
         k = 0
         for i in range(self.qubits//2):
             for j in range(i, self.qubits//2):
@@ -161,8 +146,8 @@ class uccsd(object):
     def ground_state(self, min_method='slsqp'):
         def energy_and_jac(params):
             params = qml.numpy.array(params)
-            energy = self.circuit(self, params)
-            grad = get_gradient(self.circuit)(self, params)
+            energy = self.circuit(self, params, self.H)
+            grad = get_gradient(self.circuit, 1)(self, params, self.H)
             print('energy = ', energy)
             return energy, grad
 
@@ -178,7 +163,7 @@ class uccsd(object):
             excita = self.excitations_singlet
 
         def grad(x):
-            return get_gradient(self.circuit_exc, argnum=2)(self, self.theta, x, triplet=triplet)
+            return get_gradient(self.circuit_exc, 2)(self, self.theta, x, self.H, triplet=triplet)
         fd_scheme = {
             'forward': lambda g, h, v: g(h*v)/h,
             'central': lambda g, h, v: (g(h*v) - g(-h*v))/(2*h),
@@ -208,25 +193,24 @@ class uccsd(object):
             v = v.reshape(-1, 1)
             need_reshape = True
         hvp = np.zeros_like(v)
-        e_gr = self.circuit(self, self.theta)
+        e_gr = self.circuit(self, self.theta, self.H)
         if triplet:
             excita = self.excitations_triplet
         else:
             excita = self.excitations_singlet
 
         for k in range(v.shape[1]):
-            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            v_statevector = scipy.sparse.csc_array((2**self.qubits, 1))
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
-            # todo: support sparse vector in stateprep
-            mvv = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=self.H)
+            mvv = self.circuit_stateprep(self, self.theta, v_statevector, operator=self.H)
             for i in range(v.shape[0]):
                 i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                 v_plus_i_statevector = (v_statevector + i_statevector) / np.sqrt(2)
-                norm = np.linalg.norm(v_plus_i_statevector.toarray().ravel())
+                norm = scipy.sparse.linalg.norm(v_plus_i_statevector)
                 v_plus_i_statevector /= norm
-                mii = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=self.H)
-                miv = self.circuit_operator_stateprep(self, self.theta, v_plus_i_statevector.toarray().ravel(), operator=self.H) * norm**2
+                mii = self.circuit_stateprep(self, self.theta, i_statevector, operator=self.H)
+                miv = self.circuit_stateprep(self, self.theta, v_plus_i_statevector, operator=self.H) * norm**2
                 hvp[i, k] = miv - 0.5*mii - 0.5*mvv - v[i,k]*e_gr
         if need_reshape:
             hvp = hvp.reshape(-1)
@@ -249,15 +233,15 @@ class uccsd(object):
                 fermi += qml.FermiC(2*i+1) * qml.FermiA(2*j+1)
                 operator = qml.jordan_wigner(fermi)
                 operators.append(operator)
-        D0_expvals = self.circuit_operator(self, self.theta, operators)
+        D0_expvals = self.circuit(self, self.theta, operators)
         hf_statevector = excitations.occupation_to_statevector(self.hf_state)
         for k in range(v.shape[1]):
-            v_statevector = scipy.sparse.lil_matrix((2**self.qubits, 1))
+            v_statevector = scipy.sparse.csc_array((2**self.qubits, 1))
             for i in range(v.shape[0]):
                 v_statevector += v[i,k] * excitations.excitation_to_statevector(self.hf_state, *excita[i])
             plus_statevector = (hf_statevector + v_statevector)/np.sqrt(2)
-            Dvv_expvals = self.circuit_operator_stateprep(self, self.theta, v_statevector.toarray().ravel(), operator=operators)
-            D0v_expvals = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operators)
+            Dvv_expvals = self.circuit_stateprep(self, self.theta, v_statevector, operator=operators)
+            D0v_expvals = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operators)
             unpack_idx = 0
             for i in range(self.qubits//2):
                 for j in range(self.qubits//2):
@@ -316,7 +300,7 @@ class uccsd(object):
                 num_inactive = self.inactive_electrons//2
                 for i in range(num_inactive):
                     term += 2*component[i, i]
-            expectation_values.append(self.circuit_operator(self, self.theta, operator) + term)
+            expectation_values.append(self.circuit(self, self.theta, operator) + term)
         return np.array(expectation_values).reshape(out_shape)
 
     def property_gradient(self, integral, approach='derivative', triplet=False):
@@ -353,10 +337,10 @@ class uccsd(object):
             operator = qml.jordan_wigner(operator)
 
             if approach == 'derivative':
-                operator_gradient = get_gradient(self.circuit_exc_operator, argnum=2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
+                operator_gradient = get_gradient(self.circuit_exc, 2)(self, self.theta, parameter_excitation, operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'iH-derivative':
-                operator_gradient = get_gradient(self.circuit_iH_exc_operator, argnum=2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
+                operator_gradient = get_gradient(self.circuit_iH_exc, 2)(self, self.theta, parameter_excitation, 1j*operator, triplet=triplet)
                 operator_gradients.append(operator_gradient)
             elif approach == 'statevector':
                 operator_matrix = operator.matrix(wire_order=range(self.qubits))
@@ -380,13 +364,13 @@ class uccsd(object):
                 else:
                     excita = self.excitations_singlet
                 hf_statevector = excitations.occupation_to_statevector(self.hf_state)
-                hf_expval = self.circuit_operator(self, self.theta, operator)
+                hf_expval = self.circuit(self, self.theta, operator)
                 operator_gradient = np.zeros_like(parameter_excitation)
                 for i in range(len(parameter_excitation)):
                     i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                     plus_statevector = (hf_statevector + i_statevector)/np.sqrt(2)
-                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
-                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    i_expval = self.circuit_stateprep(self, self.theta, i_statevector, operator=operator)
+                    plus_expval = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operator)
                     operator_gradient[i] = (plus_expval - 0.5 * (i_expval + hf_expval)).real
                 # sign?
                 operator_gradients.append(-operator_gradient)
@@ -397,13 +381,13 @@ class uccsd(object):
                 else:
                     excita = self.excitations_singlet
                 hf_statevector = excitations.occupation_to_statevector(self.hf_state)
-                hf_expval = self.circuit_operator(self, self.theta, operator)
+                hf_expval = self.circuit(self, self.theta, operator)
                 operator_gradient = np.zeros_like(parameter_excitation)
                 for i in range(len(parameter_excitation)):
                     i_statevector = excitations.excitation_to_statevector(self.hf_state, *excita[i])
                     plus_statevector = (hf_statevector + 1j*i_statevector)/np.sqrt(2)
-                    i_expval = self.circuit_operator_stateprep(self, self.theta, i_statevector.toarray().ravel(), operator=operator)
-                    plus_expval = self.circuit_operator_stateprep(self, self.theta, plus_statevector.toarray().ravel(), operator=operator)
+                    i_expval = self.circuit_stateprep(self, self.theta, i_statevector, operator=operator)
+                    plus_expval = self.circuit_stateprep(self, self.theta, plus_statevector, operator=operator)
                     operator_gradient[i] = plus_expval - 0.5 * (i_expval + hf_expval)
                 # sign might need extra fixing here
                 operator_gradients.append(-operator_gradient)

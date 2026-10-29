@@ -5,7 +5,6 @@ import pennylane as qml
 import numpy as np
 from pennylane._grad import grad as get_gradient
 from scipy.optimize import minimize
-from uccsd import UCCSD
 import solvers
 import excitations
 
@@ -52,13 +51,7 @@ class adaptwfn(uccsd.uccsd):
             self.excitations_ground_state = self.excitations_ground_state + pool
             params = qml.numpy.array(list(self.theta) + [0.]*len(pool))
 
-            @qml.qnode(self.device, diff_method="adjoint")
-            def circuit(self, params_ground_state):
-                UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-                return qml.expval(self.H)
-            self.circuit = circuit
-
-            gradient = get_gradient(self.circuit, argnum=1)(self, params)
+            gradient = get_gradient(self.circuit, 1)(self, params, self.H)
             grad_norm = np.linalg.norm(gradient)
             gradient_pool = gradient[len(previous_excitations_ground_state):]
             add_idx = np.argmax(np.abs(gradient_pool))
@@ -68,22 +61,16 @@ class adaptwfn(uccsd.uccsd):
             self.theta = qml.numpy.array(list(self.theta) + [0.])
             self.num_params = len(self.theta)
 
-            @qml.qnode(self.device, diff_method="adjoint")
-            def circuit(self, params_ground_state):
-                UCCSD(params_ground_state, range(self.qubits), self.excitations_ground_state, self.hf_state)
-                return qml.expval(self.H)
-            self.circuit = circuit
-
             # 4) optimize parameters
             def energy(params):
                 params = qml.numpy.array(params)
-                energy = self.circuit(self, params)
+                energy = self.circuit(self, params, self.H)
                 print('energy = ', energy, flush=True)
                 return energy
 
             def jac(params):
                 params = qml.numpy.array(params)
-                grad = get_gradient(self.circuit)(self, params)
+                grad = get_gradient(self.circuit, 1)(self, params, self.H)
                 return grad
             
             res = minimize(energy, jac=jac, x0=self.theta, method='slsqp', tol=1e-12)
