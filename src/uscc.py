@@ -1,0 +1,385 @@
+"""Ground-state unitary selective coupled cluster with scalar Trotter blocks.
+
+The selector is a documented spin-adapted extension of USCC's amplitude times
+integral heuristic. It does not measure gradients of an external operator pool.
+"""
+from hashlib import sha256
+from pathlib import Path
+from types import SimpleNamespace
+import json
+import numpy as np
+import pennylane as qml
+import pyscf
+from scipy.optimize import minimize
+
+from excitations import Excitation, singlet_excitations, singlet_excitations_for_block
+from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integrals
+from stateprep import stateprep
+from ucc_circuits import apply_ucc
+from operators import excitation_pauli_terms
+
+FORMAT_VERSION = 1
+CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
+
+
+def block_key(term):
+    return tuple(sorted(h//2 for h in term.holes)), tuple(sorted(p//2 for p in term.particles))
+
+
+def block_id(block):
+    return ','.join(map(str, block[0])) + '->' + ','.join(map(str, block[1]))
+
+
+class USCCSelector:
+    """Max-product screening followed by promotion of whole scalar blocks.
+
+    The one-body coefficient is h[a,i]. The two-body coefficient is the
+    antisymmetrized coefficient of canonical tau in (1/2) V a†a†aa. Scalar
+    amplitudes are expanded into monomial coefficients sum_mu theta_mu*c_mu,m.
+    This is a first-order proposal surrogate, not a CI coefficient estimator.
+    """
+    def __init__(self, integrals, max_rank=4, orbital_irreps=None, exhaustive=False):
+        if not isinstance(max_rank, int) or max_rank < 1:
+            raise ValueError('max_rank must be a positive integer')
+        if orbital_irreps is not None and (len(orbital_irreps) != integrals.qubits//2 or any(not isinstance(i, (int, np.integer)) or i < 0 for i in orbital_irreps)):
+            raise ValueError('Expected nonnegative Abelian XOR irrep IDs')
+        self.integrals = integrals
+        self.max_rank = min(max_rank, integrals.electrons, integrals.qubits-integrals.electrons)
+        self.requested_max_rank = max_rank
+        self.orbital_irreps = None if orbital_irreps is None else tuple(map(int, orbital_irreps))
+        self.exhaustive = bool(exhaustive)
+        self.channels = integrals.excitation_channels()
+
+    def allowed(self, block):
+        if len(block[0]) > self.max_rank:
+            return False
+        if self.orbital_irreps is not None:
+            irrep = 0
+            for orbital in block[0]+block[1]:
+                irrep ^= self.orbital_irreps[orbital]
+            if irrep:
+                return False
+        return True
+
+    def base_scores(self):
+        scores = {}
+        for channel in self.channels:
+            block = block_key(channel)
+            if self.allowed(block):
+                score = abs(channel.coefficient)
+                if score >= scores.get(block, (-1., ''))[0]:
+                    scores[block] = (score, f'h{channel.rank}')
+        return scores
+
+    def scores(self, excitations, parameters):
+        scores = self.base_scores()
+        amplitudes = {}
+        for excitation, theta in zip(excitations, parameters):
+            for term in excitation.terms:
+                key = term.holes, term.particles
+                amplitudes[key] = amplitudes.get(key, 0.) + float(theta)*term.coefficient
+        nonzero_channels = [c for c in self.channels if abs(c.coefficient) > 0]
+        for (holes, particles), amplitude in sorted(amplitudes.items()):
+            if abs(amplitude) == 0:
+                continue
+            for channel in nonzero_channels:
+                rank = len(holes)+channel.rank
+                if rank > self.max_rank or set(holes) & set(channel.holes) or set(particles) & set(channel.particles):
+                    continue
+                hs = tuple(sorted(holes+channel.holes))
+                ps = tuple(sorted(particles+channel.particles))
+                block = tuple(sorted(h//2 for h in hs)), tuple(sorted(p//2 for p in ps))
+                if not self.allowed(block):
+                    continue
+                score = abs(amplitude*channel.coefficient)
+                if score > scores.get(block, (-1., ''))[0]:
+                    scores[block] = (score, f't{len(holes)}*h{channel.rank}')
+        if self.exhaustive:
+            for excitation in singlet_excitations(self.integrals.electrons, self.integrals.qubits, range(1,self.max_rank+1), self.orbital_irreps):
+                scores.setdefault(excitation.block, (0., 'exhaustive_audit'))
+        return scores
+
+    def select(self, excitations, parameters, epsilon):
+        if not np.isfinite(epsilon) or epsilon < 0:
+            raise ValueError('Selection threshold must be finite and nonnegative')
+        present = {e.id for e in excitations}
+        selected = {e.block for e in excitations if all(g.id in present for g in singlet_excitations_for_block(*e.block))}
+        return [(block, score, reason) for block, (score, reason) in sorted(self.scores(excitations, parameters).items(), key=lambda item: (-item[1][0], item[0])) if block not in selected and score >= epsilon]
+
+
+class USCC:
+    """Reusable rank-independent ground-state wave function and USCC driver.
+
+    Parameters are physical generator coefficients, not legacy gate angles.
+    ``apply_ucc`` and the serialized ordered generators remain usable by later
+    response code, independently of this ground-state selection loop.
+    """
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False):
+        if seed not in ('sd', 'screened'):
+            raise ValueError('seed must be sd or screened')
+        if not isinstance(trotter_steps, int) or trotter_steps < 1:
+            raise ValueError('trotter_steps must be a positive integer')
+        self.integrals = integrals
+        self.H = integrals.hamiltonian()
+        self.qubits = integrals.qubits
+        self.hf_state = np.array([1]*integrals.electrons+[0]*(self.qubits-integrals.electrons), dtype=int)
+        self.metadata = {} if metadata is None else metadata
+        self.selector = USCCSelector(integrals, max_rank, orbital_irreps, exhaustive)
+        self.seed = seed
+        self.trotter_steps = trotter_steps
+        self.device_name = device
+        self.device = qml.device(device, wires=self.qubits)
+        self.excitations = []
+        self.theta = np.zeros(0)
+        self.history = []
+        self.provenance = {}
+        self.schedule = None
+        self.threshold_index = 0
+        self.initialized = False
+        self.needs_optimization = False
+        self.stop_reason = 'not_started'
+        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300)
+
+        @qml.qnode(self.device, diff_method='adjoint')
+        def expectation_circuit(parameters, operator, vector=None):
+            if vector is None:
+                qml.BasisState(self.hf_state, wires=range(self.qubits))
+            else:
+                if vector.shape not in ((2**self.qubits,1), (1,2**self.qubits)):
+                    raise ValueError('Prepared state dimension does not match the active register')
+                stateprep(vector)
+            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            if isinstance(operator, list):
+                return [qml.expval(op) for op in operator]
+            return qml.expval(operator)
+
+        @qml.qnode(self.device, diff_method=None)
+        def state_circuit(parameters, vector=None):
+            if vector is None:
+                qml.BasisState(self.hf_state, wires=range(self.qubits))
+            else:
+                if vector.shape not in ((2**self.qubits,1), (1,2**self.qubits)):
+                    raise ValueError('Prepared state dimension does not match the active register')
+                stateprep(vector)
+            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            return qml.state()
+        self.circuit = expectation_circuit
+        self.circuit_state = state_circuit
+
+    @classmethod
+    def from_molecule(cls, symbols, geometry, charge=0, basis='sto-3g', *, unit='bohr', active_electrons=None, active_orbitals=None, **kwargs):
+        geometry = np.asarray(geometry, dtype=float)
+        if geometry.shape != (len(symbols),3) or not np.all(np.isfinite(geometry)):
+            raise ValueError('Expected one finite xyz coordinate per atom')
+        if unit.lower() not in ('bohr', 'angstrom'):
+            raise ValueError('unit must be bohr or angstrom')
+        m = pyscf.M(atom=[(s, tuple(x)) for s,x in zip(symbols,geometry)], charge=charge, basis=basis, unit=unit, spin=0, verbose=0)
+        if m.nelectron % 2:
+            raise ValueError('The initial implementation requires a closed-shell reference')
+        mf = pyscf.scf.RHF(m).run()
+        if not mf.converged:
+            raise RuntimeError('RHF reference did not converge')
+        ne = m.nelectron if active_electrons is None else active_electrons
+        no = m.nao if active_orbitals is None else active_orbitals
+        if not isinstance(ne, int) or not isinstance(no, int) or ne < 0 or ne % 2 or ne > m.nelectron or no < ne//2 or no+(m.nelectron-ne)//2 > m.nao:
+            raise ValueError('Invalid closed-shell frozen-core active space')
+        setup = SimpleNamespace(m=m, mf=mf, inactive_orbitals=(m.nelectron-ne)//2, active_orbitals=no, active_electrons=ne)
+        integrals = get_active_space_integrals(setup)
+        metadata = dict(symbols=list(symbols), geometry=geometry.tolist(), unit=unit.lower(), charge=charge, basis=basis, active_electrons=ne, active_orbitals=no, inactive_orbitals=setup.inactive_orbitals, mo_coeff=mf.mo_coeff.tolist())
+        result = cls(integrals, metadata=metadata, **kwargs)
+        result.m, result.mf = m, mf
+        return result
+
+    def set_excitations(self, excitations, parameters=None):
+        """Install an ordered fixed ansatz; useful independently of selection."""
+        excitations = list(excitations)
+        if len({e.id for e in excitations}) != len(excitations):
+            raise ValueError('Duplicate excitation IDs')
+        for e in excitations:
+            if any(h >= self.integrals.electrons for t in e.terms for h in t.holes) or any(p < self.integrals.electrons or p >= self.qubits for t in e.terms for p in t.particles):
+                raise ValueError('Excitation is incompatible with the active reference')
+            if not self.selector.allowed(e.block):
+                raise ValueError('Excitation violates the requested rank or symmetry')
+        parameters = np.zeros(len(excitations)) if parameters is None else np.asarray(parameters, dtype=float)
+        if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
+            raise ValueError('Expected one finite parameter per excitation')
+        self.excitations = excitations
+        self.theta = parameters.copy()
+        self.initialized = True
+        self.needs_optimization = True
+        self.threshold_index = 0
+        self.history = []
+        self.provenance = {}
+        self.stop_reason = 'not_started'
+
+    def expectation(self, operator=None, parameters=None, statevector=None):
+        return self.circuit(self.theta if parameters is None else parameters, self.H if operator is None else operator, statevector)
+
+    def state(self, parameters=None, statevector=None):
+        return self.circuit_state(self.theta if parameters is None else parameters, statevector)
+
+    def energy_and_gradient(self, parameters):
+        parameters = qml.numpy.array(parameters, requires_grad=True)
+        if not len(parameters):
+            return float(self.expectation(parameters=parameters)), np.zeros(0)
+        gradient_function = qml.grad(self.circuit, 0)
+        gradient = gradient_function(parameters, self.H)
+        gradient = np.asarray(gradient, dtype=float)
+        energy = float(gradient_function.forward)
+        print(energy, np.linalg.norm(gradient))
+        return energy, gradient
+
+    def diagnostics(self):
+        operators = [qml.qchem.particle_number(self.qubits), qml.qchem.spinz(self.qubits), qml.qchem.spin2(self.integrals.electrons, self.qubits)]
+        number, sz, s2 = self.expectation(operators)
+        return dict(particle_number=float(number), spin_z=float(sz), spin_squared=float(s2))
+
+    def resources(self):
+        terms = [item for e in self.excitations for t in e.terms for item in excitation_pauli_terms(t.holes, t.particles, self.qubits)]
+        return dict(parameters=len(self.theta), ranks={str(r):sum(e.rank == r for e in self.excitations) for r in range(1,self.selector.requested_max_rank+1)}, pauli_rotations=len(terms)*self.trotter_steps, estimated_parity_cnots=sum(2*max(sum(p != 'I' for p in word)-1,0) for _,word in terms)*self.trotter_steps)
+
+    def _append_blocks(self, proposals, max_operators=None):
+        added = []
+        for block, score, reason in proposals:
+            present = {e.id for e in self.excitations}
+            generators = tuple(e for e in singlet_excitations_for_block(*block) if e.id not in present)
+            if max_operators is not None and len(self.excitations)+len(generators) > max_operators:
+                self.needs_optimization = bool(added) or self.needs_optimization
+                return added, True
+            self.excitations.extend(generators)
+            self.theta = np.pad(self.theta, (0,len(generators)))
+            self.provenance[block_id(block)] = dict(score=float(score), source=reason)
+            added.extend(e.id for e in generators)
+        self.needs_optimization = bool(added) or self.needs_optimization
+        return added, False
+
+    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300):
+        if gradient_tolerance <= 0 or energy_tolerance <= 0 or maxiter < 1:
+            raise ValueError('Optimization tolerances and iteration count must be positive')
+        initial = self.theta.copy()
+        old_energy, old_gradient = self.energy_and_gradient(initial)
+        if not len(initial) or np.linalg.norm(old_gradient) <= gradient_tolerance:
+            result = dict(success=True, message='Initial point converged', iterations=0)
+            energy, gradient = old_energy, old_gradient
+        else:
+            res = minimize(self.energy_and_gradient, initial, method='slsqp', jac=True, options=dict(gtol=gradient_tolerance, norm=2, maxiter=maxiter))
+            energy, gradient = self.energy_and_gradient(res.x) if np.all(np.isfinite(res.x)) else (np.inf, old_gradient)
+            accepted = bool(np.isfinite(energy) and np.all(np.isfinite(gradient)) and energy <= old_energy+energy_tolerance and (res.success or np.linalg.norm(gradient) <= gradient_tolerance))
+            if accepted:
+                self.theta = np.asarray(res.x, dtype=float)
+            else:
+                energy, gradient = old_energy, old_gradient
+            result = dict(success=accepted, message=str(res.message), iterations=int(res.nit))
+        result.update(energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
+        self.needs_optimization = not result['success']
+        return result
+
+    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, energy_tolerance=None, maxiter=None, callback=None):
+        if thresholds is None:
+            thresholds = self.schedule if self.schedule is not None else (1e-2,1e-3,1e-4)
+        thresholds = tuple(float(x) for x in thresholds)
+        if not thresholds or any(not np.isfinite(x) or x < 0 for x in thresholds) or any(a <= b for a,b in zip(thresholds,thresholds[1:])):
+            raise ValueError('Thresholds must be finite, nonnegative, and strictly decreasing')
+        if max_cycles < 1 or (max_operators is not None and max_operators < 0):
+            raise ValueError('Invalid resource limit')
+        if self.schedule is not None and tuple(self.schedule) != thresholds:
+            raise ValueError('A restart must use the saved threshold schedule')
+        self.schedule = thresholds
+        for name, value in dict(gradient_tolerance=gradient_tolerance, energy_tolerance=energy_tolerance, maxiter=maxiter).items():
+            if value is not None:
+                self.optimization_settings[name] = value
+        def record(event):
+            self.history.append(event)
+            if callback is not None:
+                callback(event)
+            if checkpoint is not None:
+                self.save_checkpoint(checkpoint)
+        if not self.initialized:
+            if self.seed == 'sd':
+                pool = singlet_excitations(self.integrals.electrons, self.qubits, range(1,min(2,self.selector.max_rank)+1), self.selector.orbital_irreps)
+                blocks = sorted({e.block for e in pool})
+                proposals = [(b,0.,'full_sd_seed') for b in blocks]
+            else:
+                proposals = [(b,s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
+            added, limited = self._append_blocks(proposals, max_operators)
+            self.initialized = not limited
+            self.needs_optimization = True
+            if limited:
+                self.stop_reason = 'operator_limit'
+                record(dict(event='seed_limited', added=added))
+                return self.result()
+        cycles = 0
+        while True:
+            if self.needs_optimization:
+                optimization = self.optimize(**self.optimization_settings)
+                self.stop_reason = 'running' if optimization['success'] else 'optimizer_failure'
+                record(dict(event='optimization', threshold_index=self.threshold_index, **optimization))
+                if not optimization['success']:
+                    return self.result()
+            if self.threshold_index >= len(thresholds):
+                self.stop_reason = 'schedule_exhausted'
+                record(dict(event='finished', reason=self.stop_reason))
+                return self.result()
+            if cycles >= max_cycles:
+                self.stop_reason = 'cycle_limit'
+                record(dict(event='finished', reason=self.stop_reason))
+                return self.result()
+            epsilon = thresholds[self.threshold_index]
+            proposals = self.selector.select(self.excitations, self.theta, epsilon)
+            if not proposals:
+                self.threshold_index += 1
+                record(dict(event='threshold_closed', epsilon=epsilon))
+                continue
+            added, limited = self._append_blocks(proposals, max_operators)
+            cycles += 1
+            if added:
+                self.stop_reason = 'running'
+                record(dict(event='growth', epsilon=epsilon, added=added, **self.resources()))
+            if limited:
+                self.stop_reason = 'operator_limit'
+                record(dict(event='finished', reason=self.stop_reason))
+                return self.result()
+
+    def result(self):
+        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, exhaustive=self.selector.exhaustive, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **self.resources(), **self.diagnostics(), history=list(self.history))
+
+    def _fingerprint(self):
+        digest = sha256()
+        for array in (self.integrals.one_body, self.integrals.two_body):
+            digest.update(np.asarray(array, dtype='<f8').tobytes())
+        digest.update(json.dumps(dict(constant=self.integrals.constant, electrons=self.integrals.electrons, metadata=self.metadata), sort_keys=True).encode())
+        return digest.hexdigest()
+
+    def save_checkpoint(self, filename):
+        filename = Path(filename)
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings)
+        temporary = filename.with_name(filename.name+'.tmp')
+        temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
+        temporary.replace(filename)
+
+    @classmethod
+    def from_checkpoint(cls, filename, *, device=None):
+        data = json.loads(Path(filename).read_text())
+        if data.get('version') != FORMAT_VERSION or data.get('convention') != CONVENTION:
+            raise ValueError('Unsupported checkpoint schema or excitation convention')
+        config = dict(data['config'])
+        if device is not None:
+            config['device'] = device
+        model = cls(ActiveSpaceIntegrals(**data['integrals']), metadata=data['metadata'], **config)
+        if model._fingerprint() != data['fingerprint']:
+            raise ValueError('Checkpoint integral/orbital fingerprint mismatch')
+        excitations = [Excitation.from_dict(e) for e in data['excitations']]
+        if [e.id for e in excitations] != data['ids']:
+            raise ValueError('Checkpoint excitation identity mismatch')
+        # Reconstruct the canonical scalar groups, rejecting edited definitions.
+        for excitation in excitations:
+            if excitation not in singlet_excitations_for_block(*excitation.block):
+                raise ValueError('Checkpoint contains a noncanonical scalar excitation')
+        model.set_excitations(excitations, data['parameters'])
+        for name in ('history','provenance','schedule','threshold_index','initialized','needs_optimization','stop_reason','optimization_settings'):
+            setattr(model, name, data[name])
+        if not isinstance(model.threshold_index, int) or model.threshold_index < 0 or (model.schedule is not None and model.threshold_index > len(model.schedule)):
+            raise ValueError('Invalid checkpoint schedule position')
+        return model
