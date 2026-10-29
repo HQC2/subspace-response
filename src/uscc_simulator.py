@@ -74,6 +74,7 @@ class SectorSimulator:
         self._pairs = {}
         self._plan = ()
         self._packed_plan = None
+        self._adjoint_plan = None
         self._excitations = None
         self._steps = None
         self._spin_matrix = None
@@ -132,6 +133,7 @@ class SectorSimulator:
                 raise ValueError('trotter_steps must be a positive integer')
             self._plan = tuple((i,term.coefficient/steps,*self.pairs(term.holes,term.particles)) for i,excitation in enumerate(excitations) for _ in range(steps) for term in excitation.terms)
             self._packed_plan = None
+            self._adjoint_plan = None
             # Keep references so object IDs cannot be recycled under the cache.
             self._excitations, self._steps = tuple(excitations), steps
         return self._plan
@@ -162,19 +164,34 @@ class SectorSimulator:
         state[source] = cosine*left-signed_sine*right
         state[target] = signed_sine*left+cosine*right
 
-    def state(self, parameters, excitations, steps=1, initial=None):
+    def apply_unitary(self, vector, parameters, excitations, steps=1, *, adjoint=False):
+        """Linear U or U† action on an arbitrary, unnormalized sector vector."""
         parameters = np.asarray(parameters,dtype=float)
         if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
             raise ValueError('Expected one finite parameter per excitation')
-        state = self.initial.copy() if initial is None else np.array(initial,dtype=np.result_type(initial,float),copy=True)
+        vector = np.asarray(vector)
+        if vector.shape != (self.dimension,) or not np.all(np.isfinite(vector)):
+            raise ValueError('Expected a finite vector matching the determinant sector')
+        state = np.array(vector,dtype=np.result_type(vector,float),copy=True)
         plan = self.plan(excitations,steps)
         if self._forward is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')):
-            self._forward(parameters,state,*self.packed_plan())
+            packed = self.packed_plan()
+            if adjoint:
+                if self._adjoint_plan is None:
+                    ids,scales,starts,stops,sources,targets,signs = packed
+                    self._adjoint_plan = (ids[::-1].copy(),-scales[::-1].copy(),starts[::-1].copy(),stops[::-1].copy(),sources,targets,signs)
+                packed = self._adjoint_plan
+            self._forward(parameters,state,*packed)
             return state
+        if adjoint:
+            plan = reversed(plan)
         for i,scale,source,target,sign in plan:
-            angle = parameters[i]*scale
+            angle = (-1 if adjoint else 1)*parameters[i]*scale
             self.rotate(state,source,target,np.cos(angle),sign*np.sin(angle))
         return state
+
+    def state(self, parameters, excitations, steps=1, initial=None):
+        return self.apply_unitary(self.initial if initial is None else initial,parameters,excitations,steps)
 
     def energy_and_gradient(self, parameters, excitations, steps=1, hamiltonian=None):
         state = self.state(parameters,excitations,steps)

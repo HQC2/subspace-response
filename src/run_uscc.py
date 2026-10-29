@@ -71,9 +71,11 @@ def main(argv=None):
         args.output_dir.mkdir(parents=True, exist_ok=True)
         def progress(event):
             if event['event'] == 'optimization':
-                print(f"E={event['energy']:.12f} |g|={event['gradient_norm']:.3e} S2={event['spin_squared']:.3e} ranks={event['ranks']} success={event['success']}", flush=True)
+                total = sum(event['ranks'].values())
+                print(f"E={event['energy']:.12f} |g|={event['gradient_norm']:.3e} S2={event['spin_squared']:.3e} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
             elif event['event'] == 'growth':
-                print(f"epsilon={event['epsilon']:g}: added {len(event['added'])} operators, ranks={event['ranks']}", flush=True)
+                total = sum(event['ranks'].values())
+                print(f"epsilon={event['epsilon']:g}: added {len(event['added'])} operators, ranks={event['ranks']} {total=}", flush=True)
         result = model.run(thresholds, checkpoint=args.output_dir/'checkpoint.json', max_cycles=args.max_cycles, max_operators=args.max_operators, gradient_tolerance=args.gradient_tolerance, energy_tolerance=args.energy_tolerance, maxiter=args.maxiter, optimizer=args.optimizer, callback=progress)
         (args.output_dir/'result.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
         print(f"Stopped: {result['stop_reason']}; energy={result['energy']:.12f}")
