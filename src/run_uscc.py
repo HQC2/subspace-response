@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Command-line ground-state USCC, with self-contained JSON checkpoints."""
+"""Ground-state USCC or SPQE selection with VQE/PQE and JSON checkpoints."""
 import argparse
 import json
 from pathlib import Path
@@ -40,11 +40,13 @@ def parser():
     cli.add_argument('--active-orbitals', type=int)
     cli.add_argument('--max-rank', type=int, default=4, help='Maximum excitation rank for recursive operator growth (default: %(default)s)')
     cli.add_argument('--seed', choices=['screened', 'sd'], default='screened', help='Initial operator seed (default: %(default)s)')
+    cli.add_argument('--selection', choices=['uscc', 'spqe'], default='uscc', help='USCC amplitude/integral screening or exact SPQE cumulative residual selection')
     cli.add_argument('--trotter-steps', type=int, default=1)
     cli.add_argument('--orbital-irreps', nargs='+', type=int, help='Optional Abelian XOR irrep IDs in active orbital order')
-    cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis'], help='Default: diagonal-metric L-BFGS with curvature reuse; DIIS starts with metric gradient steps')
-    cli.add_argument('--thresholds', nargs='+', type=float)
+    cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
+    cli.add_argument('--thresholds', nargs='+', type=float, help='Decreasing selection thresholds; SPQE uses an excluded residual L2 budget in hartree')
     cli.add_argument('--gradient-tolerance', type=float)
+    cli.add_argument('--residual-tolerance', type=float, help='PQE active residual L2 tolerance (default: 1e-6 hartree)')
     cli.add_argument('--energy-tolerance', type=float)
     cli.add_argument('--maxiter', type=int)
     cli.add_argument('--max-cycles', type=int, default=50)
@@ -65,7 +67,7 @@ def main(argv=None):
     print(args)
     try:
         if args.restart:
-            forbidden = {'unit','basis','charge','active_electrons','active_orbitals','max_rank','seed','trotter_steps','orbital_irreps'}
+            forbidden = {'unit','basis','charge','active_electrons','active_orbitals','max_rank','seed','selection','trotter_steps','orbital_irreps'}
             if args.xyz is not None or provided & forbidden:
                 cli.error('Restart uses the saved molecule, orbitals, ansatz, and selection configuration')
             overrides = {key: getattr(args, key) for key in ('device','backend','sector_threads','sector_kernels','rotation_threads') if key in provided}
@@ -81,7 +83,7 @@ def main(argv=None):
                 symbols, geometry, charge=args.charge, basis=args.basis,
                 unit=args.unit, active_electrons=args.active_electrons,
                 active_orbitals=args.active_orbitals, max_rank=args.max_rank,
-                seed=args.seed, trotter_steps=args.trotter_steps,
+                seed=args.seed, selection=args.selection, trotter_steps=args.trotter_steps,
                 device=args.device, orbital_irreps=args.orbital_irreps,
                 backend=args.backend, sector_threads=args.sector_threads,
                 sector_kernels=args.sector_kernels,
@@ -91,11 +93,13 @@ def main(argv=None):
         def progress(event):
             if event['event'] == 'optimization':
                 total = sum(event['ranks'].values())
-                print(f"E={event['energy']:.12f} |g|={event['gradient_norm']:.3e} S2={event['spin_squared']:.3e} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
+                convergence = (f"|r|={event['residual_norm']:.3e}" if event['optimizer'] == 'pqe'
+                               else f"|g|={event['gradient_norm']:.3e}")
+                print(f"E={event['energy']:.12f} {convergence} S2={event['spin_squared']:.3e} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
             elif event['event'] == 'growth':
                 total = sum(event['ranks'].values())
                 print(f"epsilon={event['epsilon']:g}: added {len(event['added'])} operators, ranks={event['ranks']} {total=}", flush=True)
-        result = model.run(thresholds, checkpoint=args.output_dir/'checkpoint.json', max_cycles=args.max_cycles, max_operators=args.max_operators, gradient_tolerance=args.gradient_tolerance, energy_tolerance=args.energy_tolerance, maxiter=args.maxiter, optimizer=args.optimizer, callback=progress)
+        result = model.run(thresholds, checkpoint=args.output_dir/'checkpoint.json', max_cycles=args.max_cycles, max_operators=args.max_operators, gradient_tolerance=args.gradient_tolerance, residual_tolerance=args.residual_tolerance, energy_tolerance=args.energy_tolerance, maxiter=args.maxiter, optimizer=args.optimizer, callback=progress)
         (args.output_dir/'result.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
         print(f"Stopped: {result['stop_reason']}; energy={result['energy']:.12f}")
         return 1 if result['stop_reason'] == 'optimizer_failure' else 0

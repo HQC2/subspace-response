@@ -1,7 +1,7 @@
-"""Ground-state unitary selective coupled cluster with scalar Trotter blocks.
+"""Ground-state USCC and SPQE selection with scalar Trotter blocks.
 
-The selector is a documented spin-adapted extension of USCC's amplitude times
-integral heuristic. It does not measure gradients of an external operator pool.
+USCC uses a spin-adapted amplitude-times-integral heuristic. SPQE uses exact
+transformed residuals with either VQE energy or PQE residual optimization.
 """
 from hashlib import sha256
 from pathlib import Path
@@ -17,6 +17,7 @@ from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integra
 from stateprep import stateprep
 from ucc_circuits import apply_ucc
 from uscc_optimizers import excitation_curvature, minimize_metric
+from spqe import project_residual, select_blocks, solve_pqe
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -113,7 +114,10 @@ class USCC:
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', selection='uscc', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
+        if selection not in ('uscc', 'spqe'):
+            raise ValueError('selection must be uscc or spqe')
+        self.selection = selection
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
@@ -153,7 +157,7 @@ class USCC:
         self.initialized = False
         self.needs_optimization = False
         self.stop_reason = 'not_started'
-        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
+        self.optimization_settings = dict(gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
         self._optimizer_state = None
 
         @qml.qnode(self.device, diff_method='adjoint')
@@ -181,6 +185,13 @@ class USCC:
             return qml.state()
         self.circuit = expectation_circuit
         self.circuit_state = state_circuit
+
+        @qml.qnode(self.device, diff_method=None)
+        def adjoint_state_circuit(parameters, vector):
+            qml.StatePrep(vector, wires=range(self.qubits))
+            qml.adjoint(apply_ucc)(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            return qml.state()
+        self.circuit_adjoint_state = adjoint_state_circuit
 
     @property
     def H(self):
@@ -296,6 +307,48 @@ class USCC:
         number, sz, s2 = self.expectation(operators)
         return dict(particle_number=float(number), spin_z=float(sz), spin_squared=float(s2))
 
+    def projective_residual_state(self, parameters=None):
+        """Return E, U†(H-E)U|HF>, and its computational basis indices.
+
+        The sector backend never expands the full register or transformed H.
+        The PennyLane path is a full-register oracle with the same circuit.
+        """
+        parameters = self.theta if parameters is None else np.asarray(parameters, dtype=float)
+        if self.backend == 'sector':
+            simulator = self._sector_simulator()
+            state = simulator.state(parameters, self.excitations, self.trotter_steps)
+            applied = (simulator.apply_hamiltonian(state) if self._H is self._integral_hamiltonian
+                       else simulator.observable_matrix(self.H) @ state)
+            energy = float(np.vdot(state, applied).real)
+            residual = simulator.apply_unitary(applied-energy*state, parameters, self.excitations,
+                                               self.trotter_steps, adjoint=True)
+            return energy, residual, simulator.indices
+        state = np.asarray(self.circuit_state(parameters))
+        try:
+            hamiltonian = self.H.sparse_matrix(wire_order=range(self.qubits))
+        except qml.operation.SparseMatrixUndefinedError:
+            hamiltonian = qml.matrix(self.H, wire_order=range(self.qubits))
+        applied = hamiltonian @ state
+        energy = float(np.vdot(state, applied).real)
+        vector = applied-energy*state
+        norm = np.linalg.norm(vector)
+        residual = np.asarray(self.circuit_adjoint_state(parameters, vector/norm))*norm if norm else vector
+        return energy, residual, np.arange(len(state))
+
+    def projective_residuals(self, parameters=None):
+        """Energy and residuals projected onto the active scalar reference CSFs."""
+        energy, vector, indices = self.projective_residual_state(parameters)
+        hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
+        address = self._sector_simulator().address if self.backend == 'sector' else range(len(indices))
+        return energy, project_residual(self.excitations, vector, address, hf_index, self.qubits)
+
+    def _select(self, epsilon):
+        if self.selection == 'uscc':
+            return self.selector.select(self.excitations, self.theta, epsilon), {}
+        _, vector, indices = self.projective_residual_state()
+        hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
+        return select_blocks(vector, indices, hf_index, self.qubits, self.selector, self.excitations, epsilon)
+
     def resources(self):
         # A rank-r pure excitation has 2**(2*r-1) JW Pauli words. Every word
         # has X/Y at the endpoints and the same Z support between alternating
@@ -318,8 +371,17 @@ class USCC:
             if max_operators is not None and len(self.excitations)+len(generators) > max_operators:
                 self.needs_optimization = bool(added) or self.needs_optimization
                 return added, True
-            self.excitations.extend(generators)
-            self.theta = np.pad(self.theta, (0,len(generators)))
+            if self.selection == 'spqe':
+                # Serialized excitations are in circuit application order.
+                # SPQE appends on the right of the algebraic product U, so
+                # newly selected rotations act first on HF (paper Eq. 18).
+                self.excitations[0:0] = reversed(generators)
+                self.theta = np.pad(self.theta, (len(generators),0))
+                if generators:
+                    self._optimizer_state = None
+            else:
+                self.excitations.extend(generators)
+                self.theta = np.pad(self.theta, (0,len(generators)))
             self.provenance[block_id(block)] = dict(score=float(score), source=reason)
             added.extend(e.id for e in generators)
             present.update(e.id for e in generators)
@@ -361,19 +423,23 @@ class USCC:
                 raise ValueError('Invalid optimizer curvature state') from error
             return None
 
-    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs'):
+    def optimize(self, *, gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs'):
         """Optimize with a physical diagonal metric and reusable L-BFGS pairs.
 
         L-BFGS and DIIS require the requested L2 gradient tolerance; a tiny
         energy change alone is insufficient. Failed calls preserve theta and
         the previously accepted curvature state. DIIS starts with two metric
         gradient steps; SLSQP and dense BFGS retain their SciPy implementations.
+        PQE instead solves projected equations to residual_tolerance, using
+        gap-preconditioned updates and DIIS without energy gradients.
         """
-        if not np.isfinite(gradient_tolerance) or not np.isfinite(energy_tolerance) or gradient_tolerance <= 0 or energy_tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
+        if not np.isfinite(gradient_tolerance) or not np.isfinite(residual_tolerance) or not np.isfinite(energy_tolerance) or gradient_tolerance <= 0 or residual_tolerance <= 0 or energy_tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
             raise ValueError('Optimization tolerances and iteration count must be positive')
         method = method.lower()
-        if method not in ('slsqp','bfgs','lbfgs','diis'):
-            raise ValueError('Optimizer must be slsqp, bfgs, lbfgs or diis')
+        if method not in ('slsqp','bfgs','lbfgs','diis','pqe'):
+            raise ValueError('Optimizer must be slsqp, bfgs, lbfgs, diis or pqe')
+        if method == 'pqe':
+            return self._optimize_pqe(residual_tolerance=residual_tolerance, maxiter=maxiter)
         initial = self.theta.copy()
         old_energy, old_gradient = self.energy_and_gradient(initial)
         last = [initial.copy(), (old_energy,old_gradient)]
@@ -423,7 +489,34 @@ class USCC:
         self.needs_optimization = not result['success']
         return result
 
-    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None):
+    def _optimize_pqe(self, *, residual_tolerance, maxiter):
+        evaluations = 0
+        initial = self.theta.copy()
+        old_energy, old_residual = self.projective_residuals(initial)
+        evaluations += 1
+        last = [initial.copy(), (old_energy, old_residual)]
+        def objective(parameters):
+            nonlocal evaluations
+            if not np.array_equal(parameters, last[0]):
+                last[:] = [np.array(parameters, copy=True), self.projective_residuals(parameters)]
+                evaluations += 1
+            return last[1]
+        res = solve_pqe(objective, initial, excitation_curvature(self.integrals, self.excitations)/2,
+                        residual_tolerance=residual_tolerance, maxiter=maxiter)
+        # PQE solves equations; its energy need not decrease on every update.
+        if res.success:
+            self.theta = res.x.copy()
+            self._optimizer_state = None
+            energy, residual = float(res.fun), res.residual
+        else:
+            energy, residual = old_energy, old_residual
+        self.needs_optimization = not res.success
+        return dict(success=bool(res.success), message=str(res.message), iterations=int(res.nit),
+                    evaluations=evaluations, optimizer='pqe', energy=float(energy),
+                    residual_norm=float(np.linalg.norm(residual)),
+                    **self.resources(), **self.diagnostics())
+
+    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, residual_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None):
         if thresholds is None:
             thresholds = self.schedule if self.schedule is not None else (1e-2,1e-3,1e-4)
         thresholds = tuple(float(x) for x in thresholds)
@@ -434,8 +527,10 @@ class USCC:
         if self.schedule is not None and tuple(self.schedule) != thresholds:
             raise ValueError('A restart must use the saved threshold schedule')
         self.schedule = thresholds
-        for name, value in dict(gradient_tolerance=gradient_tolerance, energy_tolerance=energy_tolerance, maxiter=maxiter, method=optimizer).items():
+        for name, value in dict(gradient_tolerance=gradient_tolerance, residual_tolerance=residual_tolerance, energy_tolerance=energy_tolerance, maxiter=maxiter, method=optimizer).items():
             if value is not None:
+                if name in ('method','gradient_tolerance','residual_tolerance') and value != self.optimization_settings.get(name):
+                    self.needs_optimization = True
                 self.optimization_settings[name] = value
         def record(event):
             self.history.append(event)
@@ -448,8 +543,10 @@ class USCC:
                 pool = singlet_excitations(self.integrals.electrons, self.qubits, range(1,min(2,self.selector.max_rank)+1), self.selector.orbital_irreps)
                 blocks = sorted({e.block for e in pool})
                 proposals = [(b,0.,'full_sd_seed') for b in blocks]
-            else:
+            elif self.selection == 'uscc':
                 proposals = [(b,s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
+            else:
+                proposals = []  # SPQE starts from HF and selects from its residual.
             added, limited = self._append_blocks(proposals, max_operators)
             self.initialized = not limited
             self.needs_optimization = True
@@ -474,23 +571,30 @@ class USCC:
                 record(dict(event='finished', reason=self.stop_reason))
                 return self.result()
             epsilon = thresholds[self.threshold_index]
-            proposals = self.selector.select(self.excitations, self.theta, epsilon)
+            proposals, selection_diagnostics = self._select(epsilon)
             if not proposals:
                 self.threshold_index += 1
-                record(dict(event='threshold_closed', epsilon=epsilon))
+                record(dict(event='threshold_closed', epsilon=epsilon, **selection_diagnostics))
                 continue
             added, limited = self._append_blocks(proposals, max_operators)
             cycles += 1
             if added:
                 self.stop_reason = 'running'
-                record(dict(event='growth', epsilon=epsilon, added=added, **self.resources()))
+                record(dict(event='growth', epsilon=epsilon, added=added, **selection_diagnostics, **self.resources()))
             if limited:
                 self.stop_reason = 'operator_limit'
                 record(dict(event='finished', reason=self.stop_reason))
                 return self.result()
 
     def result(self):
-        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **self.resources(), **self.diagnostics(), history=list(self.history))
+        projective = {}
+        if self.selection == 'spqe' or self.optimization_settings.get('method') == 'pqe':
+            _, vector, indices = self.projective_residual_state()
+            hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
+            address = self._sector_simulator().address if self.backend == 'sector' else range(len(indices))
+            residuals = project_residual(self.excitations, vector, address, hf_index, self.qubits)
+            projective = dict(full_residual_norm=float(np.linalg.norm(vector)), residual_norm=float(np.linalg.norm(residuals)))
+        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(method=self.selection, seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **projective, **self.resources(), **self.diagnostics(), history=list(self.history))
 
     def _fingerprint(self):
         digest = sha256()
@@ -506,7 +610,7 @@ class USCC:
         if optimizer_state is not None and (optimizer_state['context']['observable'] is not None or self._curvature_history() is None):
             optimizer_state = None
         data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
-                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, selection=self.selection, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
         temporary.replace(filename)
