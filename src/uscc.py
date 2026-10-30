@@ -37,20 +37,18 @@ class USCCSelector:
     antisymmetrized coefficient of canonical tau in (1/2) V a†a†aa. Scalar
     amplitudes are expanded into monomial coefficients sum_mu theta_mu*c_mu,m.
     This is a first-order proposal surrogate, not a CI coefficient estimator.
+    All selected excitation ranks can supply amplitudes for further proposals;
+    max_rank limits the resulting candidates.
     """
-    def __init__(self, integrals, max_rank=4, orbital_irreps=None, exhaustive=False, growth='paper'):
+    def __init__(self, integrals, max_rank=4, orbital_irreps=None):
         if not isinstance(max_rank, int) or max_rank < 1:
             raise ValueError('max_rank must be a positive integer')
         if orbital_irreps is not None and (len(orbital_irreps) != integrals.qubits//2 or any(not isinstance(i, (int, np.integer)) or i < 0 for i in orbital_irreps)):
             raise ValueError('Expected nonnegative Abelian XOR irrep IDs')
-        if growth not in ('paper','recursive') or (growth == 'paper' and max_rank > 4):
-            raise ValueError('Use recursive growth to extend USCC beyond quadruples')
-        self.growth = growth
         self.integrals = integrals
         self.max_rank = min(max_rank, integrals.electrons, integrals.qubits-integrals.electrons)
         self.requested_max_rank = max_rank
         self.orbital_irreps = None if orbital_irreps is None else tuple(map(int, orbital_irreps))
-        self.exhaustive = bool(exhaustive)
         self.channels = integrals.excitation_channels()
 
     def allowed(self, block):
@@ -78,8 +76,6 @@ class USCCSelector:
         scores = self.base_scores()
         amplitudes = {}
         for excitation, theta in zip(excitations, parameters):
-            if self.growth == 'paper' and excitation.rank > 2:
-                continue
             for term in excitation.terms:
                 key = term.holes, term.particles
                 amplitudes[key] = amplitudes.get(key, 0.) + float(theta)*term.coefficient
@@ -99,9 +95,6 @@ class USCCSelector:
                 score = abs(amplitude*channel.coefficient)
                 if score > scores.get(block, (-1., ''))[0]:
                     scores[block] = (score, f't{len(holes)}*h{channel.rank}')
-        if self.exhaustive:
-            for excitation in singlet_excitations(self.integrals.electrons, self.integrals.qubits, range(1,self.max_rank+1), self.orbital_irreps):
-                scores.setdefault(excitation.block, (0., 'exhaustive_audit'))
         return scores
 
     def select(self, excitations, parameters, epsilon):
@@ -120,7 +113,7 @@ class USCC:
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False, backend='sector', growth='paper', sector_threads=None, sector_kernels='auto', rotation_threads=None):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
@@ -146,7 +139,7 @@ class USCC:
         self.qubits = integrals.qubits
         self.hf_state = np.array([1]*integrals.electrons+[0]*(self.qubits-integrals.electrons), dtype=int)
         self.metadata = {} if metadata is None else metadata
-        self.selector = USCCSelector(integrals, max_rank, orbital_irreps, exhaustive, growth)
+        self.selector = USCCSelector(integrals, max_rank, orbital_irreps)
         self.seed = seed
         self.trotter_steps = trotter_steps
         self.device_name = device
@@ -497,7 +490,7 @@ class USCC:
                 return self.result()
 
     def result(self):
-        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, exhaustive=self.selector.exhaustive, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank, growth=self.selector.growth), **self.resources(), **self.diagnostics(), history=list(self.history))
+        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **self.resources(), **self.diagnostics(), history=list(self.history))
 
     def _fingerprint(self):
         digest = sha256()
@@ -513,7 +506,7 @@ class USCC:
         if optimizer_state is not None and (optimizer_state['context']['observable'] is not None or self._curvature_history() is None):
             optimizer_state = None
         data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
-                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive, backend=self.backend, growth=self.selector.growth, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
         temporary.replace(filename)
@@ -524,7 +517,6 @@ class USCC:
         if data.get('version') != FORMAT_VERSION or data.get('convention') != CONVENTION:
             raise ValueError('Unsupported checkpoint schema or excitation convention')
         config = dict(data['config'])
-        config.setdefault('growth','recursive')  # Preserve legacy screening semantics.
         config.setdefault('backend','pennylane')  # Legacy checkpoints retain their backend.
         if backend is not None:
             config['backend'] = backend
