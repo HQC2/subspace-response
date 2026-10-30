@@ -17,7 +17,7 @@ from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integra
 from stateprep import stateprep
 from ucc_circuits import apply_ucc
 from uscc_optimizers import excitation_curvature, minimize_metric
-from spqe import project_residual, select_blocks, solve_pqe
+from spqe import ReferenceProjector, SPQESelection, solve_pqe
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -159,6 +159,8 @@ class USCC:
         self.stop_reason = 'not_started'
         self.optimization_settings = dict(gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
         self._optimizer_state = None
+        self._spqe_selector = None
+        self._projective_projector = None
 
         @qml.qnode(self.device, diff_method='adjoint')
         def expectation_circuit(parameters, operator, vector=None):
@@ -338,16 +340,34 @@ class USCC:
     def projective_residuals(self, parameters=None):
         """Energy and residuals projected onto the active scalar reference CSFs."""
         energy, vector, indices = self.projective_residual_state(parameters)
+        return energy, self._reference_projector(indices).project(vector)
+
+    def _projection_context(self, indices):
         hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
-        address = self._sector_simulator().address if self.backend == 'sector' else range(len(indices))
-        return energy, project_residual(self.excitations, vector, address, hf_index, self.qubits)
+        simulator = self._sector_simulator() if self.backend == 'sector' else None
+        address = simulator.address if simulator is not None else range(len(indices))
+        return hf_index, address, (self.backend, id(simulator), self.qubits, hf_index)
+
+    def _reference_projector(self, indices):
+        hf_index, address, context = self._projection_context(indices)
+        ids = tuple(e.id for e in self.excitations)
+        cached = self._projective_projector
+        if cached is None or cached[0] != context or cached[1].ids != ids:
+            cached = self._projective_projector = (context, ReferenceProjector(
+                self.excitations, address, hf_index, self.qubits, len(indices)))
+        return cached[1]
 
     def _select(self, epsilon):
         if self.selection == 'uscc':
             return self.selector.select(self.excitations, self.theta, epsilon), {}
         _, vector, indices = self.projective_residual_state()
-        hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
-        return select_blocks(vector, indices, hf_index, self.qubits, self.selector, self.excitations, epsilon)
+        hf_index, address, context = self._projection_context(indices)
+        context += (id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
+        cached = self._spqe_selector
+        if cached is None or cached[0] != context:
+            cached = self._spqe_selector = (context, SPQESelection(
+                indices, hf_index, self.qubits, self.selector, address))
+        return cached[1].select(vector, self.excitations, epsilon)
 
     def resources(self):
         # A rank-r pure excitation has 2**(2*r-1) JW Pauli words. Every word
@@ -364,29 +384,34 @@ class USCC:
         return dict(parameters=len(self.theta), ranks={str(r):sum(e.rank == r for e in self.excitations) for r in range(1,self.selector.requested_max_rank+1)}, pauli_rotations=rotations*self.trotter_steps, estimated_parity_cnots=cnots*self.trotter_steps)
 
     def _append_blocks(self, proposals, max_operators=None):
-        added = []
+        added, limited = [], False
         present = {e.id for e in self.excitations}
         for block, score, reason in proposals:
-            generators = tuple(e for e in singlet_excitations_for_block(*block) if e.id not in present)
-            if max_operators is not None and len(self.excitations)+len(generators) > max_operators:
-                self.needs_optimization = bool(added) or self.needs_optimization
-                return added, True
-            if self.selection == 'spqe':
-                # Serialized excitations are in circuit application order.
-                # SPQE appends on the right of the algebraic product U, so
-                # newly selected rotations act first on HF (paper Eq. 18).
-                self.excitations[0:0] = reversed(generators)
-                self.theta = np.pad(self.theta, (len(generators),0))
-                if generators:
-                    self._optimizer_state = None
-            else:
-                self.excitations.extend(generators)
-                self.theta = np.pad(self.theta, (0,len(generators)))
+            cached = self._spqe_selector if self.selection == 'spqe' else None
+            try:
+                pool = cached[1].generators(block) if cached is not None else None
+            except KeyError:
+                pool = None  # Explicit seeds or manually supplied proposals.
+            if pool is None:
+                pool = singlet_excitations_for_block(*block)
+            generators = tuple(e for e in pool if e.id not in present)
+            if max_operators is not None and len(self.excitations)+len(added)+len(generators) > max_operators:
+                limited = True
+                break
             self.provenance[block_id(block)] = dict(score=float(score), source=reason)
-            added.extend(e.id for e in generators)
+            added.extend(generators)
             present.update(e.id for e in generators)
+        if added:
+            if self.selection == 'spqe':
+                # Circuit order is the reverse of SPQE's algebraic product.
+                self.excitations[0:0] = reversed(added)
+                self.theta = np.pad(self.theta, (len(added),0))
+                self._optimizer_state = None
+            else:
+                self.excitations.extend(added)
+                self.theta = np.pad(self.theta, (0,len(added)))
         self.needs_optimization = bool(added) or self.needs_optimization
-        return added, False
+        return [e.id for e in added], limited
 
     def _optimizer_context(self):
         # Custom observables can be replaced independently of the integrals.
@@ -590,9 +615,7 @@ class USCC:
         projective = {}
         if self.selection == 'spqe' or self.optimization_settings.get('method') == 'pqe':
             _, vector, indices = self.projective_residual_state()
-            hf_index = ((1 << self.integrals.electrons)-1) << (self.qubits-self.integrals.electrons)
-            address = self._sector_simulator().address if self.backend == 'sector' else range(len(indices))
-            residuals = project_residual(self.excitations, vector, address, hf_index, self.qubits)
+            residuals = self._reference_projector(indices).project(vector)
             projective = dict(full_residual_norm=float(np.linalg.norm(vector)), residual_norm=float(np.linalg.norm(residuals)))
         return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(method=self.selection, seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **projective, **self.resources(), **self.diagnostics(), history=list(self.history))
 

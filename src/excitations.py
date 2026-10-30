@@ -297,6 +297,7 @@ def singlet_excitations_for_block(spatial_holes, spatial_particles):
     n_modes = 2 * (max(holes + particles) + 1)
     hf = sum((1 << (n_modes - 2*h - 1)) + (1 << (n_modes - 2*h - 2)) for h in set(holes))
     basis = []
+    canonical_phases = {}
     for pairing in sorted(set(permutations(particles))):
         raw = {}
         for spins in product((0, 1), repeat=len(holes)):
@@ -306,9 +307,13 @@ def singlet_excitations_for_block(spatial_holes, spatial_particles):
                 continue
             hs = tuple(sorted(2*h+spin for h, spin in zip(holes, spins)))
             ps = tuple(sorted(2*p+spin for p, spin in zip(pairing, spins)))
-            canonical = ExcitationTerm(hs, ps).apply(hf, n_modes)
             key = hs, ps
-            raw[key] = raw.get(key, 0.) + applied[1] / canonical[1]
+            if key not in canonical_phases:
+                # This word is canonical by construction. Avoid rebuilding
+                # and validating an ExcitationTerm for every spin pairing.
+                canonical_word = tuple((p, True) for p in ps) + tuple((h, False) for h in reversed(hs))
+                canonical_phases[key] = apply_fermion_word(hf, n_modes, canonical_word)[1]
+            raw[key] = raw.get(key, 0.) + applied[1] / canonical_phases[key]
         # Reorthogonalization stabilizes blocks with several spin couplings.
         for _ in range(2):
             for previous in basis:
