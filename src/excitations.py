@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from hashlib import sha256
-from itertools import combinations_with_replacement, permutations, product
+from itertools import combinations_with_replacement, product
 import json
+from math import comb
 
 import numpy as np
 import scipy
@@ -294,11 +295,56 @@ def singlet_excitations_for_block(spatial_holes, spatial_particles):
         raise ValueError('Invalid or overlapping spatial indices')
     if any(holes.count(i) > 2 for i in holes) or any(particles.count(i) > 2 for i in particles):
         return ()
+    # Spin coupling depends on repeated occupations and orbital order within
+    # each set, not on the orbital labels or gaps. Reuse the Gram-Schmidt basis
+    # across equivalent blocks, preserving its coefficients and component order.
+    orbitals = tuple(sorted(set(holes))) + tuple(sorted(set(particles)))
+    labels = {orbital: i for i, orbital in enumerate(orbitals)}
+    template_holes = tuple(labels[h] for h in holes)
+    template_particles = tuple(labels[p] for p in particles)
+    template = _singlet_coupling_template(template_holes, template_particles)
+    translated = {}
+    def modes(indices):
+        if indices not in translated:
+            translated[indices] = tuple(2*orbitals[i//2] + i%2 for i in indices)
+        return translated[indices]
+    return tuple(Excitation(holes, particles, i,
+                           tuple(ExcitationTerm(modes(h), modes(p), c)
+                                 for (h, p), c in vector))
+                 for i, vector in enumerate(template))
+
+
+def _unique_permutations(indices):
+    """Multiset permutations in the same lexicographic order as sorted(set(...))."""
+    counts = {i: indices.count(i) for i in sorted(set(indices))}
+    prefix = []
+    def visit():
+        if len(prefix) == len(indices):
+            yield tuple(prefix)
+            return
+        for i, count in counts.items():
+            if count:
+                counts[i] -= 1
+                prefix.append(i)
+                yield from visit()
+                prefix.pop()
+                counts[i] += 1
+    yield from visit()
+
+
+@lru_cache(maxsize=2048)
+def _singlet_coupling_template(holes, particles):
+    """Canonical monomial coefficients for compact spatial occupation labels."""
     n_modes = 2 * (max(holes + particles) + 1)
     hf = sum((1 << (n_modes - 2*h - 1)) + (1 << (n_modes - 2*h - 2)) for h in set(holes))
     basis = []
     canonical_phases = {}
-    for pairing in sorted(set(permutations(particles))):
+    open_shells = sum(indices.count(i) == 1 for indices in (holes, particles) for i in set(indices))
+    # Multiplicity of S=0 in open_shells spin-1/2 representations. Once this
+    # basis is complete every remaining E product is necessarily dependent.
+    half = open_shells//2
+    singlets = comb(open_shells, half) - comb(open_shells, half+1)
+    for pairing in _unique_permutations(particles):
         raw = {}
         for spins in product((0, 1), repeat=len(holes)):
             word = tuple(op for h, p, spin in zip(holes, pairing, spins) for op in ((2*p+spin, True), (2*h+spin, False)))
@@ -326,7 +372,9 @@ def singlet_excitations_for_block(spatial_holes, spatial_particles):
             continue
         sign = np.sign(raw[min(raw)])
         basis.append({k: c/(norm*sign) for k, c in sorted(raw.items())})
-    return tuple(Excitation(holes, particles, i, tuple(ExcitationTerm(h, p, c) for (h, p), c in vector.items())) for i, vector in enumerate(basis))
+        if len(basis) == singlets:
+            break
+    return tuple(tuple(vector.items()) for vector in basis)
 
 
 def singlet_excitations(electrons, qubits, ranks=(1, 2, 3, 4), orbital_irreps=None):

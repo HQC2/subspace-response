@@ -10,7 +10,7 @@ import numpy as np
 from scipy import sparse
 from scipy.optimize import OptimizeResult
 
-from excitations import singlet_excitations_for_block
+from excitations import apply_fermion_word, singlet_excitations_for_block
 
 def _real_residuals(residuals):
     if np.iscomplexobj(residuals) and np.any(abs(residuals.imag) > 1e-10):
@@ -25,10 +25,19 @@ class ReferenceProjector:
         self.excitations = tuple(excitations)
         self.ids = tuple(e.id for e in self.excitations)
         rows, columns, data = [0], [], []
+        block, components = None, {}
         for excitation in self.excitations:
+            # Couplings of one spatial block share canonical monomials, with
+            # different coefficients. Compute their determinant/phase once.
+            if excitation.block != block:
+                block, components = excitation.block, {}
             for term in excitation.terms:
-                index, coefficient = term.apply(hf_index, n_modes)
-                columns.append(address[index]); data.append(coefficient)
+                key = term.holes, term.particles
+                if key not in components:
+                    index, phase = apply_fermion_word(hf_index, n_modes, term.word)
+                    components[key] = address[index], phase
+                column, phase = components[key]
+                columns.append(column); data.append(term.coefficient*phase)
             rows.append(len(data))
         # Keep the canonical term summation order rather than sorting columns.
         self.matrix = sparse.csr_array((np.asarray(data, dtype=float),
