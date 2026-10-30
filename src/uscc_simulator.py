@@ -51,6 +51,8 @@ class SectorSimulator:
         strings = cistring.make_strings(range(self.n_orbitals), self.n_alpha)
         self._strings = strings
         self._spin_pairs = {}
+        self._string_parities = {}
+        self._beta_mode_mask = sum(1 << (self.n_modes-2*p-2) for p in range(self.n_orbitals))
         # PySCF uses alpha-major, beta-minor CI coefficients with all alpha
         # creators before beta creators. Our JW convention interleaves spins.
         interleaved = np.zeros(len(strings),dtype=np.int64)
@@ -61,6 +63,7 @@ class SectorSimulator:
             interleaved |= occupied.astype(np.int64) << (self.n_modes-2*p-2)
             parity ^= occupied[:,None]*lower_beta_parity[None,:]
             lower_beta_parity ^= occupied
+        self._interleaved_strings = interleaved
         self.indices = ((interleaved[:,None] << 1) | interleaved[None,:]).ravel()
         self._index_order = np.argsort(self.indices)
         self._sorted_indices = self.indices[self._index_order]
@@ -111,41 +114,65 @@ class SectorSimulator:
                 applied = applied + 1j*contract(ci.imag)
         return self.phases*applied + self.integrals.constant*state
 
+    def excitation_layout(self, holes, particles):
+        """Compact spin-string tables and JW parity for an excitation.
+
+        Screening can contract these tables directly without retaining full
+        Cartesian determinant-pair arrays for every pool monomial.
+        """
+        ExcitationTerm(holes,particles)  # Validate the external canonical word.
+        if max(holes+particles) >= self.n_modes:
+            raise ValueError('Fermion mode outside the register')
+        if sum(h%2 for h in holes) != sum(p%2 for p in particles):
+            raise ValueError('Excitation leaves the fixed spin/electron sector')
+        return self._excitation_layout(holes, particles)
+
+    def _excitation_layout(self, holes, particles):
+        """Internal layout for already validated canonical monomials."""
+        # A monomial's allowed determinants are a Cartesian product of
+        # independent alpha/beta strings. Search those short string lists
+        # once, instead of scanning and searching the full squared sector.
+        spin_pairs = []
+        for spin in (0, 1):
+            hole_mask = sum(1 << (h//2) for h in holes if h%2 == spin)
+            particle_mask = sum(1 << (p//2) for p in particles if p%2 == spin)
+            masks = hole_mask, particle_mask
+            if masks not in self._spin_pairs:
+                flip = hole_mask | particle_mask
+                rows = np.flatnonzero((self._strings & flip) == hole_mask)
+                targets = np.searchsorted(self._strings, self._strings[rows] ^ flip)
+                self._spin_pairs[masks] = rows, targets
+            spin_pairs.append(self._spin_pairs[masks])
+        parity_mask, toggled, constant = 0, 0, 0
+        for mode in holes+tuple(reversed(particles)):
+            prefix = ((1 << self.n_modes)-1) ^ ((1 << (self.n_modes-mode))-1)
+            parity_mask ^= prefix
+            constant ^= (toggled & prefix).bit_count() & 1
+            toggled ^= 1 << (self.n_modes-mode-1)
+        return spin_pairs[0], spin_pairs[1], parity_mask, constant
+
+    def string_parities(self, mask):
+        """Bounded cache of JW parity signs on the short spin-string basis."""
+        mask &= self._beta_mode_mask
+        if mask not in self._string_parities:
+            if len(self._string_parities) >= 512:
+                self._string_parities.clear()
+            parity = self._interleaved_strings & mask
+            for shift in (32, 16, 8, 4, 2, 1):
+                parity ^= parity >> shift
+            signs = (1-2*(parity & 1)).astype(np.int8)
+            signs.flags.writeable = False
+            self._string_parities[mask] = signs
+        return self._string_parities[mask]
+
     def pairs(self, holes, particles):
         key = holes, particles
         if key not in self._pairs:
-            term = ExcitationTerm(holes,particles)
-            if max(holes+particles) >= self.n_modes:
-                raise ValueError('Fermion mode outside the register')
-            if sum(h%2 for h in holes) != sum(p%2 for p in particles):
-                raise ValueError('Excitation leaves the fixed spin/electron sector')
-            # A monomial's allowed determinants are a Cartesian product of
-            # independent alpha/beta strings. Search those short string lists
-            # once, instead of scanning and searching the full squared sector.
-            spin_pairs = []
-            for spin in (0, 1):
-                hole_mask = sum(1 << (h//2) for h in holes if h%2 == spin)
-                particle_mask = sum(1 << (p//2) for p in particles if p%2 == spin)
-                masks = hole_mask, particle_mask
-                if masks not in self._spin_pairs:
-                    flip = hole_mask | particle_mask
-                    rows = np.flatnonzero((self._strings & flip) == hole_mask)
-                    targets = np.searchsorted(self._strings, self._strings[rows] ^ flip)
-                    self._spin_pairs[masks] = rows, targets
-                spin_pairs.append(self._spin_pairs[masks])
-            alpha, beta = spin_pairs
+            alpha, beta, parity_mask, constant = self.excitation_layout(holes, particles)
             width = self.shape[1]
             dtype = np.int32 if self.dimension <= np.iinfo(np.int32).max else np.int64
             source = (alpha[0][:,None]*width + beta[0]).ravel().astype(dtype)
             target = (alpha[1][:,None]*width + beta[1]).ravel().astype(dtype)
-            # Fermion signs are parity of a fixed mask of the initial index,
-            # plus the signs caused by earlier toggles in the operator word.
-            parity_mask, toggled, constant = 0, 0, 0
-            for mode in holes+tuple(reversed(particles)):
-                prefix = ((1 << self.n_modes)-1) ^ ((1 << (self.n_modes-mode))-1)
-                parity_mask ^= prefix
-                constant ^= (toggled & prefix).bit_count() & 1
-                toggled ^= 1 << (self.n_modes-mode-1)
             parity = self.indices[source] & parity_mask
             # XOR folding supports NumPy versions without bitwise_count.
             for shift in (32,16,8,4,2,1):
@@ -279,8 +306,21 @@ class SectorSimulator:
             maximum = min(2, config.NUMBA_NUM_THREADS)
         return min(maximum,available) if self.dimension >= 200000 else 1
 
+    def effective_screening_threads(self):
+        # Independent pool monomials amortize larger teams than gate sweeps.
+        # An explicit sector budget applies even to small benchmark sectors.
+        if self.sector_threads is None and self.dimension < 200000:
+            return 1
+        from numba import config
+        available = self.sector_threads or lib.num_threads()
+        return min(4, available, config.NUMBA_NUM_THREADS)
+
     def _run_numba_rotation(self, serial, parallel, *arguments):
-        threads = self.effective_rotation_threads()
+        self._run_numba_kernel(serial, parallel, *arguments,
+                               threads=self.effective_rotation_threads())
+
+    @staticmethod
+    def _run_numba_kernel(serial, parallel, *arguments, threads):
         if threads == 1:
             serial(*arguments)
             return

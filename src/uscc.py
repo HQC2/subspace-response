@@ -1,7 +1,8 @@
-"""Ground-state USCC and SPQE selection with scalar Trotter blocks.
+"""Adaptive ground-state selection with scalar Trotter blocks.
 
 USCC uses a spin-adapted amplitude-times-integral heuristic. SPQE uses exact
 transformed residuals with either VQE energy or PQE residual optimization.
+Gradient selection scores appended scalar directions on the current state.
 """
 from hashlib import sha256
 from pathlib import Path
@@ -18,6 +19,7 @@ from stateprep import stateprep
 from ucc_circuits import apply_ucc
 from uscc_optimizers import excitation_curvature, minimize_metric
 from spqe import ReferenceProjector, SPQESelection, solve_pqe
+from gradient_selection import GradientSelection
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -115,8 +117,8 @@ class USCC:
     response code, independently of this ground-state selection loop.
     """
     def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', selection='uscc', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
-        if selection not in ('uscc', 'spqe'):
-            raise ValueError('selection must be uscc or spqe')
+        if selection not in ('uscc', 'spqe', 'gradient'):
+            raise ValueError('selection must be uscc, spqe or gradient')
         self.selection = selection
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
@@ -160,6 +162,7 @@ class USCC:
         self.optimization_settings = dict(gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
         self._optimizer_state = None
         self._spqe_selector = None
+        self._gradient_selector = None
         self._projective_projector = None
 
         @qml.qnode(self.device, diff_method='adjoint')
@@ -360,6 +363,31 @@ class USCC:
     def _select(self, epsilon):
         if self.selection == 'uscc':
             return self.selector.select(self.excitations, self.theta, epsilon), {}
+        if self.selection == 'gradient':
+            simulator = self._sector_simulator()
+            context = (id(simulator), id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
+            cached = self._gradient_selector
+            if cached is None or cached[0] != context:
+                cached = self._gradient_selector = (context, GradientSelection(
+                    simulator, self.selector))
+            if self.backend == 'sector':
+                state = simulator.state(self.theta, self.excitations, self.trotter_steps)
+                if self._H is self._integral_hamiltonian:
+                    applied = simulator.apply_hamiltonian(state)
+                else:
+                    matrix = simulator.observable_matrix(self.H)
+                    applied = matrix @ state
+            else:
+                # Prepare and measure with the full-register reference backend;
+                # candidate rotations conserve the same fixed N_alpha/N_beta.
+                full_state = np.asarray(self.circuit_state(self.theta))
+                try:
+                    matrix = self.H.sparse_matrix(wire_order=range(self.qubits))
+                except qml.operation.SparseMatrixUndefinedError:
+                    matrix = qml.matrix(self.H, wire_order=range(self.qubits))
+                state = full_state[simulator.indices]
+                applied = (matrix @ full_state)[simulator.indices]
+            return cached[1].select(state, applied, self.excitations, epsilon)
         _, vector, indices = self.projective_residual_state()
         hf_index, address, context = self._projection_context(indices)
         context += (id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
@@ -387,7 +415,8 @@ class USCC:
         added, limited = [], False
         present = {e.id for e in self.excitations}
         for block, score, reason in proposals:
-            cached = self._spqe_selector if self.selection == 'spqe' else None
+            cached = (self._spqe_selector if self.selection == 'spqe'
+                      else self._gradient_selector if self.selection == 'gradient' else None)
             try:
                 pool = cached[1].generators(block) if cached is not None else None
             except KeyError:
@@ -571,7 +600,7 @@ class USCC:
             elif self.selection == 'uscc':
                 proposals = [(b,s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
             else:
-                proposals = []  # SPQE starts from HF and selects from its residual.
+                proposals = []  # Residual/variational criteria first screen the HF state.
             added, limited = self._append_blocks(proposals, max_operators)
             self.initialized = not limited
             self.needs_optimization = True
