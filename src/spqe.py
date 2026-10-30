@@ -1,16 +1,16 @@
 """Exact, spin-adapted SPQE screening and projective amplitude microiterations.
 
-This is the deterministic residual limit of Stair and Evangelista, PRX Quantum
-2, 030301 (2021). Selection promotes whole scalar occupation blocks rather than
-individual determinants. It does not simulate finite-time evolution or shots.
+This project uses exact SPQE-style residuals within the single/double spatial
+occupation neighborhood of HF and selected amplitudes. Selection promotes whole
+scalar blocks.
 """
+from itertools import combinations, combinations_with_replacement
 from math import hypot
 import numpy as np
 from scipy import sparse
 from scipy.optimize import OptimizeResult
 
 from excitations import singlet_excitations_for_block
-
 
 def _real_residuals(residuals):
     if np.iscomplexobj(residuals) and np.any(abs(residuals.imag) > 1e-10):
@@ -46,47 +46,102 @@ def project_residual(excitations, vector, address, hf_index, n_modes):
 
 
 class SPQESelection:
-    """Lazily discover residual support and reuse its sparse scalar projection.
+    """Residual selection within the single/double neighborhood of selected CSFs.
 
-    Only blocks reached by nonzero residual coefficients get a scalar basis.
-    A boolean support table avoids decoding the same determinant on later
-    macroiterations. Neither amplitudes nor residual values are cached.
+    HF is always a source. Spatial occupation distance is half the occupation
+    L1 distance, so whole scalar blocks are eligible within two electron moves
+    of any source block. Only eligible blocks with nonzero determinant support
+    get a scalar basis. Values are recomputed on every call.
     """
     def __init__(self, indices, hf_index, n_modes, constraints, address=None):
         self.indices = indices
         self.address = ({int(index): i for i, index in enumerate(indices)}
                         if address is None else address)
         self.hf_index, self.n_modes, self.constraints = hf_index, n_modes, constraints
-        self._seen = np.zeros(len(indices), dtype=bool)
+        self.n_orbitals = n_modes//2
+        self.reference_occupations = tuple((hf_index >> (n_modes-2*i-2) & 3).bit_count()
+                                           for i in range(self.n_orbitals))
+        self._sources = set()
+        self._candidates = set()
+        self._support_rows = {}
         self._blocks = {}
+        self.blocks = []
         self._projector = None
         self._active_ids = None
 
-    def _spatial_modes(self, mask):
-        modes = []
-        while mask:
-            bit = mask & -mask
-            modes.append((self.n_modes-bit.bit_length())//2)
-            mask ^= bit
-        return tuple(reversed(modes))
+    def _occupations(self, block):
+        occupations = list(self.reference_occupations)
+        for hole in block[0]:
+            occupations[hole] -= 1
+        for particle in block[1]:
+            occupations[particle] += 1
+        return occupations
 
-    def _discover(self, vector):
-        unseen = np.flatnonzero((vector != 0) & ~self._seen)
-        self._seen[unseen] = True
-        new_blocks = set()
-        for row in unseen:
-            index = int(self.indices[row])
-            holes, particles = self.hf_index & ~index, index & ~self.hf_index
-            rank = holes.bit_count()
-            if not rank or rank != particles.bit_count() or rank > self.constraints.max_rank:
-                continue
-            block = self._spatial_modes(holes), self._spatial_modes(particles)
-            if block not in self._blocks and self.constraints.allowed(block):
-                new_blocks.add(block)
-        for block in sorted(new_blocks):
-            self._blocks[block] = singlet_excitations_for_block(*block)
-        if new_blocks or self._projector is None:
-            self.blocks = sorted(self._blocks)
+    def _occupation_block(self, occupations):
+        holes, particles = [], []
+        for i, (reference, occupied) in enumerate(zip(self.reference_occupations, occupations)):
+            holes.extend([i]*max(0, reference-occupied))
+            particles.extend([i]*max(0, occupied-reference))
+        return tuple(holes), tuple(particles)
+
+    def _neighbors(self, source):
+        occupations = self._occupations(source)
+        holes = [i for i, n in enumerate(occupations) if n]
+        particles = [i for i, n in enumerate(occupations) if n < 2]
+        for rank in (1, 2):
+            removals = ([(i,) for i in holes] if rank == 1 else
+                        [pair for pair in combinations_with_replacement(holes, 2)
+                         if pair[0] != pair[1] or occupations[pair[0]] == 2])
+            additions = ([(a,) for a in particles] if rank == 1 else
+                         [pair for pair in combinations_with_replacement(particles, 2)
+                          if pair[0] != pair[1] or occupations[pair[0]] == 0])
+            for removed in removals:
+                for added in additions:
+                    if any(i in added for i in removed):
+                        continue  # Canceling spatial moves are already singles.
+                    target = occupations.copy()
+                    for i in removed:
+                        target[i] -= 1
+                    for a in added:
+                        target[a] += 1
+                    block = self._occupation_block(target)
+                    if block[0] and self.constraints.allowed(block):
+                        yield block
+
+    def _update_candidates(self, excitations):
+        sources = {((), ()), *(e.block for e in excitations)}
+        if not self._sources <= sources:
+            self._sources.clear()
+            self._candidates.clear()
+        for source in sorted(sources-self._sources):
+            self._candidates.update(self._neighbors(source))
+            # Retain missing scalar couplings of an already selected block.
+            if source[0] and self.constraints.allowed(source):
+                self._candidates.add(source)
+        self._sources = sources
+
+    def _support(self, block):
+        cached = self._support_rows.get(block)
+        if cached is None:
+            occupations = self._occupations(block)
+            opens = [i for i, n in enumerate(occupations) if n == 1]
+            index = sum(3 << (self.n_modes-2*i-2) for i, n in enumerate(occupations) if n == 2)
+            index |= sum(1 << (self.n_modes-2*i-2) for i in opens)  # beta spins
+            rows = []
+            for alpha in combinations(opens, len(opens)//2):
+                flipped = sum(3 << (self.n_modes-2*i-2) for i in alpha)
+                rows.append(self.address[index ^ flipped])
+            cached = self._support_rows[block] = np.asarray(rows, dtype=np.intp)
+        return cached
+
+    def _discover(self, vector, excitations):
+        self._update_candidates(excitations)
+        for block in sorted(self._candidates-self._blocks.keys()):
+            if np.any(vector[self._support(block)] != 0):
+                self._blocks[block] = singlet_excitations_for_block(*block)
+        blocks = sorted(self._candidates & self._blocks.keys())
+        if self._projector is None or blocks != self.blocks:
+            self.blocks = blocks
             generators, block_rows = [], []
             for i, block in enumerate(self.blocks):
                 generators.extend(self._blocks[block])
@@ -99,7 +154,7 @@ class SPQESelection:
     def select(self, vector, excitations, epsilon):
         if not np.isfinite(epsilon) or epsilon < 0:
             raise ValueError('Selection threshold must be finite and nonnegative')
-        self._discover(vector)
+        self._discover(vector, excitations)
         active_ids = tuple(e.id for e in excitations)
         if self._active_ids != active_ids:
             present = set(active_ids)
@@ -111,7 +166,10 @@ class SPQESelection:
                                    minlength=len(self.blocks)))
         scores = [(self.blocks[i], float(norms[i]), 'projective_residual')
                   for i in np.flatnonzero(norms)]
-        return _select_scores(scores, epsilon)
+        proposals, diagnostics = _select_scores(scores, epsilon)
+        diagnostics.update(candidate_blocks=len(self._candidates),
+                           source_blocks=len(self._sources))
+        return proposals, diagnostics
 
     def generators(self, block):
         """Reuse discovered blocks even after eviction from the shared LRU."""

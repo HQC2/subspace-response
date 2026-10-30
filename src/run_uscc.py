@@ -40,7 +40,7 @@ def parser():
     cli.add_argument('--active-orbitals', type=int)
     cli.add_argument('--max-rank', type=int, default=4, help='Maximum excitation rank for recursive operator growth (default: %(default)s)')
     cli.add_argument('--seed', choices=['screened', 'sd'], default='screened', help='Initial operator seed (default: %(default)s)')
-    cli.add_argument('--selection', choices=['uscc', 'spqe'], default='uscc', help='USCC amplitude/integral screening or exact SPQE cumulative residual selection')
+    cli.add_argument('--selection', choices=['uscc', 'spqe'], default='uscc', help='USCC amplitude/integral screening or SPQE residual selection in the single/double neighborhood')
     cli.add_argument('--trotter-steps', type=int, default=1)
     cli.add_argument('--orbital-irreps', nargs='+', type=int, help='Optional Abelian XOR irrep IDs in active orbital order')
     cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
