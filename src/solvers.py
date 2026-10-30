@@ -103,59 +103,158 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
     return x
 
 
-def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None, tol=1e-6, verbose=False):
-    if np.allclose(b, 0.0, atol=1e-20):
-        return b, history
+def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
+                      tol=1e-6, verbose=False, *, maxiter=500,
+                      denominator_floor=1e-10):
+    """Solve ``(A + (omega + i*gamma) I) x = b`` by response Davidson.
 
-    def matvec(v, A=A, omega=omega, gamma=gamma):
-        if np.allclose(v.imag, 0.):
-            Av = A(v)
+    The plus sign preserves this module's historical frequency convention.
+    ``tol`` is an absolute residual tolerance. ``A`` may be a matrix or a
+    vector callback; complex vectors are split for real-only Hessian callbacks.
+    ``hdiag`` is an approximate unshifted diagonal, or None for no preconditioner.
+
+    History contains orthonormal V and its *unshifted* AV, so the same operator
+    can reuse it across sources and shifts. The caller must discard history
+    when the operator or coordinate space changes. The bounded subspace uses
+    conjugate projections, double orthogonalization, and solution restarts.
+    Nonconvergence and singular systems raise RuntimeError, never return a
+    silently unconverged solution.
+    """
+    b = np.asarray(b)
+    if b.ndim != 1 or not np.all(np.isfinite(b)):
+        raise ValueError('Expected a finite response source vector')
+    n = len(b)
+    if hdiag is not None:
+        hdiag = np.asarray(hdiag)
+        if hdiag.shape != b.shape or not np.all(np.isfinite(hdiag)):
+            raise ValueError('Expected a finite diagonal matching the source')
+    if not np.isfinite(tol) or tol <= 0 or type(maxiter) is not int or maxiter < 1:
+        raise ValueError('Expected positive tolerance and iteration limit')
+    if not np.isfinite(denominator_floor) or denominator_floor <= 0:
+        raise ValueError('Expected a positive denominator floor')
+    shift = complex(0. if omega is None else omega, 0. if gamma is None else gamma)
+    if not np.isfinite(shift):
+        raise ValueError('Expected finite frequency shifts')
+    shift = shift if shift.imag else shift.real
+    matrix = None if callable(A) else np.asarray(A)
+    if matrix is not None and (matrix.shape != (n, n) or not np.all(np.isfinite(matrix))):
+        raise ValueError('Expected a finite square response matrix')
+    dtype = np.result_type(b, float, shift, hdiag if hdiag is not None else float,
+                           matrix if matrix is not None else float)
+    b = b.astype(dtype, copy=False)
+    if not np.any(b):
+        return np.zeros_like(b), history
+    limit = min(n, 64)
+
+    def matvec(v):
+        if matrix is not None:
+            result = matrix @ v
+        elif np.iscomplexobj(v) and np.any(v.imag):
+            result = np.asarray(A(v.real)) + 1j*np.asarray(A(v.imag))
         else:
-            Av_real = A(v.real)
-            Av_imag = A(v.imag)
-            Av = Av_real + 1j*Av_imag
-        return Av
+            result = np.asarray(A(v.real if np.iscomplexobj(v) else v))
+        if result.shape != b.shape or not np.all(np.isfinite(result)):
+            raise ValueError('Operator returned an invalid response vector')
+        return result
 
-    I = np.ones(len(hdiag))
-    S = np.zeros_like(I)
-    if omega is not None:
-        S = S - omega*I
-    if gamma is not None:
-        S = S - 1j*gamma*I
-
-    diagonal_guess = b/(hdiag)
-    if history is not None:
-        V = history['V']
-        AV = history['AV']
-        SV = np.zeros_like(V, dtype=np.complex128)
-        for i in range(V.shape[1]):
-            SV[:, i] = S*V[:, i]
+    if hdiag is None:
+        safe = np.ones(n)
     else:
-        V = diagonal_guess.astype(np.complex128).reshape(-1, 1)
-        AV = np.zeros_like(V, dtype=np.complex128)
-        SV = np.zeros_like(V, dtype=np.complex128)
-        AV[:, 0] = matvec(V[:, 0])
-        SV[:, 0] = S*V[:, 0]
+        diagonal = hdiag+shift
+        magnitude = abs(diagonal)
+        phase = np.divide(diagonal, magnitude, out=np.ones_like(diagonal), where=magnitude != 0)
+        safe = np.where(magnitude >= denominator_floor, diagonal, denominator_floor*phase)
 
-    bred = V.T @ b
-    for i in range(100):
-        Ered = V.T @ (AV - SV)
-        xred = np.linalg.solve(Ered, bred)
-        x = xred @ V.T
-        residual = b - (xred @ AV.T - S*x)
-        #       (equivalent to)
-        #       residual = b - (matvec(x) - S*x)
+    if history is None:
+        old_v = old_av = np.empty((n, 0), dtype=dtype)
+    else:
+        old_v, old_av = np.asarray(history['V']), np.asarray(history['AV'])
+        if old_v.ndim != 2 or old_v.shape[0] != n or old_av.shape != old_v.shape or not np.all(np.isfinite(old_v)) or not np.all(np.isfinite(old_av)):
+            raise ValueError('Davidson history does not match the response space')
+        if old_v.shape[1] > limit:
+            raise ValueError('Davidson history exceeds the bounded subspace')
+        dtype = np.result_type(dtype, old_v, old_av)
+    V = np.empty((n, limit), dtype=dtype)
+    AV = np.empty_like(V)
+    H = np.empty((limit, limit), dtype=dtype)
+    m = 0
+
+    def orthogonalize(v):
+        v = np.array(v, dtype=np.result_type(v, V.dtype), copy=True)
+        norm = scipy.linalg.norm(v)
+        if not norm:
+            return None
+        v /= norm
+        for _ in range(2):
+            v -= V[:, :m] @ (V[:, :m].conj().T @ v)
+        norm = scipy.linalg.norm(v)
+        return v/norm if norm > 1e-12 else None
+
+    def append(v, av=None):
+        nonlocal V, AV, H, m
+        image = matvec(v) if av is None else av
+        promoted = np.result_type(V, v, image)
+        if promoted != V.dtype:
+            V, AV, H = V.astype(promoted), AV.astype(promoted), H.astype(promoted)
+        V[:, m], AV[:, m] = v, image
+        H[:m+1, m] = V[:, :m+1].conj().T @ image
+        H[m, :m] = v.conj() @ AV[:, :m]
+        m += 1
+
+    # Histories produced by this implementation are already orthonormal. QR
+    # also repairs the old routine's unnormalized starting vector without new
+    # operator products, transforming AV by the same change of coordinates.
+    if old_v.shape[1]:
+        gram = old_v.conj().T @ old_v
+        if np.allclose(gram, np.eye(len(gram)), atol=1e-12, rtol=0):
+            V[:, :old_v.shape[1]], AV[:, :old_v.shape[1]] = old_v, old_av
+            m = old_v.shape[1]
+            H[:m, :m] = V[:, :m].conj().T @ AV[:, :m]
+        else:
+            q, r = np.linalg.qr(old_v, mode='reduced')
+            if np.min(abs(r.diagonal())) < 1e-12:
+                raise ValueError('Davidson history contains dependent vectors')
+            V[:, :len(r)], AV[:, :len(r)] = q, scipy.linalg.solve_triangular(r.T, old_av.T, lower=True).T
+            m = len(r)
+            H[:m, :m] = V[:, :m].conj().T @ AV[:, :m]
+    if not m:
+        append(orthogonalize(b/safe))
+    for iteration in range(maxiter):
+        reduced = H[:m, :m].copy()
+        reduced.flat[::m+1] += shift
+        projected_b = V[:, :m].conj().T @ b
+        try:
+            coefficients = np.linalg.solve(reduced, projected_b)
+        except np.linalg.LinAlgError:
+            coefficients = np.linalg.lstsq(reduced, projected_b, rcond=None)[0]
+        x = V[:, :m] @ coefficients
+        ax = AV[:, :m] @ coefficients
+        residual = b-ax-shift*x
+        residual_norm = scipy.linalg.norm(residual)
         if verbose:
-            print(f'Iteration {i+1:3d} residual norm: {np.linalg.norm(residual):6e}')
-        if np.linalg.norm(residual) < tol:
-            history = {'V': V, 'AV': AV}
-            return x, history
-        delta = residual/(hdiag)
-        delta = delta/np.linalg.norm(delta)
-        vnew = delta - V @ (V.T @ delta)
-        vnew = vnew/np.linalg.norm(vnew)
-        V = np.hstack([V, vnew[:, None]])
-        bred = V.T @ b
-        AV = np.hstack([AV, matvec(vnew)[:, None]])
-        SV = np.hstack([SV, (S*vnew)[:, None]])
-    raise ValueError('Not converged')
+            print(f'Iteration {iteration+1:3d} residual norm: {residual_norm:6e}')
+        if residual_norm <= tol:
+            return x, dict(V=V[:, :m].copy(), AV=AV[:, :m].copy())
+        if iteration+1 == maxiter:
+            break
+        if m == limit and m < n:
+            # Retain the current solution and its image without an A product.
+            norm = scipy.linalg.norm(x)
+            m = 0
+            if norm:
+                append(x/norm, ax/norm)
+        trial = orthogonalize(residual/safe)
+        if trial is None:
+            trial = orthogonalize(residual)
+        if trial is None:
+            # A singular reduced projection of an indefinite operator can
+            # leave its residual inside V. Its cached image supplies a Krylov
+            # direction without another expensive application of A.
+            for i in range(m):
+                trial = orthogonalize(AV[:, i])
+                if trial is not None:
+                    break
+        if trial is None or m == n:
+            break
+        append(trial)
+    raise RuntimeError(f'Response Davidson did not converge after {iteration+1} iterations (residual={residual_norm:.3e})')

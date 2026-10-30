@@ -16,6 +16,7 @@ from excitations import Excitation, singlet_excitations, singlet_excitations_for
 from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integrals
 from stateprep import stateprep
 from ucc_circuits import apply_ucc
+from uscc_optimizers import excitation_curvature, minimize_metric
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -107,7 +108,8 @@ class USCCSelector:
         if not np.isfinite(epsilon) or epsilon < 0:
             raise ValueError('Selection threshold must be finite and nonnegative')
         present = {e.id for e in excitations}
-        selected = {e.block for e in excitations if all(g.id in present for g in singlet_excitations_for_block(*e.block))}
+        blocks = {e.block for e in excitations}
+        selected = {block for block in blocks if all(g.id in present for g in singlet_excitations_for_block(*block))}
         return [(block, score, reason) for block, (score, reason) in sorted(self.scores(excitations, parameters).items(), key=lambda item: (-item[1][0], item[0])) if block not in selected and score >= epsilon]
 
 
@@ -118,7 +120,7 @@ class USCC:
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False, backend='sector', growth='paper', sector_threads=None):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, exhaustive=False, backend='sector', growth='paper', sector_threads=None, sector_kernels='auto', rotation_threads=None):
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
@@ -128,6 +130,12 @@ class USCC:
         if sector_threads is not None and (type(sector_threads) is not int or sector_threads < 1):
             raise ValueError('sector_threads must be a positive integer or None')
         self.sector_threads = sector_threads
+        if sector_kernels not in ('auto','native','numba','numpy'):
+            raise ValueError('sector_kernels must be auto, native, numba or numpy')
+        if rotation_threads is not None and (type(rotation_threads) is not int or rotation_threads < 1):
+            raise ValueError('rotation_threads must be a positive integer or None')
+        self.sector_kernels = sector_kernels
+        self.rotation_threads = rotation_threads
         self.integrals = integrals
         # The sector path uses spatial integrals directly. Materialize its JW
         # observable only when a caller actually requests H or a circuit.
@@ -152,7 +160,8 @@ class USCC:
         self.initialized = False
         self.needs_optimization = False
         self.stop_reason = 'not_started'
-        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='slsqp')
+        self.optimization_settings = dict(gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
+        self._optimizer_state = None
 
         @qml.qnode(self.device, diff_method='adjoint')
         def expectation_circuit(parameters, operator, vector=None):
@@ -236,11 +245,12 @@ class USCC:
         self.history = []
         self.provenance = {}
         self.stop_reason = 'not_started'
+        self._optimizer_state = None
 
     def _sector_simulator(self):
         if self._simulator is None:
             from uscc_simulator import SectorSimulator
-            self._simulator = SectorSimulator(self.integrals, sector_threads=self.sector_threads)
+            self._simulator = SectorSimulator(self.integrals, sector_threads=self.sector_threads, kernels=self.sector_kernels, rotation_threads=self.rotation_threads)
         return self._simulator
 
     def _sector_state(self, parameters, statevector):
@@ -257,10 +267,11 @@ class USCC:
             if state is not None:
                 simulator = self._sector_simulator()
                 operator = self._H if operator is None else operator
+                norm = np.vdot(state,state).real
                 def measure(op):
                     if op is self._integral_hamiltonian:
-                        return np.vdot(state,simulator.apply_hamiltonian(state)).real
-                    return simulator.expectation(state,op)
+                        return np.vdot(state,simulator.apply_hamiltonian(state)).real/norm
+                    return simulator.expectation(state,op)/norm
                 return [measure(op) for op in operator] if isinstance(operator,list) else measure(operator)
         return self.circuit(parameters,self.H if operator is None else operator,statevector)
 
@@ -322,11 +333,54 @@ class USCC:
         self.needs_optimization = bool(added) or self.needs_optimization
         return added, False
 
-    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='slsqp'):
-        if gradient_tolerance <= 0 or energy_tolerance <= 0 or maxiter < 1:
+    def _optimizer_context(self):
+        # Custom observables can be replaced independently of the integrals.
+        # Their runtime identity is valid in memory, but is never checkpointed.
+        observable = None if self._H is self._integral_hamiltonian else id(self._H)
+        digest = sha256()
+        for array in (self.integrals.one_body,self.integrals.two_body):
+            digest.update(np.asarray(array,dtype='<f8').tobytes())
+        digest.update(json.dumps(dict(constant=self.integrals.constant,electrons=self.integrals.electrons),sort_keys=True).encode())
+        return dict(fingerprint=digest.hexdigest(), trotter_steps=self.trotter_steps, observable=observable)
+
+    def _curvature_history(self, *, strict=False):
+        state = self._optimizer_state
+        if state is None:
+            return None
+        try:
+            n = len(state['ids'])
+            anchor = np.asarray(state['theta'], dtype=float)
+            s = np.asarray(state['s'], dtype=float)
+            y = np.asarray(state['y'], dtype=float)
+            if state['version'] != 1 or anchor.shape != (n,) or s.ndim != 2 or s.shape != y.shape or s.shape[1] != n or len(s)>10:
+                raise ValueError('Invalid optimizer curvature state dimensions')
+            with np.errstate(over='ignore',invalid='ignore'):
+                sy = np.sum(s*y,axis=1)
+            if not all(np.all(np.isfinite(a)) for a in (anchor,s,y,sy)) or np.any(sy <= 0):
+                raise ValueError('Invalid optimizer curvature state values')
+            if n>len(self.theta) or state['ids'] != [e.id for e in self.excitations[:n]] or state['context'] != self._optimizer_context() or not np.array_equal(anchor,self.theta[:n]) or np.any(self.theta[n:]):
+                if strict:
+                    raise ValueError('Optimizer curvature state does not match the saved wave function')
+                return None
+            return [(np.pad(a,(0,len(self.theta)-n)),np.pad(b,(0,len(self.theta)-n))) for a,b in zip(s,y)]
+        except (KeyError, TypeError, ValueError) as error:
+            if strict:
+                raise ValueError('Invalid optimizer curvature state') from error
+            return None
+
+    def optimize(self, *, gradient_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs'):
+        """Optimize with a physical diagonal metric and reusable L-BFGS pairs.
+
+        L-BFGS and DIIS require the requested L2 gradient tolerance; a tiny
+        energy change alone is insufficient. Failed calls preserve theta and
+        the previously accepted curvature state. DIIS starts with two metric
+        gradient steps; SLSQP and dense BFGS retain their SciPy implementations.
+        """
+        if not np.isfinite(gradient_tolerance) or not np.isfinite(energy_tolerance) or gradient_tolerance <= 0 or energy_tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
             raise ValueError('Optimization tolerances and iteration count must be positive')
-        if method.lower() not in ('slsqp','bfgs'):
-            raise ValueError('Optimizer must be slsqp or bfgs')
+        method = method.lower()
+        if method not in ('slsqp','bfgs','lbfgs','diis'):
+            raise ValueError('Optimizer must be slsqp, bfgs, lbfgs or diis')
         initial = self.theta.copy()
         old_energy, old_gradient = self.energy_and_gradient(initial)
         last = [initial.copy(), (old_energy,old_gradient)]
@@ -337,9 +391,26 @@ class USCC:
                 last[:] = [np.array(parameters,copy=True),self.energy_and_gradient(parameters)]
                 evaluations += 1
             return last[1]
+        reused = 0
         if not len(initial) or np.linalg.norm(old_gradient) <= gradient_tolerance:
             result = dict(success=True, message='Initial point converged', iterations=0)
             energy, gradient = old_energy, old_gradient
+        elif method in ('lbfgs','diis'):
+            history = self._curvature_history() if method == 'lbfgs' else None
+            reused = len(history) if history is not None else 0
+            res = minimize_metric(objective,initial,excitation_curvature(self.integrals,self.excitations),
+                                  gradient_tolerance=gradient_tolerance,maxiter=maxiter,history=history,
+                                  algorithm=method,scale_metric=True,memory=10 if method=='lbfgs' else 8,warmup=2)
+            accepted = bool(res.success and np.all(np.isfinite(res.jac)) and np.isfinite(res.fun) and res.fun <= old_energy+energy_tolerance)
+            if accepted:
+                self.theta = res.x.copy()
+                energy, gradient = float(res.fun), res.jac
+                pairs = res.history[-10:]
+                self._optimizer_state = dict(version=1,context=self._optimizer_context(),ids=[e.id for e in self.excitations],theta=self.theta.tolist(),
+                                             s=[s.tolist() for s,y in pairs],y=[y.tolist() for s,y in pairs]) if pairs else None
+            else:
+                energy, gradient = old_energy, old_gradient
+            result = dict(success=accepted,message=str(res.message),iterations=int(res.nit))
         else:
             options = dict(maxiter=maxiter)
             if method.lower() == 'slsqp':
@@ -351,10 +422,11 @@ class USCC:
             accepted = bool(np.isfinite(energy) and np.all(np.isfinite(gradient)) and energy <= old_energy+energy_tolerance and (res.success or np.linalg.norm(gradient) <= gradient_tolerance))
             if accepted:
                 self.theta = np.asarray(res.x, dtype=float)
+                self._optimizer_state = None
             else:
                 energy, gradient = old_energy, old_gradient
             result = dict(success=accepted, message=str(res.message), iterations=int(res.nit))
-        result.update(evaluations=evaluations, optimizer=method, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
+        result.update(evaluations=evaluations, optimizer=method, reused_curvature_pairs=reused, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
         self.needs_optimization = not result['success']
         return result
 
@@ -437,14 +509,17 @@ class USCC:
     def save_checkpoint(self, filename):
         filename = Path(filename)
         filename.parent.mkdir(parents=True, exist_ok=True)
+        optimizer_state = self._optimizer_state
+        if optimizer_state is not None and (optimizer_state['context']['observable'] is not None or self._curvature_history() is None):
+            optimizer_state = None
         data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
-                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive, backend=self.backend, growth=self.selector.growth, sector_threads=self.sector_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings)
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, exhaustive=self.selector.exhaustive, backend=self.backend, growth=self.selector.growth, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
         temporary.replace(filename)
 
     @classmethod
-    def from_checkpoint(cls, filename, *, device=None, backend=None, sector_threads=None):
+    def from_checkpoint(cls, filename, *, device=None, backend=None, sector_threads=None, sector_kernels=None, rotation_threads=None):
         data = json.loads(Path(filename).read_text())
         if data.get('version') != FORMAT_VERSION or data.get('convention') != CONVENTION:
             raise ValueError('Unsupported checkpoint schema or excitation convention')
@@ -457,6 +532,10 @@ class USCC:
             config['device'] = device
         if sector_threads is not None:
             config['sector_threads'] = sector_threads
+        if sector_kernels is not None:
+            config['sector_kernels'] = sector_kernels
+        if rotation_threads is not None:
+            config['rotation_threads'] = rotation_threads
         model = cls(ActiveSpaceIntegrals(**data['integrals']), metadata=data['metadata'], **config)
         if model._fingerprint() != data['fingerprint']:
             raise ValueError('Checkpoint integral/orbital fingerprint mismatch')
@@ -470,6 +549,8 @@ class USCC:
         model.set_excitations(excitations, data['parameters'])
         for name in ('history','provenance','schedule','threshold_index','initialized','needs_optimization','stop_reason','optimization_settings'):
             setattr(model, name, data[name])
+        model._optimizer_state = data.get('optimizer_state')
+        model._curvature_history(strict=True)
         if not isinstance(model.threshold_index, int) or model.threshold_index < 0 or (model.schedule is not None and model.threshold_index > len(model.schedule)):
             raise ValueError('Invalid checkpoint schedule position')
         return model

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from hashlib import sha256
 from itertools import combinations_with_replacement, permutations, product
 import json
@@ -241,7 +241,7 @@ class Excitation:
     def block(self):
         return self.spatial_holes, self.spatial_particles
 
-    @property
+    @cached_property
     def id(self):
         return sha256(json.dumps(self.to_dict(), sort_keys=True).encode()).hexdigest()[:24]
 

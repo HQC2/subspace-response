@@ -8,10 +8,9 @@ spin-coupling blocks within the supplied pool are promoted. Convergence refers
 to that finite pool.
 """
 from dataclasses import dataclass
-from types import SimpleNamespace
 import numpy as np
-from scipy.sparse.linalg import LinearOperator, gmres
 from uscc_response import USCCResponse
+from solvers import davidson_response
 
 
 @dataclass
@@ -24,6 +23,46 @@ class ResponseSelection:
     property_threshold: float
     response_threshold: float
     response_score: str
+
+
+def _residual_scores(candidates, external, residuals, shifts, threshold, floor):
+    """Exact promotion/max score with lazy diagonals and rigorous upper bounds.
+
+    Unmeasured rejected entries may retain upper bounds internally. They are
+    strictly below the threshold and no larger than the measured maximum, so
+    neither the selected set nor its reported maximum score changes.
+    """
+    scores = np.zeros(len(candidates.space))
+    if not len(external):
+        return scores
+    residuals = np.asarray(residuals)[:, external]
+    shifts = np.asarray(shifts)
+    upper = np.max(residuals/np.maximum(abs(shifts.imag), floor)[:, None], axis=0)
+    values = upper.copy()
+    measured = np.zeros(len(external), dtype=bool)
+
+    def evaluate(positions):
+        diagonal = candidates.diagonal(external[positions])
+        values[positions] = np.max(residuals[:, positions]/np.maximum(abs(diagonal[None, :]-shifts[:, None]), floor), axis=0)
+        measured[positions] = True
+
+    # Scores that can reach the threshold require exact denominators. Reuse
+    # previously measured entries even if their current upper bound is small.
+    cached = np.zeros(len(external), dtype=bool) if candidates._diagonal is None else np.isfinite(candidates._diagonal[external])
+    positions = np.flatnonzero((upper >= threshold) | cached)
+    if len(positions):
+        evaluate(positions)
+    best = float(np.max(values[measured])) if np.any(measured) else 0.
+    while True:
+        remaining = np.flatnonzero(~measured & (upper > best))
+        if not len(remaining):
+            break
+        # Batch the largest bounds while resolving the exact diagnostic max.
+        chosen = remaining[np.argsort(upper[remaining])[-32:]]
+        evaluate(chosen)
+        best = max(best, float(np.max(values[chosen])))
+    scores[external] = values
+    return scores
 
 
 def select_response(candidates, properties, *, property_threshold=1e-4,
@@ -61,7 +100,7 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
     excitations = candidates.space.excitations
     dimension = len(excitations)
     sources = np.array([candidates.property_vector(op) for op in properties])
-    diagonal = candidates.diagonal() if response_score == 'residual' else np.zeros(dimension)
+    diagonal = candidates.orbital_diagonal() if response_score == 'residual' else np.zeros(dimension)
     blocks = {}
     for i,excitation in enumerate(excitations):
         blocks.setdefault(excitation.block,[]).append(i)
@@ -80,14 +119,17 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
         P = np.array(sorted(selected),dtype=int)
         Q = np.array(sorted(set(range(dimension))-selected),dtype=int)
         scores = np.zeros(dimension)
+        residuals, residual_shifts = [], []
         max_external_norm, max_internal_norm = 0., 0.
         if response_score == 'coupling':
-            for i in P:
-                if i not in column_cache:
-                    unit = np.zeros(dimension); unit[i] = 1.
-                    column_cache[i] = candidates.matvec(unit)
+            missing = [i for i in P if i not in column_cache]
+            if missing:
+                measured = candidates.matrix_columns(missing)
+                column_cache.update(zip(missing, measured.T))
             columns = np.column_stack([column_cache[i] for i in P]) if len(P) else np.empty((dimension,0))
             diagonal[P] = np.diag(columns[P]).real
+            internal = columns[P]
+        inner_history = None
         for shift in branches:
             dtype = complex if shift.imag else float
             shift = shift if shift.imag else shift.real
@@ -97,30 +139,32 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
                 return full
             def matvec(vector):
                 if response_score == 'coupling':
-                    return columns[P] @ vector-shift*vector
-                return candidates.matvec(lift(vector))[P]-shift*vector
-            safe = diagonal[P]-shift
-            safe = np.where(abs(safe) > denominator_floor,safe,denominator_floor)
-            operator = LinearOperator((len(P),)*2,matvec=matvec,dtype=dtype)
-            preconditioner = LinearOperator(operator.shape,matvec=lambda v:v/safe,dtype=dtype)
+                    return internal @ vector
+                return candidates.matvec(lift(vector))[P]
             for source in sources:
                 rhs = source[P].astype(dtype)
                 if not np.any(rhs):
                     solution = np.zeros_like(rhs)
                 else:
-                    solution,info = gmres(operator,rhs,M=preconditioner,rtol=solver_tolerance,atol=0.,maxiter=500)
-                    if info:
-                        raise RuntimeError(f'Inner selected response solve did not converge (info={info})')
+                    solution,inner_history = davidson_response(matvec,rhs,diagonal[P],history=inner_history,
+                        omega=-complex(shift).real,gamma=-complex(shift).imag,tol=solver_tolerance*np.linalg.norm(rhs),
+                        denominator_floor=denominator_floor)
                 full = lift(solution)
                 applied = columns @ solution if response_score == 'coupling' else candidates.matvec(full)
                 residual = source-applied+shift*full
+                if np.linalg.norm(residual[P]) > solver_tolerance*np.linalg.norm(rhs)*1.01 and np.any(rhs):
+                    raise RuntimeError('Inner selected response solve did not converge (true residual)')
                 max_internal_norm = max(max_internal_norm,float(np.linalg.norm(residual[P])))
                 max_external_norm = max(max_external_norm,float(np.linalg.norm(residual[Q])))
                 if response_score == 'coupling':
                     contribution = np.max(abs(columns)*abs(solution)[None,:],axis=1) if len(P) else np.zeros(dimension)
                 else:
-                    contribution = abs(residual)/np.maximum(abs(diagonal-shift),denominator_floor)
+                    residuals.append(abs(residual))
+                    residual_shifts.append(shift)
+                    continue
                 scores = np.maximum(scores,contribution)
+        if response_score == 'residual':
+            scores = _residual_scores(candidates, Q, residuals, residual_shifts, response_threshold, denominator_floor)
         grown = promote(selected,scores,response_threshold)
         added = grown-selected
         history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_external_residual_norm=max_external_norm,max_internal_residual_norm=max_internal_norm,max_external_score=float(np.max(scores[Q])) if len(Q) else 0.,added=[excitations[i].id for i in sorted(added)]))
@@ -131,9 +175,9 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
             break
         selected = grown
     indices = tuple(sorted(selected))
-    if len(indices) == dimension:
-        response = candidates
+    if response_score == 'coupling':
+        response = candidates._restrict(indices, matrix=columns[P])
     else:
-        snapshot = SimpleNamespace(integrals=candidates.integrals,metadata=candidates.metadata,theta=candidates.theta,excitations=candidates.ground_excitations,trotter_steps=candidates.trotter_steps,sector_threads=candidates.simulator.sector_threads)
-        response = USCCResponse(snapshot,[excitations[i] for i in indices],dressing=candidates.dressing)
+        response = candidates if len(indices) == dimension else candidates._restrict(indices)
+    response._davidson_history = inner_history
     return ResponseSelection(response,indices,history,converged,'threshold_converged' if converged else 'cycle_limit',property_threshold,response_threshold,response_score)
