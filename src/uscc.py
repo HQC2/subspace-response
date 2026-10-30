@@ -113,7 +113,7 @@ class USCC:
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='sd', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
