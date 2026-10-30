@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from hashlib import sha256
-from itertools import combinations_with_replacement, product
+from itertools import combinations, combinations_with_replacement, product
 import json
 from math import comb
 
@@ -308,28 +308,55 @@ def singlet_excitations_for_block(spatial_holes, spatial_particles):
         if indices not in translated:
             translated[indices] = tuple(2*orbitals[i//2] + i%2 for i in indices)
         return translated[indices]
+    components = {}
+    def component(h, p, coefficient):
+        key = h, p, coefficient
+        if key not in components:
+            components[key] = ExcitationTerm(modes(h), modes(p), coefficient)
+        return components[key]
     return tuple(Excitation(holes, particles, i,
-                           tuple(ExcitationTerm(modes(h), modes(p), c)
+                           tuple(component(h, p, c)
                                  for (h, p), c in vector))
                  for i, vector in enumerate(template))
 
 
-def _unique_permutations(indices):
-    """Multiset permutations in the same lexicographic order as sorted(set(...))."""
-    counts = {i: indices.count(i) for i in sorted(set(indices))}
+def _spin_free_pairings(holes, particles):
+    """Lexicographic pairings, modulo commuting products sharing a hole.
+
+    E_ai and E_bi commute for disjoint occupied/virtual orbital sets. Keep
+    the first permutation of each repeated-hole group; later permutations
+    generate the identical vector and cannot enlarge the scalar basis.
+    """
+    counts = {i: particles.count(i) for i in sorted(set(particles))}
     prefix = []
     def visit():
-        if len(prefix) == len(indices):
+        if len(prefix) == len(particles):
             yield tuple(prefix)
             return
         for i, count in counts.items():
-            if count:
+            if count and (not prefix or holes[len(prefix)-1] != holes[len(prefix)] or prefix[-1] <= i):
                 counts[i] -= 1
                 prefix.append(i)
                 yield from visit()
                 prefix.pop()
                 counts[i] += 1
     yield from visit()
+
+
+def _scalar_monomials(holes, particles):
+    """Canonical monomials for all M_S=0 determinants of a spatial block."""
+    singles_h = sorted(i for i in set(holes) if holes.count(i) == 1)
+    singles_p = sorted(i for i in set(particles) if particles.count(i) == 1)
+    paired_h = tuple(2*i+s for i in sorted(set(holes)) if holes.count(i) == 2 for s in (0,1))
+    paired_p = tuple(2*i+s for i in sorted(set(particles)) if particles.count(i) == 2 for s in (0,1))
+    opens = len(singles_h)+len(singles_p)
+    keys = []
+    for alpha in combinations(range(opens), opens//2):
+        # A hole removes the opposite spin to the electron left behind.
+        hs = paired_h + tuple(2*h+int(i in alpha) for i,h in enumerate(singles_h))
+        ps = paired_p + tuple(2*p+int(i+len(singles_h) not in alpha) for i,p in enumerate(singles_p))
+        keys.append((tuple(sorted(hs)), tuple(sorted(ps))))
+    return sorted(keys)
 
 
 @lru_cache(maxsize=2048)
@@ -344,9 +371,25 @@ def _singlet_coupling_template(holes, particles):
     # basis is complete every remaining E product is necessarily dependent.
     half = open_shells//2
     singlets = comb(open_shells, half) - comb(open_shells, half+1)
-    for pairing in _unique_permutations(particles):
+    from uscc_kernels import orthogonalize
+    compiled = orthogonalize is not None and open_shells >= 8
+    if compiled:
+        keys = _scalar_monomials(holes, particles)
+        addresses = {key:i for i,key in enumerate(keys)}
+        vectors = np.zeros((singlets, len(keys)))
+        columns = np.empty(vectors.shape, dtype=np.int32)
+        counts = np.zeros(singlets, dtype=np.int32)
+    # A repeated hole must remove opposite spins. Generate those assignments
+    # directly, retaining the original lexicographic order of valid spin words.
+    choices = [((0,1), (1,0)) if holes.count(h) == 2 else ((0,), (1,))
+               for h in sorted(set(holes))]
+    spin_words = [tuple(spin for group in groups for spin in group) for groups in product(*choices)]
+    for pairing in _spin_free_pairings(holes, particles):
         raw = {}
-        for spins in product((0, 1), repeat=len(holes)):
+        repeated_particles = [(i,j) for i,p in enumerate(pairing) for j in range(i) if pairing[j] == p]
+        for spins in spin_words:
+            if any(spins[i] == spins[j] for i,j in repeated_particles):
+                continue
             word = tuple(op for h, p, spin in zip(holes, pairing, spins) for op in ((2*p+spin, True), (2*h+spin, False)))
             applied = apply_fermion_word(hf, n_modes, word)
             if applied is None:
@@ -360,18 +403,29 @@ def _singlet_coupling_template(holes, particles):
                 canonical_word = tuple((p, True) for p in ps) + tuple((h, False) for h in reversed(hs))
                 canonical_phases[key] = apply_fermion_word(hf, n_modes, canonical_word)[1]
             raw[key] = raw.get(key, 0.) + applied[1] / canonical_phases[key]
-        # Reorthogonalization stabilizes blocks with several spin couplings.
-        for _ in range(2):
-            for previous in basis:
-                overlap = sum(previous.get(k, 0.) * c for k, c in raw.items())
-                for k, c in previous.items():
-                    raw[k] = raw.get(k, 0.) - overlap*c
-        raw = {k: c for k, c in raw.items() if abs(c) > 1e-12}
-        norm = np.sqrt(sum(c*c for c in raw.values()))
-        if norm < 1e-10:
-            continue
-        sign = np.sign(raw[min(raw)])
-        basis.append({k: c/(norm*sign) for k, c in sorted(raw.items())})
+        if compiled:
+            values = np.zeros(len(keys))
+            order = np.empty(len(keys), dtype=np.int32)
+            for i,(key,value) in enumerate(raw.items()):
+                col = addresses[key]
+                values[col], order[i] = value, col
+            count = orthogonalize(values, order, len(raw), vectors, columns, counts, len(basis))
+            if not count:
+                continue
+            basis.append({keys[col]:vectors[len(basis), col] for col in columns[len(basis), :count]})
+        else:
+            # Reorthogonalization stabilizes blocks with several spin couplings.
+            for _ in range(2):
+                for previous in basis:
+                    overlap = sum(previous.get(k, 0.) * c for k, c in raw.items())
+                    for k, c in previous.items():
+                        raw[k] = raw.get(k, 0.) - overlap*c
+            raw = {k: c for k, c in raw.items() if abs(c) > 1e-12}
+            norm = np.sqrt(sum(c*c for c in raw.values()))
+            if norm < 1e-10:
+                continue
+            sign = np.sign(raw[min(raw)])
+            basis.append({k: c/(norm*sign) for k, c in sorted(raw.items())})
         if len(basis) == singlets:
             break
     return tuple(tuple(vector.items()) for vector in basis)

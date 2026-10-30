@@ -54,7 +54,7 @@ def parser():
     cli.add_argument('--backend', choices=['sector','pennylane'], default='sector', help='Ideal fixed-sector simulator (default) or circuit reference')
     cli.add_argument('--sector-threads', type=int, help='OpenMP threads for sector PySCF contractions; default uses PySCF settings')
     cli.add_argument('--sector-kernels', choices=['auto','native','numba','numpy'], default='auto', help='Rotation kernels: auto prefers the optional C++ module, then Numba, then NumPy')
-    cli.add_argument('--rotation-threads', type=int, help='Native rotation threads; default uses one for small sectors, otherwise up to four sector threads')
+    cli.add_argument('--rotation-threads', type=int, help='Rotation threads; default uses one for small sectors, otherwise up to two for Numba or four for native kernels')
     cli.add_argument('--device', default='lightning.qubit', help='PennyLane simulator, default %(default)s')
     cli.add_argument('--output-dir', type=Path, default=Path('uscc-output'))
     return cli

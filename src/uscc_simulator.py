@@ -30,6 +30,7 @@ class SectorSimulator:
         self.dimension = comb(self.n_orbitals, self.n_alpha)**2
         self._native_module = None
         self._forward = self._reverse = None
+        self._parallel_forward = self._parallel_reverse = None
         # Preserve use_numba=False as the NumPy oracle for existing callers.
         if kernels == 'auto' and not use_numba:
             kernels = 'numpy'
@@ -43,10 +44,13 @@ class SectorSimulator:
                 if kernels == 'native':
                     raise RuntimeError('Native kernels unavailable; build with python native/build.py') from error
         if self._native_module is None and kernels in ('auto','numba'):
-            from uscc_kernels import forward, reverse
+            from uscc_kernels import forward, reverse, parallel_forward, parallel_reverse
             self._forward, self._reverse = forward, reverse
+            self._parallel_forward, self._parallel_reverse = parallel_forward, parallel_reverse
         self.kernel_backend = 'native' if self._native_module is not None else 'numba' if self._forward is not None else 'numpy'
         strings = cistring.make_strings(range(self.n_orbitals), self.n_alpha)
+        self._strings = strings
+        self._spin_pairs = {}
         # PySCF uses alpha-major, beta-minor CI coefficients with all alpha
         # creators before beta creators. Our JW convention interleaves spins.
         interleaved = np.zeros(len(strings),dtype=np.int64)
@@ -113,15 +117,27 @@ class SectorSimulator:
             term = ExcitationTerm(holes,particles)
             if max(holes+particles) >= self.n_modes:
                 raise ValueError('Fermion mode outside the register')
-            hole_mask = sum(1 << (self.n_modes-h-1) for h in holes)
-            particle_mask = sum(1 << (self.n_modes-p-1) for p in particles)
-            flip_mask = hole_mask | particle_mask
-            source = np.flatnonzero((self.indices & flip_mask) == hole_mask)
-            destinations = self.indices[source] ^ flip_mask
-            positions = np.searchsorted(self._sorted_indices,destinations)
-            if np.any(positions == self.dimension) or np.any(self._sorted_indices[positions] != destinations):
+            if sum(h%2 for h in holes) != sum(p%2 for p in particles):
                 raise ValueError('Excitation leaves the fixed spin/electron sector')
-            target = self._index_order[positions]
+            # A monomial's allowed determinants are a Cartesian product of
+            # independent alpha/beta strings. Search those short string lists
+            # once, instead of scanning and searching the full squared sector.
+            spin_pairs = []
+            for spin in (0, 1):
+                hole_mask = sum(1 << (h//2) for h in holes if h%2 == spin)
+                particle_mask = sum(1 << (p//2) for p in particles if p%2 == spin)
+                masks = hole_mask, particle_mask
+                if masks not in self._spin_pairs:
+                    flip = hole_mask | particle_mask
+                    rows = np.flatnonzero((self._strings & flip) == hole_mask)
+                    targets = np.searchsorted(self._strings, self._strings[rows] ^ flip)
+                    self._spin_pairs[masks] = rows, targets
+                spin_pairs.append(self._spin_pairs[masks])
+            alpha, beta = spin_pairs
+            width = self.shape[1]
+            dtype = np.int32 if self.dimension <= np.iinfo(np.int32).max else np.int64
+            source = (alpha[0][:,None]*width + beta[0]).ravel().astype(dtype)
+            target = (alpha[1][:,None]*width + beta[1]).ravel().astype(dtype)
             # Fermion signs are parity of a fixed mask of the initial index,
             # plus the signs caused by earlier toggles in the operator word.
             parity_mask, toggled, constant = 0, 0, 0
@@ -134,7 +150,7 @@ class SectorSimulator:
             # XOR folding supports NumPy versions without bitwise_count.
             for shift in (32,16,8,4,2,1):
                 parity ^= parity >> shift
-            signs = 1.-2*((parity ^ constant) & 1)
+            signs = (1-2*((parity ^ constant) & 1)).astype(np.int8)
             self._pairs[key] = (source,target,signs)
         return self._pairs[key]
 
@@ -255,7 +271,26 @@ class SectorSimulator:
         # The measured large-sector default is conservative; explicit counts
         # permit tuning on machines/workloads with different scaling.
         available = self.sector_threads if self.sector_threads is not None else lib.num_threads()
-        return min(4,available) if self.dimension >= 200000 else 1
+        maximum = 1
+        if self._native_module is not None:
+            maximum = 4
+        elif self._parallel_forward is not None:
+            from numba import config
+            maximum = min(2, config.NUMBA_NUM_THREADS)
+        return min(maximum,available) if self.dimension >= 200000 else 1
+
+    def _run_numba_rotation(self, serial, parallel, *arguments):
+        threads = self.effective_rotation_threads()
+        if threads == 1:
+            serial(*arguments)
+            return
+        from numba import get_num_threads, set_num_threads
+        previous = get_num_threads()
+        try:
+            set_num_threads(threads)
+            parallel(*arguments)
+        finally:
+            set_num_threads(previous)
 
     @staticmethod
     def rotate(state, source, target, cosine, signed_sine):
@@ -283,7 +318,7 @@ class SectorSimulator:
                     ids,scales,starts,stops,sources,targets,signs = packed
                     self._adjoint_plan = (ids[::-1].copy(),-scales[::-1].copy(),starts[::-1].copy(),stops[::-1].copy(),sources,targets,signs)
                 packed = self._adjoint_plan
-            self._forward(parameters,state,*packed)
+            self._run_numba_rotation(self._forward, self._parallel_forward, parameters,state,*packed)
             return state
         if adjoint:
             plan = reversed(plan)
@@ -336,7 +371,8 @@ class SectorSimulator:
             self.native_plan().reverse(np.ascontiguousarray(parameters,dtype=float),state,costate,gradient,self.effective_rotation_threads())
             return energy,gradient
         if self._reverse is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')) and costate.dtype in (np.dtype('float64'),np.dtype('complex128')):
-            self._reverse(np.asarray(parameters,dtype=float),state,costate,gradient,*self.packed_plan())
+            self._run_numba_rotation(self._reverse, self._parallel_reverse,
+                                     np.asarray(parameters,dtype=float),state,costate,gradient,*self.packed_plan())
             return energy,gradient
         # Reverse both the state and costate: no tape or per-gate state storage.
         # dU/dtheta = scale*(tau-tau†)*U, evaluated before undoing each gate.
