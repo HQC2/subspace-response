@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Ground-state USCC or SPQE selection with VQE/PQE and JSON checkpoints."""
+"""Adaptive ground-state selection with VQE/PQE and JSON checkpoints."""
 import argparse
 import json
 from pathlib import Path
@@ -40,11 +40,11 @@ def parser():
     cli.add_argument('--active-orbitals', type=int)
     cli.add_argument('--max-rank', type=int, default=4, help='Maximum excitation rank for recursive operator growth (default: %(default)s)')
     cli.add_argument('--seed', choices=['screened', 'sd'], default='screened', help='Initial operator seed (default: %(default)s)')
-    cli.add_argument('--selection', choices=['uscc', 'spqe'], default='uscc', help='USCC amplitude/integral screening or SPQE residual selection in the single/double neighborhood')
+    cli.add_argument('--selection', choices=['uscc', 'spqe', 'linear-spqe', 'gradient'], default='uscc', help='Amplitude/integral, exact residual, first-order commutator residual or insertion-gradient screening; residual and gradient use the single/double neighborhood')
     cli.add_argument('--trotter-steps', type=int, default=1)
     cli.add_argument('--orbital-irreps', nargs='+', type=int, help='Optional Abelian XOR irrep IDs in active orbital order')
     cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
-    cli.add_argument('--thresholds', nargs='+', type=float, help='Decreasing selection thresholds; SPQE uses an excluded residual L2 budget in hartree')
+    cli.add_argument('--thresholds', nargs='+', type=float, help='Decreasing thresholds: SPQE/linear-SPQE excluded residual L2 budget; gradient individual absolute derivative (hartree per generator coefficient)')
     cli.add_argument('--gradient-tolerance', type=float)
     cli.add_argument('--residual-tolerance', type=float, help='PQE active residual L2 tolerance (default: 1e-6 hartree)')
     cli.add_argument('--energy-tolerance', type=float)
@@ -52,7 +52,7 @@ def parser():
     cli.add_argument('--max-cycles', type=int, default=50)
     cli.add_argument('--max-operators', type=int)
     cli.add_argument('--backend', choices=['sector','pennylane'], default='sector', help='Ideal fixed-sector simulator (default) or circuit reference')
-    cli.add_argument('--sector-threads', type=int, help='OpenMP threads for sector PySCF contractions; default uses PySCF settings')
+    cli.add_argument('--sector-threads', type=int, help='Worker budget for sector Hamiltonian contractions and gradient screening; default uses PySCF settings')
     cli.add_argument('--sector-kernels', choices=['auto','native','numba','numpy'], default='auto', help='Rotation kernels: auto prefers the optional C++ module, then Numba, then NumPy')
     cli.add_argument('--rotation-threads', type=int, help='Rotation threads; default uses one for small sectors, otherwise up to two for Numba or four for native kernels')
     cli.add_argument('--device', default='lightning.qubit', help='PennyLane simulator, default %(default)s')

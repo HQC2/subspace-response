@@ -2,6 +2,7 @@
 
 USCC uses a spin-adapted amplitude-times-integral heuristic. SPQE uses exact
 transformed residuals with either VQE energy or PQE residual optimization.
+Linear SPQE screens with sparse first-order commutator residuals.
 Gradient selection scores appended scalar directions on the current state.
 """
 from hashlib import sha256
@@ -20,6 +21,7 @@ from ucc_circuits import apply_ucc
 from uscc_optimizers import excitation_curvature, minimize_metric
 from spqe import ReferenceProjector, SPQESelection, solve_pqe
 from gradient_selection import GradientSelection
+from linear_spqe import LinearSPQESelection
 
 FORMAT_VERSION = 1
 CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
@@ -117,8 +119,8 @@ class USCC:
     response code, independently of this ground-state selection loop.
     """
     def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', selection='uscc', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
-        if selection not in ('uscc', 'spqe', 'gradient'):
-            raise ValueError('selection must be uscc, spqe or gradient')
+        if selection not in ('uscc', 'spqe', 'linear-spqe', 'gradient'):
+            raise ValueError('selection must be uscc, spqe, linear-spqe or gradient')
         self.selection = selection
         if backend not in ('sector','pennylane'):
             raise ValueError('backend must be sector or pennylane')
@@ -162,6 +164,7 @@ class USCC:
         self.optimization_settings = dict(gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs')
         self._optimizer_state = None
         self._spqe_selector = None
+        self._linear_spqe_selector = None
         self._gradient_selector = None
         self._projective_projector = None
 
@@ -363,6 +366,15 @@ class USCC:
     def _select(self, epsilon):
         if self.selection == 'uscc':
             return self.selector.select(self.excitations, self.theta, epsilon), {}
+        if self.selection == 'linear-spqe':
+            if self._H is not self._integral_hamiltonian:
+                raise ValueError('linear-spqe selection requires the integral Hamiltonian')
+            context = (id(self.integrals), id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
+            cached = self._linear_spqe_selector
+            if cached is None or cached[0] != context:
+                cached = self._linear_spqe_selector = (context, LinearSPQESelection(
+                    self.integrals, self.selector))
+            return cached[1].select(self.excitations, self.theta, epsilon)
         if self.selection == 'gradient':
             simulator = self._sector_simulator()
             context = (id(simulator), id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
@@ -416,6 +428,7 @@ class USCC:
         present = {e.id for e in self.excitations}
         for block, score, reason in proposals:
             cached = (self._spqe_selector if self.selection == 'spqe'
+                      else self._linear_spqe_selector if self.selection == 'linear-spqe'
                       else self._gradient_selector if self.selection == 'gradient' else None)
             try:
                 pool = cached[1].generators(block) if cached is not None else None
@@ -431,11 +444,10 @@ class USCC:
             added.extend(generators)
             present.update(e.id for e in generators)
         if added:
-            if self.selection == 'spqe':
+            if self.selection in ('spqe', 'linear-spqe'):
                 # Circuit order is the reverse of SPQE's algebraic product.
                 self.excitations[0:0] = reversed(added)
                 self.theta = np.pad(self.theta, (len(added),0))
-                self._optimizer_state = None
             else:
                 self.excitations.extend(added)
                 self.theta = np.pad(self.theta, (0,len(added)))
@@ -467,11 +479,25 @@ class USCC:
                 sy = np.sum(s*y,axis=1)
             if not all(np.all(np.isfinite(a)) for a in (anchor,s,y,sy)) or np.any(sy <= 0):
                 raise ValueError('Invalid optimizer curvature state values')
-            if n>len(self.theta) or state['ids'] != [e.id for e in self.excitations[:n]] or state['context'] != self._optimizer_context() or not np.array_equal(anchor,self.theta[:n]) or np.any(self.theta[n:]):
+            current = {e.id:i for i,e in enumerate(self.excitations)}
+            compatible = n <= len(self.theta) and len(set(state['ids'])) == n and all(identifier in current for identifier in state['ids'])
+            positions = np.array([current[identifier] for identifier in state['ids']], dtype=int) if compatible else np.empty(0,dtype=int)
+            new = np.ones(len(self.theta),dtype=bool)
+            new[positions] = False
+            # Zero-angle insertions preserve the old objective restriction.
+            # Keep the learned old block for prepended as well as appended
+            # rotations; reordered old rotations invalidate that restriction.
+            if (not compatible or np.any(np.diff(positions) <= 0) or state['context'] != self._optimizer_context()
+                    or not np.array_equal(anchor,self.theta[positions]) or np.any(self.theta[new])):
                 if strict:
                     raise ValueError('Optimizer curvature state does not match the saved wave function')
                 return None
-            return [(np.pad(a,(0,len(self.theta)-n)),np.pad(b,(0,len(self.theta)-n))) for a,b in zip(s,y)]
+            embedded = []
+            for a,b in zip(s,y):
+                full_s,full_y = np.zeros(len(self.theta)),np.zeros(len(self.theta))
+                full_s[positions],full_y[positions] = a,b
+                embedded.append((full_s,full_y))
+            return embedded
         except (KeyError, TypeError, ValueError) as error:
             if strict:
                 raise ValueError('Invalid optimizer curvature state') from error

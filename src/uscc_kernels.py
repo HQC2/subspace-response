@@ -137,8 +137,45 @@ def _orthogonalize(raw, order, count, basis, columns, counts, size):
     return count
 
 
+def _insertion_gradients(output, state, residual, width, enabled, a_starts, b_starts,
+                         sources, targets, signs):
+    for term in range(len(output)):
+        if not enabled[term]:
+            continue
+        left, right = 0., 0.
+        for a in range(a_starts[term], b_starts[term]):
+            for b in range(b_starts[term], a_starts[term+1]):
+                source = sources[a]*width+sources[b]
+                target = targets[a]*width+targets[b]
+                sign = signs[a]*signs[b]
+                left += sign*(np.conj(residual[target])*state[source]).real
+                right += sign*(np.conj(residual[source])*state[target]).real
+        output[term] = 2*(left-right)
+
+
+def _insertion_gradients_parallel(output, state, residual, width, enabled, a_starts, b_starts,
+                                  sources, targets, signs):
+    # Only independent monomials are split across workers. Each scalar sum
+    # retains its order, and no pair/state arrays are shared for mutation.
+    for term in prange(len(output)):
+        if not enabled[term]:
+            continue
+        left, right = 0., 0.
+        for a in range(a_starts[term], b_starts[term]):
+            for b in range(b_starts[term], a_starts[term+1]):
+                source = sources[a]*width+sources[b]
+                target = targets[a]*width+targets[b]
+                sign = signs[a]*signs[b]
+                left += sign*(np.conj(residual[target])*state[source]).real
+                right += sign*(np.conj(residual[source])*state[target]).real
+        output[term] = 2*(left-right)
+
+
 forward = None if njit is None else njit(cache=True)(_forward)
 reverse = None if njit is None else njit(cache=True)(_reverse)
 parallel_forward = None if njit is None else njit(cache=True, parallel=True)(_forward_parallel)
 parallel_reverse = None if njit is None else njit(cache=True, parallel=True)(_reverse_parallel)
 orthogonalize = None if njit is None else njit(cache=True)(_orthogonalize)
+
+insertion_gradients = None if njit is None else njit(cache=True)(_insertion_gradients)
+parallel_insertion_gradients = None if njit is None else njit(cache=True, parallel=True)(_insertion_gradients_parallel)
