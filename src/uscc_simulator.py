@@ -1,20 +1,26 @@
-"""Exact simulator acceleration for the existing factorized USCC circuit.
+"""Fixed-sector USCC simulation with product formulas or exact exponentials.
 
 A pure fermionic excitation couples disjoint pairs of determinants. Applying
 those signed plane rotations directly avoids its exponentially many Pauli
-rotations. Only a fixed (N_alpha,N_beta) sector is stored. This changes neither
-component ordering nor the accepted internal Trotter approximation.
+rotations. Only a fixed (N_alpha,N_beta) sector is stored. The default preserves
+component ordering and internal Trotter approximation. Exact scalar factors
+and a single summed exponential use sparse exponential actions instead.
 """
 from math import comb
 import numpy as np
 from scipy import sparse
+from scipy.sparse.linalg import expm_multiply
 from pyscf import lib
 from pyscf.fci import cistring, direct_spin1, spin_op
 from excitations import ExcitationTerm
+from ucc_evolution import component_schedule, validate_evolution
 
 
 class SectorSimulator:
-    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None, use_numba=True, kernels='auto', rotation_threads=None):
+    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None, use_numba=True, kernels='auto', rotation_threads=None, spin_adaptation='trotter', trotter_order=1):
+        validate_evolution(spin_adaptation, trotter_order)
+        self.spin_adaptation = spin_adaptation
+        self.trotter_order = trotter_order
         if sector_threads is not None and (type(sector_threads) is not int or sector_threads < 1):
             raise ValueError('sector_threads must be a positive integer or None')
         self.sector_threads = sector_threads
@@ -96,7 +102,9 @@ class SectorSimulator:
         self._native_plan = None
         self._excitations = None
         self._steps = None
+        self._order = None
         self._observables = {}
+        self._scalar_evolution = None
 
     def apply_hamiltonian(self, state):
         if self.hamiltonian is not None:
@@ -211,18 +219,70 @@ class SectorSimulator:
         return applied*self.phases+self.integrals.constant*vectors
 
     def plan(self, excitations, steps):
-        if self._steps != steps or self._excitations is None or len(excitations) != len(self._excitations) or any(a is not b for a,b in zip(excitations,self._excitations)):
-            if not isinstance(steps,int) or steps < 1:
-                raise ValueError('trotter_steps must be a positive integer')
+        validate_evolution(self.spin_adaptation, self.trotter_order, steps)
+        if self._steps != steps or self._order != self.trotter_order or self._excitations is None or len(excitations) != len(self._excitations) or any(a is not b for a,b in zip(excitations,self._excitations)):
             if self._native_module is not None:
                 self._build_native_pairs(excitations)
-            self._plan = tuple((i,term.coefficient/steps,*self.pairs(term.holes,term.particles)) for i,excitation in enumerate(excitations) for _ in range(steps) for term in excitation.terms)
+            self._plan = tuple((i,scale,*self.pairs(term.holes,term.particles))
+                               for i,excitation in enumerate(excitations)
+                               for term,scale in component_schedule(excitation,steps,self.trotter_order))
             self._packed_plan = None
             self._adjoint_plan = None
             self._native_plan = None
             # Keep references so object IDs cannot be recycled under the cache.
             self._excitations, self._steps = tuple(excitations), steps
+            self._order = self.trotter_order
         return self._plan
+
+    def generator(self, excitations, parameters):
+        """Sparse sum theta_i (T_i - T_i†) in the fixed electron sector.
+
+        Assemble a single CSR operator, merging shared monomials first. No
+        dense sector operator or exponential is formed. CSR contractions act
+        on all excitations together rather than applying sequential rotations.
+        """
+        coefficients = {}
+        for excitation, theta in zip(excitations, parameters):
+            for term in excitation.terms:
+                key = term.holes, term.particles
+                coefficients[key] = coefficients.get(key, 0.)+theta*term.coefficient
+        rows, cols, values = [], [], []
+        for (holes, particles), coefficient in coefficients.items():
+            if coefficient == 0:
+                continue
+            source, target, signs = self.pairs(holes, particles)
+            rows.extend((target, source))
+            cols.extend((source, target))
+            values.extend((coefficient*signs, -coefficient*signs))
+        if not rows:
+            return sparse.csr_matrix((self.dimension, self.dimension))
+        return sparse.coo_matrix((np.concatenate(values),
+                                  (np.concatenate(rows), np.concatenate(cols))),
+                                 shape=(self.dimension, self.dimension)).tocsr()
+
+    def _exponential_action(self, vectors, parameters, excitations, *, adjoint=False):
+        """Column-vector exponential actions, also accepting several columns."""
+        if self.spin_adaptation == 'exact':
+            generator = self.generator(excitations, parameters)
+            return expm_multiply(-generator if adjoint else generator, vectors, traceA=0.)
+        plan = self.scalar_evolution()
+        if vectors.ndim == 2:
+            return np.column_stack([plan.apply(v.copy(), parameters, excitations, adjoint=adjoint)
+                                    for v in vectors.T])
+        return plan.apply(vectors.copy(), parameters, excitations, adjoint=adjoint)
+
+    def scalar_evolution(self):
+        if self._scalar_evolution is None:
+            from uscc_scalar import ScalarEvolution
+            self._scalar_evolution = ScalarEvolution(self)
+        return self._scalar_evolution
+
+    def exponential_tangent(self, generator, excitation):
+        """L_exp(A, T-T†)|HF> via a sparse augmented exponential action."""
+        direction = self.generator((excitation,), (1.,))
+        augmented = sparse.bmat([[generator, direction], [None, generator]], format='csr')
+        initial = np.concatenate((np.zeros(self.dimension), self.initial))
+        return expm_multiply(augmented, initial, traceA=0.)[:self.dimension]
 
     def _build_native_pairs(self, excitations):
         missing = dict.fromkeys((term.holes,term.particles) for excitation in excitations
@@ -347,6 +407,9 @@ class SectorSimulator:
         if vector.shape != (self.dimension,) or not np.all(np.isfinite(vector)):
             raise ValueError('Expected a finite vector matching the determinant sector')
         state = np.array(vector,dtype=np.result_type(vector,float),copy=True)
+        validate_evolution(self.spin_adaptation, self.trotter_order, steps)
+        if self.spin_adaptation != 'trotter':
+            return self._exponential_action(state, parameters, excitations, adjoint=adjoint)
         plan = self.plan(excitations,steps)
         if self._native_module is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')):
             self.native_plan().forward(np.ascontiguousarray(parameters),state,self.effective_rotation_threads(),adjoint=adjoint)
@@ -380,8 +443,13 @@ class SectorSimulator:
             raise ValueError('Expected finite row vectors matching the electron sector')
         if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
             raise ValueError('Expected finite parameters matching the excitation list')
-        self.plan(excitations, steps)
+        validate_evolution(self.spin_adaptation, self.trotter_order, steps)
         states = np.array(vectors, dtype=np.result_type(vectors, float), order='C', copy=True)
+        if self.spin_adaptation != 'trotter':
+            if not len(states):
+                return states
+            return self._exponential_action(states.T, parameters, excitations, adjoint=adjoint).T.copy()
+        self.plan(excitations, steps)
         if len(states) == 1:
             states[0] = self.apply_unitary(states[0], parameters, excitations, steps, adjoint=adjoint)
             return states
@@ -407,6 +475,19 @@ class SectorSimulator:
         energy = float(np.vdot(state,costate).real)/norm
         costate = (costate-energy*state)/norm
         gradient = np.zeros(len(parameters))
+        if self.spin_adaptation == 'exact':
+            # d exp(A)/d theta_i is a Frechet derivative, not G_i exp(A).
+            # The upper-right block of exp([[A,G_i],[0,A]]) is L_exp(A,G_i).
+            # Its action on [0,HF] gives each tangent without a dense matrix
+            # or finite differences. Directions are independent of each other.
+            generator = self.generator(excitations, parameters)
+            for i, excitation in enumerate(excitations):
+                tangent = self.exponential_tangent(generator, excitation)
+                gradient[i] = 2*np.vdot(costate, tangent).real
+            return energy, gradient
+        if self.spin_adaptation == 'scalar':
+            gradient = self.scalar_evolution().apply(state, parameters, excitations, costate=costate)
+            return energy, gradient
         if self._native_module is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')) and costate.dtype in (np.dtype('float64'),np.dtype('complex128')):
             self.native_plan().reverse(np.ascontiguousarray(parameters,dtype=float),state,costate,gradient,self.effective_rotation_threads())
             return energy,gradient

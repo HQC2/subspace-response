@@ -105,7 +105,7 @@ class GradientSelection(ExcitationNeighborhood):
             index = base ^ sum(3 << (self.n_modes-2*i-2) for i in alpha)
             yield modes(self.hf_index & ~index), modes(index & ~self.hf_index)
 
-    def select(self, state, applied, excitations, epsilon):
+    def select(self, state, applied, excitations, epsilon, *, parameters=None):
         if not np.isfinite(epsilon) or epsilon < 0:
             raise ValueError('Selection threshold must be finite and nonnegative')
         self._update_candidates(excitations)
@@ -115,6 +115,33 @@ class GradientSelection(ExcitationNeighborhood):
         energy = float(np.vdot(state, applied).real/norm)
         residual = applied-energy*state
         floor = 64*np.finfo(float).eps*max(1., abs(energy), np.linalg.norm(applied)/np.sqrt(norm))
+        if self.simulator.spin_adaptation == 'exact':
+            # A new parameter lies inside the summed exponential. Its tangent
+            # is L_exp(A,G)|HF>, rather than the factorized insertion G|psi>.
+            parameters = np.asarray(parameters, dtype=float)
+            if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
+                raise ValueError('Full exponential gradient selection requires current parameters')
+            generator = self.simulator.generator(excitations, parameters)
+            proposals, evaluated, maximum = [], 0, 0.
+            for block in sorted(self._candidates):
+                if block not in self._blocks:
+                    self._blocks[block] = singlet_excitations_for_block(*block)
+                score = 0.
+                for excitation in self._blocks[block]:
+                    if excitation.id in present:
+                        continue
+                    tangent = self.simulator.exponential_tangent(generator, excitation)
+                    score = max(score, abs(float(2*np.vdot(residual, tangent).real/norm)))
+                    evaluated += 1
+                maximum = max(maximum, score)
+                if score > floor and score >= epsilon:
+                    proposals.append((block, score, 'gradient'))
+            proposals.sort(key=lambda item: (-item[1], item[0]))
+            return proposals, dict(candidate_blocks=len(self._candidates),
+                                   candidate_operators=evaluated, source_blocks=len(self._sources),
+                                   screened_blocks=0, evaluated_operators=evaluated,
+                                   max_evaluated_gradient=maximum,
+                                   max_candidate_gradient_bound=maximum)
         proposals, candidates, screened, evaluated = [], 0, 0, 0
         max_gradient = max_bound = 0.
 

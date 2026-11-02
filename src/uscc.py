@@ -18,6 +18,7 @@ from excitations import Excitation, singlet_excitations, singlet_excitations_for
 from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integrals
 from stateprep import stateprep
 from ucc_circuits import apply_ucc
+from ucc_evolution import component_schedule, validate_evolution
 from uscc_optimizers import excitation_curvature, minimize_metric
 from spqe import ReferenceProjector, SPQESelection, solve_pqe
 from gradient_selection import GradientSelection
@@ -46,12 +47,13 @@ class USCCSelector:
     max_rank limits the resulting candidates.
     """
     def __init__(self, integrals, max_rank=4, orbital_irreps=None):
-        if not isinstance(max_rank, int) or max_rank < 1:
-            raise ValueError('max_rank must be a positive integer')
+        if max_rank is not None and (type(max_rank) is not int or max_rank < 1):
+            raise ValueError('max_rank must be a positive integer or None (unlimited)')
         if orbital_irreps is not None and (len(orbital_irreps) != integrals.qubits//2 or any(not isinstance(i, (int, np.integer)) or i < 0 for i in orbital_irreps)):
             raise ValueError('Expected nonnegative Abelian XOR irrep IDs')
         self.integrals = integrals
-        self.max_rank = min(max_rank, integrals.electrons, integrals.qubits-integrals.electrons)
+        physical_rank = min(integrals.electrons, integrals.qubits-integrals.electrons)
+        self.max_rank = physical_rank if max_rank is None else min(max_rank, physical_rank)
         self.requested_max_rank = max_rank
         self.orbital_irreps = None if orbital_irreps is None else tuple(map(int, orbital_irreps))
         self.channels = integrals.excitation_channels()
@@ -84,6 +86,12 @@ class USCCSelector:
             for term in excitation.terms:
                 key = term.holes, term.particles
                 amplitudes[key] = amplitudes.get(key, 0.) + float(theta)*term.coefficient
+        if self.integrals.qubits <= 62:
+            from uscc_selection import product_scores
+            for block, (score, reason) in product_scores(self, amplitudes).items():
+                if score > scores.get(block, (-1., ''))[0]:
+                    scores[block] = score, reason
+            return scores
         nonzero_channels = [c for c in self.channels if abs(c.coefficient) > 0]
         for (holes, particles), amplitude in sorted(amplitudes.items()):
             if abs(amplitude) == 0:
@@ -117,8 +125,17 @@ class USCC:
     Parameters are physical generator coefficients, not legacy gate angles.
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
+
+    ``spin_adaptation='trotter'`` splits each scalar factor into component
+    rotations of order ``trotter_order`` (1 or 2). ``'scalar'`` exponentiates
+    whole scalar factors; ``'exact'`` exponentiates their sum (sector only).
     """
-    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', selection='uscc', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None):
+    def __init__(self, integrals, *, metadata=None, max_rank=4, seed='screened', selection='uscc', trotter_steps=1, device='lightning.qubit', orbital_irreps=None, backend='sector', sector_threads=None, sector_kernels='auto', rotation_threads=None, spin_adaptation='trotter', trotter_order=1):
+        validate_evolution(spin_adaptation, trotter_order, trotter_steps)
+        if spin_adaptation == 'exact' and backend != 'sector':
+            raise ValueError('spin_adaptation=exact requires the sector backend')
+        self.spin_adaptation = spin_adaptation
+        self.trotter_order = trotter_order
         if selection not in ('uscc', 'spqe', 'linear-spqe', 'gradient'):
             raise ValueError('selection must be uscc, spqe, linear-spqe or gradient')
         self.selection = selection
@@ -126,8 +143,6 @@ class USCC:
             raise ValueError('backend must be sector or pennylane')
         if seed not in ('sd', 'screened'):
             raise ValueError('seed must be sd or screened')
-        if not isinstance(trotter_steps, int) or trotter_steps < 1:
-            raise ValueError('trotter_steps must be a positive integer')
         if sector_threads is not None and (type(sector_threads) is not int or sector_threads < 1):
             raise ValueError('sector_threads must be a positive integer or None')
         self.sector_threads = sector_threads
@@ -176,7 +191,7 @@ class USCC:
                 if vector.shape not in ((2**self.qubits,1), (1,2**self.qubits)):
                     raise ValueError('Prepared state dimension does not match the active register')
                 stateprep(vector)
-            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
             if isinstance(operator, list):
                 return [qml.expval(op) for op in operator]
             return qml.expval(operator)
@@ -189,7 +204,7 @@ class USCC:
                 if vector.shape not in ((2**self.qubits,1), (1,2**self.qubits)):
                     raise ValueError('Prepared state dimension does not match the active register')
                 stateprep(vector)
-            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
             return qml.state()
         self.circuit = expectation_circuit
         self.circuit_state = state_circuit
@@ -197,7 +212,7 @@ class USCC:
         @qml.qnode(self.device, diff_method=None)
         def adjoint_state_circuit(parameters, vector):
             qml.StatePrep(vector, wires=range(self.qubits))
-            qml.adjoint(apply_ucc)(parameters, self.excitations, range(self.qubits), self.trotter_steps)
+            qml.adjoint(apply_ucc)(parameters, self.excitations, range(self.qubits), self.trotter_steps, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
             return qml.state()
         self.circuit_adjoint_state = adjoint_state_circuit
 
@@ -262,13 +277,17 @@ class USCC:
     def _sector_simulator(self):
         if self._simulator is None:
             from uscc_simulator import SectorSimulator
-            self._simulator = SectorSimulator(self.integrals, sector_threads=self.sector_threads, kernels=self.sector_kernels, rotation_threads=self.rotation_threads)
+            self._simulator = SectorSimulator(self.integrals, sector_threads=self.sector_threads, kernels=self.sector_kernels, rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
+        self._simulator.spin_adaptation = self.spin_adaptation
+        self._simulator.trotter_order = self.trotter_order
         return self._simulator
 
     def _sector_state(self, parameters, statevector):
         simulator = self._sector_simulator()
         initial = None if statevector is None else simulator.project_input(statevector)
         if statevector is not None and initial is None:
+            if self.spin_adaptation == 'exact':
+                raise ValueError('Exact exponential preparation must lie in the fixed electron/spin sector')
             return None  # Preserve full-register support for other sectors.
         return simulator.state(parameters,self.excitations,self.trotter_steps,initial)
 
@@ -399,7 +418,7 @@ class USCC:
                     matrix = qml.matrix(self.H, wire_order=range(self.qubits))
                 state = full_state[simulator.indices]
                 applied = (matrix @ full_state)[simulator.indices]
-            return cached[1].select(state, applied, self.excitations, epsilon)
+            return cached[1].select(state, applied, self.excitations, epsilon, parameters=self.theta)
         _, vector, indices = self.projective_residual_state()
         hf_index, address, context = self._projection_context(indices)
         context += (id(self.selector), self.selector.max_rank, self.selector.orbital_irreps)
@@ -414,14 +433,24 @@ class USCC:
         # has X/Y at the endpoints and the same Z support between alternating
         # sorted endpoint pairs. Count that support without expanding words.
         rotations, cnots = 0, 0
+        if self.spin_adaptation == 'trotter':
+            for excitation in self.excitations:
+                for term, _ in component_schedule(excitation, 1, self.trotter_order):
+                    modes = sorted(term.holes + term.particles)
+                    count = 1 << (2*term.rank-1)
+                    support = sum(b-a+1 for a,b in zip(modes[::2],modes[1::2]))
+                    rotations += count
+                    cnots += count*2*(support-1)
+        ranks = {str(r): 0 for r in range(1, (self.selector.requested_max_rank or self.selector.max_rank)+1)}
         for excitation in self.excitations:
-            for term in excitation.terms:
-                modes = sorted(term.holes + term.particles)
-                count = 1 << (2*term.rank-1)
-                support = sum(b-a+1 for a,b in zip(modes[::2],modes[1::2]))
-                rotations += count
-                cnots += count*2*(support-1)
-        return dict(parameters=len(self.theta), ranks={str(r):sum(e.rank == r for e in self.excitations) for r in range(1,self.selector.requested_max_rank+1)}, pauli_rotations=rotations*self.trotter_steps, estimated_parity_cnots=cnots*self.trotter_steps)
+            ranks[str(excitation.rank)] += 1
+        factor = self.trotter_steps
+        return dict(parameters=len(self.theta),
+                    ranks=ranks,
+                    spin_adaptation=self.spin_adaptation,
+                    trotter_order=self.trotter_order, trotter_steps=self.trotter_steps,
+                    pauli_rotations=rotations*factor if self.spin_adaptation == 'trotter' else None,
+                    estimated_parity_cnots=cnots*factor if self.spin_adaptation == 'trotter' else None)
 
     def _append_blocks(self, proposals, max_operators=None):
         added, limited = [], False
@@ -462,7 +491,11 @@ class USCC:
         for array in (self.integrals.one_body,self.integrals.two_body):
             digest.update(np.asarray(array,dtype='<f8').tobytes())
         digest.update(json.dumps(dict(constant=self.integrals.constant,electrons=self.integrals.electrons),sort_keys=True).encode())
-        return dict(fingerprint=digest.hexdigest(), trotter_steps=self.trotter_steps, observable=observable)
+        context = dict(fingerprint=digest.hexdigest(), trotter_steps=self.trotter_steps, observable=observable)
+        # Preserve optimizer compatibility for legacy first-order checkpoints.
+        if self.spin_adaptation != 'trotter' or self.trotter_order != 1:
+            context.update(spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
+        return context
 
     def _curvature_history(self, *, strict=False):
         state = self._optimizer_state
@@ -688,7 +721,7 @@ class USCC:
         if optimizer_state is not None and (optimizer_state['context']['observable'] is not None or self._curvature_history() is None):
             optimizer_state = None
         data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
-                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, selection=self.selection, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
+                    config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, selection=self.selection, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
         temporary.replace(filename)

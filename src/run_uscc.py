@@ -28,6 +28,18 @@ def read_xyz(filename):
         raise ValueError('Expected an XYZ file with atom count, comment, and element/x/y/z rows') from error
 
 
+def excitation_rank(value):
+    if value == 'unlimited':
+        return None
+    try:
+        rank = int(value)
+        if rank > 0:
+            return rank
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError('Expected a positive excitation rank or unlimited')
+
+
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.register('action', None, StoreExplicit)
@@ -38,10 +50,12 @@ def parser():
     cli.add_argument('--charge', type=int, default=0)
     cli.add_argument('--active-electrons', type=int)
     cli.add_argument('--active-orbitals', type=int)
-    cli.add_argument('--max-rank', type=int, default=4, help='Maximum excitation rank for recursive operator growth (default: %(default)s)')
+    cli.add_argument('--max-rank', type=excitation_rank, default=4, help='Maximum excitation rank, or unlimited for the active-space limit (default: %(default)s)')
     cli.add_argument('--seed', choices=['screened', 'sd'], default='screened', help='Initial operator seed (default: %(default)s)')
     cli.add_argument('--selection', choices=['uscc', 'spqe', 'linear-spqe', 'gradient'], default='uscc', help='Amplitude/integral, exact residual, first-order commutator residual or insertion-gradient screening; residual and gradient use the single/double neighborhood')
     cli.add_argument('--trotter-steps', type=int, default=1)
+    cli.add_argument('--trotter-order', type=int, choices=[1, 2], default=1, help='Internal component product formula order')
+    cli.add_argument('--spin-adaptation', choices=['trotter', 'scalar', 'exact'], default='trotter', help='Component product formula, exact scalar factors, or one full exponential (sector only)')
     cli.add_argument('--orbital-irreps', nargs='+', type=int, help='Optional Abelian XOR irrep IDs in active orbital order')
     cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
     cli.add_argument('--thresholds', nargs='+', type=float, help='Decreasing thresholds: SPQE/linear-SPQE excluded residual L2 budget; gradient individual absolute derivative (hartree per generator coefficient)')
@@ -67,7 +81,7 @@ def main(argv=None):
     print(args)
     try:
         if args.restart:
-            forbidden = {'unit','basis','charge','active_electrons','active_orbitals','max_rank','seed','selection','trotter_steps','orbital_irreps'}
+            forbidden = {'unit','basis','charge','active_electrons','active_orbitals','max_rank','seed','selection','trotter_steps','trotter_order','spin_adaptation','orbital_irreps'}
             if args.xyz is not None or provided & forbidden:
                 cli.error('Restart uses the saved molecule, orbitals, ansatz, and selection configuration')
             overrides = {key: getattr(args, key) for key in ('device','backend','sector_threads','sector_kernels','rotation_threads') if key in provided}
@@ -84,6 +98,7 @@ def main(argv=None):
                 unit=args.unit, active_electrons=args.active_electrons,
                 active_orbitals=args.active_orbitals, max_rank=args.max_rank,
                 seed=args.seed, selection=args.selection, trotter_steps=args.trotter_steps,
+                spin_adaptation=args.spin_adaptation, trotter_order=args.trotter_order,
                 device=args.device, orbital_irreps=args.orbital_irreps,
                 backend=args.backend, sector_threads=args.sector_threads,
                 sector_kernels=args.sector_kernels,

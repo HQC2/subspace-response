@@ -63,10 +63,12 @@ class USCCResponse:
         self.theta.flags.writeable = False
         self.ground_excitations = tuple(wavefunction.excitations)
         self.trotter_steps = wavefunction.trotter_steps
+        self.spin_adaptation = getattr(wavefunction, 'spin_adaptation', 'trotter')
+        self.trotter_order = getattr(wavefunction, 'trotter_order', 1)
         threads = wavefunction.sector_threads if sector_threads is None else sector_threads
         self.sector_kernels = getattr(wavefunction,'sector_kernels','auto')
         self.rotation_threads = getattr(wavefunction,'rotation_threads',None)
-        self.simulator = SectorSimulator(self.integrals,sector_threads=threads,kernels=self.sector_kernels if dressing == 'uscc' else 'numpy',rotation_threads=self.rotation_threads)
+        self.simulator = SectorSimulator(self.integrals,sector_threads=threads,kernels=self.sector_kernels if dressing == 'uscc' else 'numpy',rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
         if excitations is None:
             if type(max_rank) is not int or max_rank < 1:
                 raise ValueError('max_rank must be a positive integer')
