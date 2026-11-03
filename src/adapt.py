@@ -73,7 +73,7 @@ class adaptwfn(uccsd.uccsd):
                 grad = get_gradient(self.circuit, 1)(self, params, self.H)
                 return grad
             
-            res = minimize(energy, jac=jac, x0=self.theta, method='slsqp', tol=1e-12)
+            res = minimize(energy, jac=jac, x0=self.theta, method='L-BFGS-B', tol=1e-12)
             self.theta = res.x
             adapt_iter += 1
 

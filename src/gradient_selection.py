@@ -12,21 +12,6 @@ from excitation_neighborhood import ExcitationNeighborhood
 from excitations import singlet_excitations_for_block
 
 
-def insertion_gradient(simulator, excitation, state, residual):
-    """2 Re <(H-E)psi | dV/dtheta(0) psi>, before normalization.
-
-    At zero angle the derivative of the scalar's factorized circuit is the
-    sum of its monomial generators, independently of the Trotter step count.
-    No Hamiltonian application or tangent state allocation is needed here.
-    """
-    value = 0.
-    for term in excitation.terms:
-        source, target, signs = simulator.pairs(term.holes, term.particles)
-        value += term.coefficient*np.real(np.vdot(residual[target], signs*state[source])
-                                         - np.vdot(residual[source], signs*state[target]))
-    return float(2*value)
-
-
 def _pack_monomials(simulator, monomials):
     """Immutable compact tables, reusable while only the wave function changes."""
     sources, targets, signs, a_starts, b_starts = [], [], [], [0], []
@@ -72,12 +57,6 @@ def _contract_monomials(simulator, packed, state, residual, enabled):
             output[i] = 2*np.real(np.vdot(residual[target], sign*state[source])
                                   - np.vdot(residual[source], sign*state[target]))
     return output
-
-
-def monomial_gradients(simulator, monomials, state, residual):
-    """One-off contraction of unit monomials, without caching determinant pairs."""
-    return _contract_monomials(simulator, _pack_monomials(simulator, monomials),
-                               state, residual, np.ones(len(monomials), dtype=bool))
 
 
 class GradientSelection(ExcitationNeighborhood):

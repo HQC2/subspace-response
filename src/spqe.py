@@ -50,11 +50,6 @@ class ReferenceProjector:
         return _real_residuals(self.matrix @ vector)
 
 
-def project_residual(excitations, vector, address, hf_index, n_modes):
-    """One-off <Phi_mu|vector>; iterative callers reuse ReferenceProjector."""
-    return ReferenceProjector(excitations, address, hf_index, n_modes, len(vector)).project(vector)
-
-
 class SPQESelection(ExcitationNeighborhood):
     """Residual selection within the single/double neighborhood of selected CSFs.
 
@@ -123,11 +118,6 @@ class SPQESelection(ExcitationNeighborhood):
         diagnostics.update(candidate_blocks=len(self._candidates),
                            source_blocks=len(self._sources))
         return proposals, diagnostics
-
-
-def select_blocks(vector, indices, hf_index, n_modes, constraints, excitations, epsilon):
-    """One-off screening; the driver reuses SPQESelection across macroiterations."""
-    return SPQESelection(indices, hf_index, n_modes, constraints).select(vector, excitations, epsilon)
 
 
 def _select_scores(scores, epsilon):

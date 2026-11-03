@@ -10,8 +10,7 @@ from uccsd_circuits import UCCSD, UCCSD_exc, UCCSD_iH_exc
 import pyscf
 import excitations
 import copy
-from molecular_hamiltonian import get_molecular_hamiltonian, get_PE_hamiltonian
-import time
+from molecular_hamiltonian import get_molecular_hamiltonian
 import scipy
 from stateprep import stateprep
 
@@ -36,7 +35,7 @@ def _make_rdm1_on_mo(casdm1, ncore, ncas, nmo):
     return dm1
 
 class uccsd(object):
-    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None, PE=None):
+    def __init__(self, symbols, geometry, charge, basis, active_electrons=None, active_orbitals=None):
         atom_str = ''
         for symbol, coord in zip(symbols, geometry):
             atom_str += f'{symbol} {coord[0]} {coord[1]} {coord[2]}; '
@@ -143,7 +142,7 @@ class uccsd(object):
                 k = k + 1
         return rdm1_active
 
-    def ground_state(self, min_method='slsqp'):
+    def ground_state(self):
         def energy_and_jac(params):
             params = qml.numpy.array(params)
             energy = self.circuit(self, params, self.H)
@@ -151,7 +150,7 @@ class uccsd(object):
             print('energy = ', energy)
             return energy, grad
 
-        res = minimize(energy_and_jac, jac=True, x0=self.theta, method=min_method, tol=1e-12)
+        res = minimize(energy_and_jac, jac=True, x0=self.theta, method='L-BFGS-B', tol=1e-12)
         print(res)
         self.theta = res.x
 

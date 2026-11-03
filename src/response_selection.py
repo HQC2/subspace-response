@@ -97,9 +97,6 @@ class _CouplingColumns:
         self.indices = indices.copy()
         self.matrix = matrix
 
-    def project(self, indices):
-        return self.matrix
-
     def screen(self, weights, indices):
         external = np.ones(len(self.candidates.space), dtype=bool)
         external[indices] = False
@@ -197,22 +194,18 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
     amplitude_scale = max(np.linalg.norm(source) for source in sources)/denominator_floor
     coupling_columns = _CouplingColumns(candidates, response_threshold, amplitude_scale,
                                         approximation=COUPLING_MODES[response_score])
+    diagonal = candidates.orbital_diagonal()
     converged = False
     for cycle in range(max_cycles+1):
         P = np.array(sorted(selected),dtype=int)
-        Q = np.array(sorted(set(range(dimension))-selected),dtype=int)
         weights = np.zeros(len(P))
-        max_external_norm, max_internal_norm = 0., 0.
+        max_internal_norm = 0.
         coupling_columns.add(P)
-        internal = coupling_columns.project(P)
+        internal = coupling_columns.matrix
         inner_history = None
         for shift in branches:
             dtype = complex if shift.imag else float
             shift = shift if shift.imag else shift.real
-            def lift(vector):
-                full = np.zeros(dimension,dtype=np.result_type(vector,dtype))
-                full[P] = vector
-                return full
             def matvec(vector):
                 return internal @ vector
             for source in sources:
@@ -220,21 +213,18 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
                 if not np.any(rhs):
                     solution = np.zeros_like(rhs)
                 else:
-                    solution,inner_history = davidson_response(matvec,rhs,internal.diagonal().real,history=inner_history,
+                    solution,inner_history = davidson_response(matvec,rhs,diagonal[P],history=inner_history,
                         omega=-complex(shift).real,gamma=-complex(shift).imag,tol=solver_tolerance*np.linalg.norm(rhs),
                         denominator_floor=denominator_floor)
-                full = lift(solution)
-                applied = candidates.matvec(full)
-                residual = source-applied+shift*full
-                if np.linalg.norm(residual[P]) > solver_tolerance*np.linalg.norm(rhs)*1.01 and np.any(rhs):
+                residual = rhs-internal @ solution+shift*solution
+                if np.linalg.norm(residual) > solver_tolerance*np.linalg.norm(rhs)*1.01 and np.any(rhs):
                     raise RuntimeError('Inner selected response solve did not converge (true residual)')
-                max_internal_norm = max(max_internal_norm,float(np.linalg.norm(residual[P])))
-                max_external_norm = max(max_external_norm,float(np.linalg.norm(residual[Q])))
+                max_internal_norm = max(max_internal_norm,float(np.linalg.norm(residual)))
                 np.maximum(weights, abs(solution), out=weights)
         passed, maximum = coupling_columns.screen(weights, P)
         grown = promote(selected,passed,.5)
         added = grown-selected
-        history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_external_residual_norm=max_external_norm,max_internal_residual_norm=max_internal_norm,max_external_score=maximum,added=[excitations[i].id for i in sorted(added)]))
+        history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_internal_residual_norm=max_internal_norm,max_external_score=maximum,added=[excitations[i].id for i in sorted(added)]))
         history[-1].update(coupling_cache_bytes=coupling_columns.stored_bytes,
                            coupling_dense_columns=coupling_columns.dense_columns,
                            coupling_refined_columns=coupling_columns.refined_columns)

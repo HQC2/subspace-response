@@ -5,6 +5,7 @@ transformed residuals with either VQE energy or PQE residual optimization.
 Linear SPQE screens with sparse first-order commutator residuals.
 Gradient selection scores appended scalar directions on the current state.
 """
+from functools import cached_property
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,6 @@ import json
 import numpy as np
 import pennylane as qml
 import pyscf
-from scipy.optimize import minimize
 
 from excitations import Excitation, singlet_excitations, singlet_excitations_for_block
 from molecular_hamiltonian import ActiveSpaceIntegrals, get_active_space_integrals
@@ -162,7 +162,6 @@ class USCC:
         self.seed = seed
         self.trotter_steps = trotter_steps
         self.device_name = device
-        self.device = qml.device(device, wires=self.qubits)
         self.excitations = []
         self.theta = np.zeros(0)
         self.history = []
@@ -179,6 +178,13 @@ class USCC:
         self._gradient_selector = None
         self._projective_projector = None
 
+    @cached_property
+    def device(self):
+        return qml.device(self.device_name, wires=self.qubits)
+
+    @cached_property
+    def _circuits(self):
+        """Build the circuit reference only when a caller actually uses it."""
         @qml.qnode(self.device, diff_method='adjoint')
         def expectation_circuit(parameters, operator, vector=None):
             if vector is None:
@@ -202,15 +208,25 @@ class USCC:
                 stateprep(vector)
             apply_ucc(parameters, self.excitations, range(self.qubits), self.trotter_steps, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
             return qml.state()
-        self.circuit = expectation_circuit
-        self.circuit_state = state_circuit
 
         @qml.qnode(self.device, diff_method=None)
         def adjoint_state_circuit(parameters, vector):
             qml.StatePrep(vector, wires=range(self.qubits))
             qml.adjoint(apply_ucc)(parameters, self.excitations, range(self.qubits), self.trotter_steps, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
             return qml.state()
-        self.circuit_adjoint_state = adjoint_state_circuit
+        return expectation_circuit, state_circuit, adjoint_state_circuit
+
+    @cached_property
+    def circuit(self):
+        return self._circuits[0]
+
+    @cached_property
+    def circuit_state(self):
+        return self._circuits[1]
+
+    @cached_property
+    def circuit_adjoint_state(self):
+        return self._circuits[2]
 
     @property
     def H(self):
@@ -536,15 +552,15 @@ class USCC:
         L-BFGS and DIIS require the requested L2 gradient tolerance; a tiny
         energy change alone is insufficient. Failed calls preserve theta and
         the previously accepted curvature state. DIIS starts with two metric
-        gradient steps; SLSQP and dense BFGS retain their SciPy implementations.
+        gradient steps followed by safeguarded Pulay extrapolation.
         PQE instead solves projected equations to residual_tolerance, using
         gap-preconditioned updates and DIIS without energy gradients.
         """
         if not np.isfinite(gradient_tolerance) or not np.isfinite(residual_tolerance) or not np.isfinite(energy_tolerance) or gradient_tolerance <= 0 or residual_tolerance <= 0 or energy_tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
             raise ValueError('Optimization tolerances and iteration count must be positive')
         method = method.lower()
-        if method not in ('slsqp','bfgs','lbfgs','diis','pqe'):
-            raise ValueError('Optimizer must be slsqp, bfgs, lbfgs, diis or pqe')
+        if method not in ('lbfgs','diis','pqe'):
+            raise ValueError('Optimizer must be lbfgs, diis or pqe')
         if method == 'pqe':
             return self._optimize_pqe(residual_tolerance=residual_tolerance, maxiter=maxiter)
         initial = self.theta.copy()
@@ -561,7 +577,7 @@ class USCC:
         if not len(initial) or np.linalg.norm(old_gradient) <= gradient_tolerance:
             result = dict(success=True, message='Initial point converged', iterations=0)
             energy, gradient = old_energy, old_gradient
-        elif method in ('lbfgs','diis'):
+        else:
             history = self._curvature_history() if method == 'lbfgs' else None
             reused = len(history) if history is not None else 0
             res = minimize_metric(objective,initial,excitation_curvature(self.integrals,self.excitations),
@@ -577,21 +593,6 @@ class USCC:
             else:
                 energy, gradient = old_energy, old_gradient
             result = dict(success=accepted,message=str(res.message),iterations=int(res.nit))
-        else:
-            options = dict(maxiter=maxiter)
-            if method.lower() == 'slsqp':
-                options['ftol'] = energy_tolerance
-            else:
-                options.update(gtol=gradient_tolerance,norm=2)
-            res = minimize(objective,initial,method=method,jac=True,options=options)
-            energy, gradient = objective(res.x) if np.all(np.isfinite(res.x)) else (np.inf,old_gradient)
-            accepted = bool(np.isfinite(energy) and np.all(np.isfinite(gradient)) and energy <= old_energy+energy_tolerance and (res.success or np.linalg.norm(gradient) <= gradient_tolerance))
-            if accepted:
-                self.theta = np.asarray(res.x, dtype=float)
-                self._optimizer_state = None
-            else:
-                energy, gradient = old_energy, old_gradient
-            result = dict(success=accepted, message=str(res.message), iterations=int(res.nit))
         result.update(evaluations=evaluations, optimizer=method, reused_curvature_pairs=reused, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
         self.needs_optimization = not result['success']
         return result

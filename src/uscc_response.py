@@ -76,7 +76,6 @@ class USCCResponse:
         self.energy = float(np.vdot(self.ground_state,applied).real)
         self.ground_residual_norm = float(np.linalg.norm(applied-self.energy*self.ground_state))
         self.ground_state.flags.writeable = False
-        self._diagonal = None
         self._orbital_diagonal = None
         self._matrix = None
         self._solution_cache = OrderedDict()
@@ -99,7 +98,6 @@ class USCCResponse:
         result.space.ids = tuple(self.space.ids[i] for i in indices)
         result.space.columns = self.space.columns[:, indices]
         result._property_cache = {key: value[indices].copy() for key, value in self._property_cache.items()}
-        result._diagonal = None if self._diagonal is None else self._diagonal[indices].copy()
         result._orbital_diagonal = None if self._orbital_diagonal is None else self._orbital_diagonal[indices].copy()
         result._solution_cache = OrderedDict()
         result._davidson_history = None
@@ -108,7 +106,6 @@ class USCCResponse:
         result._matrix = None if matrix is None else np.array(matrix, copy=True)
         if result._matrix is not None:
             result._matrix.flags.writeable = False
-            result._diagonal = result._matrix.diagonal().real.copy()
         return result
 
     def _unitary(self, vector, *, adjoint=False):
@@ -136,7 +133,6 @@ class USCCResponse:
                 unit[i] = 0.
             matrix.flags.writeable = False
             self._matrix = matrix
-            self._diagonal = matrix.diagonal().real.copy()
         return self._matrix.copy()
 
     def matrix_columns(self, indices, *, batch_size=None, approximation='dressed'):
@@ -144,7 +140,7 @@ class USCCResponse:
 
         ``dressed`` uses U†HU; ``bare`` uses H; ``linear`` uses H+[H,A], with
         A=sum(theta_mu*(T_mu-T_mu†)). All subtract the fixed reference energy.
-        Only dressed columns populate exact matrix/diagonal caches. Each
+        Approximate columns never populate the exact matrix cache. Each
         sector-state buffer is bounded by the batch policy; no dense dressed
         basis or commutator matrix is constructed.
         """
@@ -174,10 +170,6 @@ class USCCResponse:
                                - self._selection_generator_action(applied))
             result[:, start:start+len(chosen)] = self.space.columns.conj().T @ applied.T
             result[chosen, start+np.arange(len(chosen))] -= self.energy
-        if len(indices) and approximation == 'dressed':
-            if self._diagonal is None:
-                self._diagonal = np.full(len(self.space), np.nan)
-            self._diagonal[indices] = result[indices, np.arange(len(indices))]
         return result
 
     def _selection_generator_action(self, states):
@@ -194,29 +186,6 @@ class USCCResponse:
                 result[:, target] += coefficient*signs*states[:, source]
                 result[:, source] -= coefficient*signs*states[:, target]
         return result
-
-    def diagonal(self, indices=None):
-        """Exact dressed diagonal, optionally evaluating only requested entries."""
-        if indices is None:
-            indices = np.arange(len(self.space))
-        else:
-            indices = self._column_indices(indices)
-        if self._diagonal is None:
-            if self._matrix is not None:
-                self._diagonal = self._matrix.diagonal().real.copy()
-            else:
-                self._diagonal = np.full(len(self.space), np.nan)
-        missing = np.unique(indices[np.isnan(self._diagonal[indices])])
-        batch_size = self._column_batch_size()
-        for start in range(0, len(missing), batch_size):
-            # <mu|U† H U|mu> needs only forward rotation sweeps.
-            chosen = missing[start:start+batch_size]
-            states = self.space.columns[:, chosen].T.toarray()
-            states = self.simulator.apply_unitary_batch(states, self.theta, self.ground_excitations, self.trotter_steps)
-            applied = self.simulator.apply_hamiltonian_batch(states)
-            for i, state, image in zip(chosen, states, applied):
-                self._diagonal[i] = np.vdot(state, image).real-self.energy
-        return self._diagonal[indices].copy()
 
     def _column_indices(self, indices):
         raw = np.asarray(indices)
@@ -236,12 +205,7 @@ class USCCResponse:
         operator. Coupling selection has no energy-denominator score.
         """
         if self._orbital_diagonal is None:
-            occupied = range(self.integrals.electrons//2)
-            eri = self.simulator.chemist_eri
-            eps = np.diag(self.integrals.one_body).copy()
-            for i in occupied:
-                eps += 2*np.einsum('pp->p', eri[:, :, i, i])-np.einsum('pp->p', eri[:, i, i, :])
-            self._orbital_diagonal = np.array([sum(eps[p] for p in e.spatial_particles)-sum(eps[h] for h in e.spatial_holes) for e in self.space.excitations])
+            self._orbital_diagonal = self.integrals.excitation_gaps(self.space.excitations)
         return self._orbital_diagonal.copy()
 
     def property_vector(self, one_body):
@@ -279,11 +243,10 @@ class USCCResponse:
         coefficients = np.asarray(meta['mo_coeff'])[:,core:core+self.simulator.n_orbitals]
         return -np.einsum('pi,xpq,qj->xij',coefficients,molecule.intor('int1e_r'),coefficients)
 
-    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500, preconditioner='orbital'):
+    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500):
         """Solve (K-(omega+i*gamma)I)x=source; audit the true residual.
 
-        Orbital gaps avoid constructing the entire exact dressed diagonal.
-        ``preconditioner='exact'`` retains that option; ``'none'`` disables it.
+        HF Fock excitation gaps precondition every response solve.
         Identical solves reuse a bounded cache on this frozen response context.
         """
         source = np.asarray(source)
@@ -291,19 +254,16 @@ class USCCResponse:
             raise ValueError('Expected a finite source matching the response space')
         if not np.isfinite(omega) or not np.isfinite(gamma) or not np.isfinite(tolerance) or tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
             raise ValueError('Expected finite shifts and positive solver tolerances/limits')
-        if preconditioner not in ('orbital','exact','none'):
-            raise ValueError('preconditioner must be orbital, exact or none')
         dtype = np.result_type(source,float,complex if gamma else float)
         source = source.astype(dtype,copy=False)
         if not np.any(source):
             return np.zeros_like(source)
         shift = omega+1j*gamma if gamma else omega
-        key = (source.dtype.str, source.tobytes(), shift, tolerance, maxiter, preconditioner)
+        key = (source.dtype.str, source.tobytes(), shift, tolerance, maxiter)
         if key in self._solution_cache:
             self._solution_cache.move_to_end(key)
             return self._solution_cache[key].copy()
-        diagonal = self.diagonal() if preconditioner == 'exact' else self.orbital_diagonal() if preconditioner == 'orbital' else None
-        solution, history = davidson_response(self.matvec,source,diagonal,history=self._davidson_history,
+        solution, history = davidson_response(self.matvec,source,self.orbital_diagonal(),history=self._davidson_history,
                                              omega=-omega,gamma=-gamma,tol=tolerance*np.linalg.norm(source),maxiter=maxiter)
         if not np.all(np.isfinite(solution)) or np.linalg.norm(self.matvec(solution)-shift*solution-source) > tolerance*np.linalg.norm(source)*1.01:
             raise RuntimeError('Response linear solve did not converge (true residual)')

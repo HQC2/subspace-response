@@ -58,7 +58,7 @@ def parser(*, description=__doc__):
     cli.add_argument('--trotter-order', type=int, choices=[1, 2], default=1, help='Internal component product formula order')
     cli.add_argument('--spin-adaptation', choices=['trotter', 'scalar', 'exact'], default='trotter', help='Component product formula, exact scalar factors, or one full exponential (sector only)')
     cli.add_argument('--orbital-irreps', nargs='+', type=int, help='Optional Abelian XOR irrep IDs in active orbital order')
-    cli.add_argument('--optimizer', choices=['lbfgs', 'slsqp','bfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
+    cli.add_argument('--optimizer', choices=['lbfgs','diis','pqe'], help='Default: VQE L-BFGS; pqe solves projected residual equations using gap updates and DIIS')
     cli.add_argument('--thresholds', nargs='+', type=float, help='Decreasing thresholds: SPQE/linear-SPQE excluded residual L2 budget; gradient individual absolute derivative (hartree per generator coefficient)')
     cli.add_argument('--gradient-tolerance', type=float)
     cli.add_argument('--residual-tolerance', type=float, help='PQE active residual L2 tolerance (default: 1e-6 hartree)')

@@ -23,7 +23,6 @@ def parser():
     response.add_argument('--damping', type=float, default=0., help='Nonnegative imaginary shift gamma (default: %(default)s)')
     response.add_argument('--response-tolerance', type=float, default=1e-9, help='Relative linear-solve tolerance (default: %(default)s)')
     response.add_argument('--response-maxiter', type=int, default=500, help='Linear solver iteration limit (default: %(default)s)')
-    response.add_argument('--preconditioner', choices=['orbital', 'exact', 'none'], default='orbital', help='Response linear-solve preconditioner (default: %(default)s)')
     selection = cli.add_argument_group('response operator selection (+V/+X; state-transfer LR equations are fixed)')
     selection.add_argument('--response-selection', choices=['full', *COUPLING_MODES], default='full', help='Full candidate pool, or +X coupling screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling). All choices solve correlated-USCC state-transfer LR equations (default: %(default)s)')
     selection.add_argument('--property-threshold', type=float, default=1e-4, help='+V threshold on absolute dipole coupling (default: %(default)s)')
@@ -85,7 +84,7 @@ def calculate_response(model, args):
     for omega in args.frequencies:
         options = dict(
             omega=omega, gamma=args.damping, tolerance=args.response_tolerance,
-            maxiter=args.response_maxiter, preconditioner=args.preconditioner)
+            maxiter=args.response_maxiter)
         tensor = np.array([[response.linear_response(a, b, **options) for b in operators] for a in operators])
         tensors.append(dict(omega=omega, gamma=args.damping,
                             real=tensor.real.tolist(), imag=tensor.imag.tolist()))
@@ -97,8 +96,7 @@ def calculate_response(model, args):
         reference_energy=response.energy, ground_residual_norm=response.ground_residual_norm,
         sector_dimension=response.simulator.dimension, candidate_dimension=candidate_dimension,
         response_dimension=len(response.space), response_ids=list(response.space.ids),
-        solver=dict(tolerance=args.response_tolerance, maxiter=args.response_maxiter,
-                    preconditioner=args.preconditioner),
+        solver=dict(tolerance=args.response_tolerance, maxiter=args.response_maxiter),
         polarizabilities=tensors,
         selection=dict(method=args.response_selection, converged=True, stop_reason='full_pool'))
     if selected is not None:

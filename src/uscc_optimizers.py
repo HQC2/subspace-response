@@ -9,13 +9,7 @@ from scipy.optimize import OptimizeResult
 
 def excitation_curvature(integrals, excitations):
     """Positive HF Fock estimate of the energy curvature: twice the gap."""
-    # g[p,q,r,s]=(p s|q r), whereas F uses chemists' (p q|r s).
-    eri = integrals.two_body.transpose(0, 3, 1, 2)
-    eps = np.diag(integrals.one_body).copy()
-    for i in range(integrals.electrons//2):
-        eps += 2*np.diag(eri[:, :, i, i])-np.diag(eri[:, i, i, :])
-    gaps = [sum(eps[p] for p in e.spatial_particles)-sum(eps[h] for h in e.spatial_holes) for e in excitations]
-    return np.maximum(2*np.asarray(gaps), .1)
+    return np.maximum(2*integrals.excitation_gaps(excitations), .1)
 
 
 def _line_search(objective, x, energy, gradient, direction, max_steps=24):

@@ -17,7 +17,7 @@ from ucc_evolution import component_schedule, validate_evolution
 
 
 class SectorSimulator:
-    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None, use_numba=True, kernels='auto', rotation_threads=None, spin_adaptation='trotter', trotter_order=1):
+    def __init__(self, integrals, max_dense_dimension=1024, *, sector_threads=None, kernels='auto', rotation_threads=None, spin_adaptation='trotter', trotter_order=1):
         validate_evolution(spin_adaptation, trotter_order)
         self.spin_adaptation = spin_adaptation
         self.trotter_order = trotter_order
@@ -37,9 +37,6 @@ class SectorSimulator:
         self._native_module = None
         self._forward = self._reverse = None
         self._parallel_forward = self._parallel_reverse = None
-        # Preserve use_numba=False as the NumPy oracle for existing callers.
-        if kernels == 'auto' and not use_numba:
-            kernels = 'numpy'
         if kernels in ('auto','native'):
             try:
                 import _uscc_native

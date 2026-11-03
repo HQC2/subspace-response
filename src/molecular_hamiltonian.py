@@ -53,6 +53,16 @@ class ActiveSpaceIntegrals:
     def spin_integrals(self):
         return spinorb_from_spatial(self.one_body, self.two_body)
 
+    def excitation_gaps(self, excitations):
+        """HF Fock excitation gaps in the active reference, without a floor."""
+        eri = self.two_body.transpose(0, 3, 1, 2)
+        energies = np.diag(self.one_body).copy()
+        for i in range(self.electrons//2):
+            energies += 2*np.diag(eri[:, :, i, i])-np.diag(eri[:, i, i, :])
+        return np.array([sum(energies[p] for p in e.spatial_particles)
+                         - sum(energies[h] for h in e.spatial_holes)
+                         for e in excitations], dtype=float)
+
     def hamiltonian(self):
         h, v = self.spin_integrals()
         interaction = reps.InteractionOperator(self.constant, h, .5*v)
@@ -90,23 +100,3 @@ def get_active_space_integrals(ucc):
 def get_molecular_hamiltonian(ucc):
     integrals = get_active_space_integrals(ucc)
     return integrals.hamiltonian(), integrals.qubits
-
-def get_PE_hamiltonian(ucc, v_PE):
-    mf = ucc.mf
-    mult = 1
-    active_electrons = ucc.active_electrons
-    active_orbitals = ucc.active_orbitals
-        
-    C = mf.mo_coeff
-    h1e_mo = np.einsum('uj,uv,vi->ij', C, v_PE, C)
-    
-    occupied_indices, active_indices = qml.qchem.active_space(sum(mf.mol.nelec), mf.mol.nao, mult, active_electrons, active_orbitals)
-    core_adjustment, one_body_integrals, two_body_integrals = reps.get_active_space_integrals(h1e_mo, np.zeros((ucc.m.nao,)*4), occupied_indices, active_indices)
-    constant = core_adjustment # normally + mf.energy_nuc(), but that is already counted in the gas-phase hamiltonian
-    one_body_coefficients, two_body_coefficients = spinorb_from_spatial(
-        one_body_integrals, two_body_integrals)
-    terms_molecular_hamiltonian = reps.InteractionOperator(
-        constant, one_body_coefficients, 1 / 2 * two_body_coefficients)
-    fermionic_hamiltonian = openfermion.transforms.get_fermion_operator(terms_molecular_hamiltonian)
-    H = openfermion.transforms.jordan_wigner(fermionic_hamiltonian)
-    return qml.qchem.convert.import_operator(H), 2*active_orbitals

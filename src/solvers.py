@@ -2,7 +2,6 @@
 
 import numpy as np
 import scipy
-import time
 from typing import Callable
 
 
@@ -201,22 +200,13 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
         H[m, :m] = v.conj() @ AV[:, :m]
         m += 1
 
-    # Histories produced by this implementation are already orthonormal. QR
-    # also repairs the old routine's unnormalized starting vector without new
-    # operator products, transforming AV by the same change of coordinates.
     if old_v.shape[1]:
         gram = old_v.conj().T @ old_v
-        if np.allclose(gram, np.eye(len(gram)), atol=1e-12, rtol=0):
-            V[:, :old_v.shape[1]], AV[:, :old_v.shape[1]] = old_v, old_av
-            m = old_v.shape[1]
-            H[:m, :m] = V[:, :m].conj().T @ AV[:, :m]
-        else:
-            q, r = np.linalg.qr(old_v, mode='reduced')
-            if np.min(abs(r.diagonal())) < 1e-12:
-                raise ValueError('Davidson history contains dependent vectors')
-            V[:, :len(r)], AV[:, :len(r)] = q, scipy.linalg.solve_triangular(r.T, old_av.T, lower=True).T
-            m = len(r)
-            H[:m, :m] = V[:, :m].conj().T @ AV[:, :m]
+        if not np.allclose(gram, np.eye(len(gram)), atol=1e-12, rtol=0):
+            raise ValueError('Davidson history must contain orthonormal vectors')
+        m = old_v.shape[1]
+        V[:, :m], AV[:, :m] = old_v, old_av
+        H[:m, :m] = V[:, :m].conj().T @ AV[:, :m]
     if not m:
         append(orthogonalize(b/safe))
     for iteration in range(maxiter):
