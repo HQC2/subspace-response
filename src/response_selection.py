@@ -10,7 +10,6 @@ to that finite pool.
 from dataclasses import dataclass
 import numpy as np
 from uscc_response import USCCResponse
-from solvers import davidson_response
 
 
 COUPLING_MODES = {'coupling': 'dressed', 'bare-coupling': 'bare', 'linear-coupling': 'linear'}
@@ -33,12 +32,11 @@ class _CouplingColumns:
 
     Sparse columns retain a bound on every omitted element. Screening checks
     that bound with the current amplitudes and remeasures only columns whose
-    omissions could change promotion or the reported external maximum.
+    omissions could change promotion.
     """
 
-    def __init__(self, candidates, threshold, amplitude_scale, *, approximation='dressed'):
+    def __init__(self, candidates, threshold, amplitude_scale):
         self.candidates = candidates
-        self.approximation = approximation
         self.threshold = threshold
         self.cutoff = threshold/(2*amplitude_scale) if amplitude_scale else np.inf
         if threshold == 0:
@@ -49,18 +47,11 @@ class _CouplingColumns:
         self.refined_columns = 0
 
     def _columns(self, indices):
-        if self.approximation == 'dressed':
-            return self.candidates.matrix_columns(indices)
-        return self.candidates.matrix_columns(indices, approximation=self.approximation)
+        return self.candidates.matrix_columns(indices)
 
     def _store(self, index, values, external, cutoff):
         magnitude = abs(values)
         keep = (magnitude >= cutoff) & external & (magnitude > 0)
-        # Keep an external maximizer even when all couplings are subthreshold.
-        # This usually resolves the exact diagnostic maximum without refinement.
-        strongest = np.argmax(np.where(external, magnitude, 0.))
-        if external[strongest] and magnitude[strongest]:
-            keep[strongest] = True
         rows = np.flatnonzero(keep)
         index_type = np.int32 if len(values) <= np.iinfo(np.int32).max else np.int64
         if len(rows)*(np.dtype(index_type).itemsize+values.dtype.itemsize) >= values.nbytes:
@@ -80,15 +71,12 @@ class _CouplingColumns:
         matrix[np.ix_(old_positions, old_positions)] = self.matrix
         external = np.ones(len(self.candidates.space), dtype=bool)
         external[indices] = False
-        # Approximate external couplings must never enter the selected LR
-        # matrix. Measure only its selected rows in a restricted exact context.
-        exact = self.candidates._restrict(indices) if self.approximation != 'dressed' else None
         batch_size = self.candidates._column_batch_size()
         for start in range(0, len(missing), batch_size):
             chosen = missing[start:start+batch_size]
             values = self._columns(chosen)
             positions = np.searchsorted(indices, chosen)
-            internal = values[indices] if exact is None else USCCResponse.matrix_columns(exact, positions)
+            internal = values[indices]
             matrix[:, positions] = internal
             # Hermiticity supplies new rows of previously measured columns.
             matrix[np.ix_(positions, old_positions)] = internal[old_positions].T
@@ -100,9 +88,10 @@ class _CouplingColumns:
     def screen(self, weights, indices):
         external = np.ones(len(self.candidates.space), dtype=bool)
         external[indices] = False
+        if self.threshold == 0:
+            return external
         while True:
-            passed = external.copy() if self.threshold == 0 else np.zeros_like(external)
-            maximum = 0.
+            passed = np.zeros_like(external)
             bounds = np.empty(len(indices))
             for position, (index, weight) in enumerate(zip(indices, weights)):
                 rows, data, omitted = self.columns[index]
@@ -116,18 +105,14 @@ class _CouplingColumns:
                     active = external[rows]
                     rows, values = rows[active], abs(data[active])*weight
                 passed[rows[values >= self.threshold]] = True
-                maximum = max(maximum, float(np.max(values, initial=0.)))
-            unresolved = bounds > maximum
-            if self.threshold:
-                unresolved |= bounds >= self.threshold
-            positions = np.flatnonzero(unresolved)
+            positions = np.flatnonzero(bounds >= self.threshold)
             if not len(positions):
-                return passed, maximum
+                return passed
             # Only unresolved omissions trigger another screening-column pass.
             positions = positions[np.argsort(bounds[positions])[-self.candidates._column_batch_size():]]
             chosen = indices[positions]
             values = self._columns(chosen)
-            target = min(self.threshold, maximum)/2
+            target = self.threshold/2
             for position, index, column in zip(positions, chosen, values.T):
                 self._store(index, column, external, target/weights[position])
             self.refined_columns += len(chosen)
@@ -140,6 +125,68 @@ class _CouplingColumns:
     @property
     def dense_columns(self):
         return sum(rows is None for rows, _, _ in self.columns.values())
+
+
+class _ConnectedCouplings:
+    """Recompute weighted external scores by streaming connected CSF elements.
+
+    The native path visits Slater--Condon singles/doubles and generator words.
+    Contributions to a CSF are summed before taking an absolute value. It
+    retains no selected/candidate columns. The portable oracle streams bounded
+    batches through the existing operator actions, without a column cache.
+    """
+
+    def __init__(self, candidates, threshold, *, approximation):
+        self.candidates, self.threshold, self.approximation = candidates, threshold, approximation
+        self.native = None
+        sim = candidates.simulator
+        module = sim._native_module
+        if module is not None and hasattr(module, 'ConnectedScreening') and sim.n_orbitals <= 31:
+            coefficients = {}
+            if approximation == 'linear':
+                for excitation, theta in zip(candidates.ground_excitations, candidates.theta):
+                    for term in excitation.terms:
+                        key = term.holes, term.particles
+                        coefficients[key] = coefficients.get(key, 0.)+theta*term.coefficient
+            rules, amplitudes = [], []
+            for (holes, particles), coefficient in coefficients.items():
+                if not coefficient:
+                    continue
+                _, _, parity, constant = sim.excitation_layout(holes, particles)
+                source = sum(1 << (sim.n_modes-h-1) for h in holes)
+                target = sum(1 << (sim.n_modes-p-1) for p in particles)
+                rules.append((source, source | target, parity, constant))
+                amplitudes.append(coefficient)
+            C = candidates.space.columns
+            self.native = module.ConnectedScreening(
+                np.ascontiguousarray(candidates.integrals.one_body), sim.chemist_eri,
+                sim._strings, sim.indices, sim.phases,
+                C.indptr, C.indices, C.data,
+                np.asarray(rules, dtype=np.uint64).reshape(-1, 4), np.asarray(amplitudes, dtype=float))
+
+    def screen(self, weights, indices):
+        external = np.ones(len(self.candidates.space), dtype=bool)
+        external[indices] = False
+        if self.threshold == 0:
+            return external
+        if not np.any(external) or not np.any(weights):
+            return np.zeros_like(external)
+        if self.native is not None:
+            sim = self.candidates.simulator
+            from pyscf import lib
+            return self.native.screen(np.ascontiguousarray(indices, dtype=np.int64),
+                                      np.ascontiguousarray(weights), self.threshold,
+                                      self.approximation == 'linear', sim.sector_threads or lib.num_threads())
+        else:
+            passed = np.zeros(len(self.candidates.space), dtype=bool)
+            size = self.candidates._column_batch_size()
+            for start in range(0, len(indices), size):
+                chosen = indices[start:start+size]
+                values = self.candidates.matrix_columns(chosen, approximation=self.approximation)
+                passed |= np.any(abs(values)*weights[start:start+size] >= self.threshold, axis=1)
+            return external & passed
+
+    stored_bytes = dense_columns = refined_columns = 0
 
 
 def select_response(candidates, properties, *, property_threshold=1e-4,
@@ -177,54 +224,51 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
     if not branches:
         raise ValueError('At least one frequency shift is required')
     excitations = candidates.space.excitations
-    dimension = len(excitations)
     sources = np.array([candidates.property_vector(op) for op in properties])
     blocks = {}
     for i,excitation in enumerate(excitations):
         blocks.setdefault(excitation.block,[]).append(i)
-    def promote(selected,scores,threshold):
+    def promote(selected,passed):
         promoted = set(selected)
-        for indices in blocks.values():
-            if np.max(scores[indices]) >= threshold:
-                promoted.update(indices)
+        for i in np.flatnonzero(passed):
+            promoted.update(blocks[excitations[i].block])
         return promoted
     selected = {i for i,e in enumerate(excitations) if e.rank <= seed_rank}
-    selected = promote(selected,np.max(abs(sources),axis=0),property_threshold)
+    selected = promote(selected,np.any(abs(sources) >= property_threshold, axis=0))
     history = []
-    amplitude_scale = max(np.linalg.norm(source) for source in sources)/denominator_floor
-    coupling_columns = _CouplingColumns(candidates, response_threshold, amplitude_scale,
-                                        approximation=COUPLING_MODES[response_score])
-    diagonal = candidates.orbital_diagonal()
+    approximation = COUPLING_MODES[response_score]
+    if approximation == 'dressed':
+        amplitude_scale = max(np.linalg.norm(source) for source in sources)/denominator_floor
+        coupling_columns = _CouplingColumns(candidates, response_threshold, amplitude_scale)
+    else:
+        coupling_columns = _ConnectedCouplings(candidates, response_threshold, approximation=approximation)
     converged = False
+    previous, previous_indices = None, None
     for cycle in range(max_cycles+1):
         P = np.array(sorted(selected),dtype=int)
         weights = np.zeros(len(P))
         max_internal_norm = 0.
-        coupling_columns.add(P)
-        internal = coupling_columns.matrix
-        inner_history = None
+        if approximation == 'dressed':
+            coupling_columns.add(P)
+            response = candidates._restrict(P, matrix=coupling_columns.matrix)
+        else:
+            response = candidates._restrict(P)
+            response._retain_solution_images = True
+            if previous is not None:
+                response._seed_from_response(previous, np.searchsorted(P, previous_indices))
         for shift in branches:
             dtype = complex if shift.imag else float
             shift = shift if shift.imag else shift.real
-            def matvec(vector):
-                return internal @ vector
             for source in sources:
                 rhs = source[P].astype(dtype)
-                if not np.any(rhs):
-                    solution = np.zeros_like(rhs)
-                else:
-                    solution,inner_history = davidson_response(matvec,rhs,diagonal[P],history=inner_history,
-                        omega=-complex(shift).real,gamma=-complex(shift).imag,tol=solver_tolerance*np.linalg.norm(rhs),
-                        denominator_floor=denominator_floor)
-                residual = rhs-internal @ solution+shift*solution
-                if np.linalg.norm(residual) > solver_tolerance*np.linalg.norm(rhs)*1.01 and np.any(rhs):
-                    raise RuntimeError('Inner selected response solve did not converge (true residual)')
-                max_internal_norm = max(max_internal_norm,float(np.linalg.norm(residual)))
+                solution, residual_norm = response._solve(rhs, omega=complex(shift).real,
+                    gamma=complex(shift).imag, tolerance=solver_tolerance, denominator_floor=denominator_floor)
+                max_internal_norm = max(max_internal_norm, residual_norm)
                 np.maximum(weights, abs(solution), out=weights)
-        passed, maximum = coupling_columns.screen(weights, P)
-        grown = promote(selected,passed,.5)
+        passed = coupling_columns.screen(weights, P)
+        grown = promote(selected,passed)
         added = grown-selected
-        history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_internal_residual_norm=max_internal_norm,max_external_score=maximum,added=[excitations[i].id for i in sorted(added)]))
+        history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_internal_residual_norm=max_internal_norm,added=[excitations[i].id for i in sorted(added)]))
         history[-1].update(coupling_cache_bytes=coupling_columns.stored_bytes,
                            coupling_dense_columns=coupling_columns.dense_columns,
                            coupling_refined_columns=coupling_columns.refined_columns)
@@ -234,7 +278,8 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
         if cycle == max_cycles:
             break
         selected = grown
+        previous, previous_indices = response, P
     indices = tuple(sorted(selected))
-    response = candidates._restrict(indices, matrix=internal)
-    response._davidson_history = inner_history
+    response._solution_images.clear()
+    response._retain_solution_images = False
     return ResponseSelection(response,indices,history,converged,'threshold_converged' if converged else 'cycle_limit',property_threshold,response_threshold,response_score)

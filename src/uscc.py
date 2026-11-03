@@ -338,6 +338,7 @@ class USCC:
         return float(gradient_function.forward), np.asarray(gradient,dtype=float)
 
     def diagnostics(self):
+        """Explicit spin/particle audit; optimization does not run this circuit."""
         if self.backend == 'sector':
             simulator = self._sector_simulator()
             state = simulator.state(self.theta,self.excitations,self.trotter_steps)
@@ -593,7 +594,7 @@ class USCC:
             else:
                 energy, gradient = old_energy, old_gradient
             result = dict(success=accepted,message=str(res.message),iterations=int(res.nit))
-        result.update(evaluations=evaluations, optimizer=method, reused_curvature_pairs=reused, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources(), **self.diagnostics())
+        result.update(evaluations=evaluations, optimizer=method, reused_curvature_pairs=reused, energy=float(energy), gradient_norm=float(np.linalg.norm(gradient)), **self.resources())
         self.needs_optimization = not result['success']
         return result
 
@@ -622,7 +623,7 @@ class USCC:
         return dict(success=bool(res.success), message=str(res.message), iterations=int(res.nit),
                     evaluations=evaluations, optimizer='pqe', energy=float(energy),
                     residual_norm=float(np.linalg.norm(residual)),
-                    **self.resources(), **self.diagnostics())
+                    **self.resources())
 
     def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, residual_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None):
         if thresholds is None:
@@ -695,12 +696,7 @@ class USCC:
                 return self.result()
 
     def result(self):
-        projective = {}
-        if self.selection == 'spqe' or self.optimization_settings.get('method') == 'pqe':
-            _, vector, indices = self.projective_residual_state()
-            residuals = self._reference_projector(indices).project(vector)
-            projective = dict(full_residual_norm=float(np.linalg.norm(vector)), residual_norm=float(np.linalg.norm(residuals)))
-        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(method=self.selection, seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **projective, **self.resources(), **self.diagnostics(), history=list(self.history))
+        return dict(energy=float(self.expectation()), stop_reason=self.stop_reason, selection=dict(method=self.selection, seed=self.seed, threshold_index=self.threshold_index, thresholds=self.schedule, requested_max_rank=self.selector.requested_max_rank, effective_max_rank=self.selector.max_rank), **self.resources(), history=list(self.history))
 
     def _fingerprint(self):
         digest = sha256()

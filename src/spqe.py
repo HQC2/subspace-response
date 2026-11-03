@@ -132,8 +132,7 @@ def _select_scores(scores, epsilon):
         else:
             selected.append(proposal)
     selected.sort(key=lambda item: (-item[1], item[0]))
-    return selected, dict(candidate_residual_norm=float(np.linalg.norm([s for _, s, _ in scores])),
-                          excluded_residual_norm=float(discarded))
+    return selected, dict(excluded_residual_norm=float(discarded))
 
 
 def solve_pqe(objective, initial, gaps, *, residual_tolerance=1e-6, maxiter=300, memory=8):

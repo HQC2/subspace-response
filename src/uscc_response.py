@@ -12,7 +12,7 @@ from scipy.sparse.linalg import LinearOperator, eigsh
 from pyscf import lib
 from pyscf.fci import cistring, direct_spin1
 
-from excitations import singlet_excitations
+from excitations import apply_fermion_word, singlet_excitations
 from uscc_simulator import SectorSimulator
 from solvers import davidson_response
 
@@ -26,16 +26,33 @@ class ResponseSpace:
         if len(set(self.ids)) != len(self.ids):
             raise ValueError('Duplicate response excitation IDs')
         hf_index = int(simulator.indices[np.flatnonzero(simulator.initial)[0]])
-        rows, cols, data = [], [], []
-        for col,excitation in enumerate(self.excitations):
+        nnz = sum(len(e.terms) for e in self.excitations)
+        index_type = np.int32 if max(simulator.dimension, nnz) <= np.iinfo(np.int32).max else np.int64
+        rows, data = np.empty(nnz, dtype=index_type), np.empty(nnz)
+        starts = np.empty(len(self.ids)+1, dtype=index_type)
+        starts[0] = position = 0
+        block, references = None, {}
+        for column, excitation in enumerate(self.excitations):
+            if excitation.block != block:
+                block, references = excitation.block, {}
             for term in excitation.terms:
-                if any(h >= simulator.integrals.electrons for h in term.holes) or any(p < simulator.integrals.electrons or p >= simulator.n_modes for p in term.particles):
-                    raise ValueError('Response excitation is incompatible with the active reference')
-                result = term.apply(hf_index,simulator.n_modes)
-                if result is None or result[0] not in simulator.address:
-                    raise ValueError('Response excitation leaves the active spin/electron sector')
-                rows.append(simulator.address[result[0]]); cols.append(col); data.append(result[1])
-        self.columns = sparse.csc_array((data,(rows,cols)),shape=(simulator.dimension,len(self.ids)))
+                key = term.holes, term.particles
+                if key not in references:
+                    if any(h >= simulator.integrals.electrons for h in term.holes) or any(p < simulator.integrals.electrons or p >= simulator.n_modes for p in term.particles):
+                        raise ValueError('Response excitation is incompatible with the active reference')
+                    result = apply_fermion_word(hf_index, simulator.n_modes, term.word)
+                    if result is None or result[0] not in simulator.address:
+                        raise ValueError('Response excitation leaves the active spin/electron sector')
+                    # Cache the fermionic phase independently of the scalar
+                    # coupling coefficient shared by this occupation block.
+                    references[key] = simulator.address[result[0]], result[1]
+                row, phase = references[key]
+                rows[position], data[position] = row, phase*term.coefficient
+                position += 1
+            starts[column+1] = position
+        self.columns = sparse.csc_array((data, rows, starts),
+                                       shape=(simulator.dimension,len(self.ids)))
+        self.columns.sort_indices()
         gram_error = self.columns.T @ self.columns-sparse.eye_array(len(self.ids),format='csc')
         if gram_error.nnz and np.max(abs(gram_error.data)) > 1e-10:
             raise ValueError('Response reference states must be orthonormal')
@@ -79,6 +96,8 @@ class USCCResponse:
         self._orbital_diagonal = None
         self._matrix = None
         self._solution_cache = OrderedDict()
+        self._solution_images = OrderedDict()
+        self._retain_solution_images = False
         self._davidson_history = None
         self._property_cache = {}
         self._one_body_links = None
@@ -100,6 +119,8 @@ class USCCResponse:
         result._property_cache = {key: value[indices].copy() for key, value in self._property_cache.items()}
         result._orbital_diagonal = None if self._orbital_diagonal is None else self._orbital_diagonal[indices].copy()
         result._solution_cache = OrderedDict()
+        result._solution_images = OrderedDict()
+        result._retain_solution_images = False
         result._davidson_history = None
         if matrix is None and self._matrix is not None:
             matrix = self._matrix[np.ix_(indices, indices)]
@@ -117,9 +138,43 @@ class USCCResponse:
             raise ValueError('Expected a finite vector matching the response space')
         if self._matrix is not None:
             return self._matrix @ vector
-        state = self._unitary(self.space.columns @ vector)
+        return self.space.columns.conj().T @ self._sector_matvec(vector)
+
+    def _sector_matvec(self, vector):
+        """Unprojected exact K action, also used to carry solutions across growth."""
+        reference = self.space.columns @ vector
+        state = self._unitary(reference)
         applied = self._unitary(self.simulator.apply_hamiltonian(state),adjoint=True)
-        return self.space.columns.conj().T @ applied-self.energy*vector
+        return applied-self.energy*reference
+
+    def _seed_from_response(self, previous, positions):
+        """Prolong audited solutions and their exact images to a larger space.
+
+        Added coordinates are zero in each trial solution. Its full sector
+        image already contains the new rows, so no operator calls are needed.
+        Double orthogonalization applies identical transformations to V/AV.
+        """
+        vectors, images = [], []
+        dtype = np.result_type(*[image.dtype for image in previous._solution_images.values()], float)
+        for key, image in previous._solution_images.items():
+            if key not in previous._solution_cache:
+                continue
+            solution = previous._solution_cache[key][0]
+            vector = np.zeros(len(self.space), dtype=dtype)
+            vector[positions] = solution
+            applied = np.asarray(self.space.columns.conj().T @ image, dtype=dtype)
+            for _ in range(2):
+                for v, av in zip(vectors, images):
+                    coefficient = np.vdot(v, vector)
+                    vector -= coefficient*v
+                    applied -= coefficient*av
+            norm = np.linalg.norm(vector)
+            if norm > 1e-12*np.linalg.norm(solution):
+                vectors.append(vector/norm)
+                images.append(applied/norm)
+        if vectors:
+            self._davidson_history = dict(V=np.column_stack(vectors), AV=np.column_stack(images))
+        previous._solution_images.clear()
 
     def matrix(self):
         """Explicit small-system oracle; iterative solvers use matvec instead."""
@@ -174,18 +229,7 @@ class USCCResponse:
 
     def _selection_generator_action(self, states):
         """Apply A to independent row states without assembling a sector matrix."""
-        coefficients = {}
-        for excitation, theta in zip(self.ground_excitations, self.theta):
-            for term in excitation.terms:
-                key = term.holes, term.particles
-                coefficients[key] = coefficients.get(key, 0.)+theta*term.coefficient
-        result = np.zeros_like(states)
-        for (holes, particles), coefficient in coefficients.items():
-            if coefficient:
-                source, target, signs = self.simulator.pairs(holes, particles)
-                result[:, target] += coefficient*signs*states[:, source]
-                result[:, source] -= coefficient*signs*states[:, target]
-        return result
+        return self.simulator.apply_generator_batch(states, self.theta, self.ground_excitations)
 
     def _column_indices(self, indices):
         raw = np.asarray(indices)
@@ -243,35 +287,55 @@ class USCCResponse:
         coefficients = np.asarray(meta['mo_coeff'])[:,core:core+self.simulator.n_orbitals]
         return -np.einsum('pi,xpq,qj->xij',coefficients,molecule.intor('int1e_r'),coefficients)
 
-    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500):
+    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500, denominator_floor=1e-10):
         """Solve (K-(omega+i*gamma)I)x=source; audit the true residual.
 
         HF Fock excitation gaps precondition every response solve.
         Identical solves reuse a bounded cache on this frozen response context.
         """
+        return self._solve(source, omega=omega, gamma=gamma, tolerance=tolerance,
+                           maxiter=maxiter, denominator_floor=denominator_floor)[0]
+
+    def _solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500, denominator_floor=1e-10):
+        """Return the solution and its audited residual norm for selection."""
         source = np.asarray(source)
         if source.shape != (len(self.space),) or not np.all(np.isfinite(source)):
             raise ValueError('Expected a finite source matching the response space')
-        if not np.isfinite(omega) or not np.isfinite(gamma) or not np.isfinite(tolerance) or tolerance <= 0 or type(maxiter) is not int or maxiter < 1:
+        if not np.isfinite(omega) or not np.isfinite(gamma) or not np.isfinite(tolerance) or tolerance <= 0 or type(maxiter) is not int or maxiter < 1 or not np.isfinite(denominator_floor) or denominator_floor <= 0:
             raise ValueError('Expected finite shifts and positive solver tolerances/limits')
         dtype = np.result_type(source,float,complex if gamma else float)
         source = source.astype(dtype,copy=False)
         if not np.any(source):
-            return np.zeros_like(source)
+            return np.zeros_like(source), 0.
         shift = omega+1j*gamma if gamma else omega
-        key = (source.dtype.str, source.tobytes(), shift, tolerance, maxiter)
-        if key in self._solution_cache:
-            self._solution_cache.move_to_end(key)
-            return self._solution_cache[key].copy()
+        key = (source.dtype.str, source.tobytes(), shift, tolerance, maxiter, denominator_floor)
+        for cached, (solution, residual_norm) in self._solution_cache.items():
+            if cached[:3] == key[:3] and cached[3] <= tolerance:
+                self._solution_cache.move_to_end(cached)
+                return solution.copy(), residual_norm
         solution, history = davidson_response(self.matvec,source,self.orbital_diagonal(),history=self._davidson_history,
-                                             omega=-omega,gamma=-gamma,tol=tolerance*np.linalg.norm(source),maxiter=maxiter)
-        if not np.all(np.isfinite(solution)) or np.linalg.norm(self.matvec(solution)-shift*solution-source) > tolerance*np.linalg.norm(source)*1.01:
+                                             omega=-omega,gamma=-gamma,tol=tolerance*np.linalg.norm(source),maxiter=maxiter,
+                                             denominator_floor=denominator_floor)
+        if self._retain_solution_images and self._matrix is None:
+            image = self._sector_matvec(solution)
+            applied = self.space.columns.conj().T @ image
+            self._solution_images[key] = image
+            # These are a few converged-solution images, never K columns or a
+            # full dressed basis. Bound retained payload to 64 MiB.
+            limit = max(0, 64*1024**2//image.nbytes)
+            while len(self._solution_images) > limit:
+                self._solution_images.popitem(last=False)
+        else:
+            applied = self.matvec(solution)
+        residual_norm = float(np.linalg.norm(applied-shift*solution-source))
+        if not np.all(np.isfinite(solution)) or not np.isfinite(residual_norm) or residual_norm > tolerance*np.linalg.norm(source)*1.01:
             raise RuntimeError('Response linear solve did not converge (true residual)')
         self._davidson_history = history
-        self._solution_cache[key] = solution.copy()
+        self._solution_cache[key] = solution.copy(), residual_norm
         if len(self._solution_cache) > 16:
-            self._solution_cache.popitem(last=False)
-        return solution
+            expired, _ = self._solution_cache.popitem(last=False)
+            self._solution_images.pop(expired, None)
+        return solution, residual_norm
 
     def linear_response(self, left, right=None, *, omega=0., gamma=0., **solver_options):
         """Physical two-branch susceptibility for H(F)=H-F*right.

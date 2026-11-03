@@ -3,20 +3,60 @@
 
 struct ScalarEdge { Offset row,column; double value; };
 struct ScalarSpectrum {
-    py::array generator, frequencies, cosine, sine;
+    py::array generator, frequencies, basis;
     Offset size, modes;
     std::vector<ScalarEdge> edges;
+    bool low_rank() const { return 4*modes<size; }
+    Offset rotation_work() const { return size*(low_rank()?4*modes+4:size+4); }
+    template<class State>
+    void apply(const State *input,State *output,const double *u) const {
+        if (low_rank()) {
+            std::copy(input,input+size,output);
+            const auto *q=static_cast<const double*>(basis.data());
+            for (Offset mode=0;mode<modes;++mode) {
+                State a{},b{};
+                for (Offset j=0;j<size;++j) {
+                    a+=q[j*2*modes+2*mode]*input[j];
+                    b+=q[j*2*modes+2*mode+1]*input[j];
+                }
+                const State x=u[2*mode]*a+u[2*mode+1]*b;
+                const State y=u[2*mode]*b-u[2*mode+1]*a;
+                for (Offset j=0;j<size;++j)
+                    output[j]+=q[j*2*modes+2*mode]*x+q[j*2*modes+2*mode+1]*y;
+            }
+        } else if (size==2) {
+            output[0]=u[0]*input[0]+u[1]*input[1];
+            output[1]=u[2]*input[0]+u[3]*input[1];
+        } else for (Offset j=0;j<size;++j) {
+            State value{};
+            for (Offset k=0;k<size;++k) value+=u[j*size+k]*input[k];
+            output[j]=value;
+        }
+    }
     std::vector<double> evolution(double angle) const {
+        const auto *f=static_cast<const double*>(frequencies.data());
+        if (low_rank()) {
+            std::vector<double> result(2*modes);
+            for (Offset mode=0;mode<modes;++mode) {
+                const double half=std::sin(angle*f[mode]/2.);
+                result[2*mode]=-2*half*half;
+                result[2*mode+1]=std::sin(angle*f[mode]);
+            }
+            return result;
+        }
         std::vector<double> result(size*size,0.);
         for (Offset j=0;j<size;++j) result[j*size+j]=1.;
-        const auto *f=static_cast<const double*>(frequencies.data());
-        const auto *p=static_cast<const double*>(cosine.data());
-        const auto *k=static_cast<const double*>(sine.data());
+        const auto *q=static_cast<const double*>(basis.data());
         for (Offset mode=0;mode<modes;++mode) {
             const double half=std::sin(angle*f[mode]/2.);
             const double c=-2*half*half,s=std::sin(angle*f[mode]);
-            for (Offset j=0;j<size*size;++j)
-                result[j]+=c*p[mode*size*size+j]+s*k[mode*size*size+j];
+            for (Offset j=0;j<size;++j) {
+                const double a=q[j*2*modes+2*mode],b=q[j*2*modes+2*mode+1];
+                for (Offset k=0;k<size;++k) {
+                    const double x=q[k*2*modes+2*mode],y=q[k*2*modes+2*mode+1];
+                    result[j*size+k]+=c*(a*x+b*y)+s*(a*y-b*x);
+                }
+            }
         }
         return result;
     }
@@ -32,6 +72,7 @@ struct ScalarFactor {
     std::vector<ScalarEmbedding> blocks;
     Offset copies=0;
     Offset work=0;
+    Offset rotation_work=0;
 };
 
 class ScalarPlan {
@@ -97,6 +138,81 @@ class ScalarPlan {
         return matrices;
     }
 
+    // Resolve each compressed address/sign map once for a complete row batch.
+    // Copies within a factor are disjoint; the barrier preserves factor order
+    // and also prevents races between overlapping terms in the generator sum.
+    template<class State,class Index,bool Generator>
+    void batch_action(const State *input,State *output,Offset count,
+                      const std::vector<double> &theta,int threads,bool adjoint,
+                      const Evolution *matrices=nullptr) const {
+        auto worker=[&](int rank,int workers) {
+            std::vector<State> local(maximum_),image(maximum_);
+            std::vector<Offset> addresses(maximum_);
+            std::vector<int8_t> signs(maximum_);
+            for (Offset step=0;step<parameters_;++step) {
+                const Offset i=adjoint?parameters_-1-step:step;
+                if (theta[i]==0.) continue;
+                const auto &factor=factors_[i];
+                const Offset work=Generator?factor.work:factor.rotation_work;
+                const Offset first=work*rank/workers,last=work*(rank+1)/workers;
+                Offset offset=0;
+                for (const auto &b:factor.blocks) {
+                    const Offset weight=Generator?b.size*(b.size+4):factor.spectra[b.spectrum].rotation_work();
+                    const Offset copies=b.components*b.na*b.nb;
+                    const Offset stop=offset+copies*weight;
+                    const Offset begin=std::max(first,offset),end=std::min(last,stop);
+                    if (begin<end) {
+                        const auto *alpha=static_cast<const Index*>(b.alpha.data());
+                        const auto *beta=static_cast<const Index*>(b.beta.data());
+                        const auto *as=static_cast<const int8_t*>(b.alpha_signs.data());
+                        const auto *bs=static_cast<const int8_t*>(b.beta_signs.data());
+                        const Offset copy_begin=(begin-offset+weight-1)/weight;
+                        const Offset copy_end=(end-offset+weight-1)/weight;
+                        for (Offset copy=copy_begin;copy<copy_end;++copy) {
+                            const Offset component=copy/(b.na*b.nb),a=(copy/b.nb)%b.na,beta_row=copy%b.nb,d=b.size;
+                            for (Offset j=0;j<d;++j) {
+                                addresses[j]=alpha[(component*b.na+a)*d+j]*width_+beta[(component*b.nb+beta_row)*d+j];
+                                signs[j]=as[(component*b.na+a)*d+j]*bs[(component*b.nb+beta_row)*d+j];
+                            }
+                            for (Offset row=0;row<count;++row) {
+                                const auto *source=input+row*dimension_;
+                                auto *target=output+row*dimension_;
+                                for (Offset j=0;j<d;++j) local[j]=static_cast<double>(signs[j])*source[addresses[j]];
+                                // Reference columns and symmetry sectors leave
+                                // many copies exactly zero. No tolerance or
+                                // amplitude truncation is used here.
+                                if (std::none_of(local.begin(),local.begin()+d,
+                                                 [](const State &value) { return value!=State{}; })) continue;
+                                if constexpr (Generator) {
+                                    std::fill(image.begin(),image.begin()+d,State{});
+                                    for (const auto &edge:factor.spectra[b.spectrum].edges) {
+                                        const double value=theta[i]*edge.value;
+                                        image[edge.row]+=value*local[edge.column];
+                                        image[edge.column]-=value*local[edge.row];
+                                    }
+                                    for (Offset j=0;j<d;++j) target[addresses[j]]+=static_cast<double>(signs[j])*image[j];
+                                } else {
+                                    const auto *u=(*matrices)[i][b.spectrum].data();
+                                    factor.spectra[b.spectrum].apply(local.data(),image.data(),u);
+                                    for (Offset j=0;j<d;++j) target[addresses[j]]=static_cast<double>(signs[j])*image[j];
+                                }
+                            }
+                        }
+                    }
+                    offset=stop;
+                }
+                if (workers>1) {
+                    #pragma omp barrier
+                }
+            }
+        };
+        if (threads==1) worker(0,1);
+        else {
+            #pragma omp parallel num_threads(threads)
+            worker(omp_get_thread_num(),omp_get_num_threads());
+        }
+    }
+
     template<class State,class Costate,class Index,bool Reverse>
     void sweep(State *state,Costate *costate,double *gradient,
                const std::vector<double> &theta,int threads,bool adjoint,double *timings,
@@ -117,13 +233,15 @@ class ScalarPlan {
                 const Offset i=(Reverse || adjoint)?parameters_-1-step:step;
                 if (!Reverse && theta[i]==0.) continue;
                 const auto &factor=factors_[i];
-                // A 72-state block costs much more than a two-state rotation.
-                // Partition estimated arithmetic, not just spectator count.
-                const Offset first=factor.work*rank/workers,last=factor.work*(rank+1)/workers;
+                // Partition estimated arithmetic, including the generator
+                // edges needed by reverse derivatives, across spectator copies.
+                const Offset work=Reverse?factor.work:factor.rotation_work;
+                const Offset first=work*rank/workers,last=work*(rank+1)/workers;
                 Offset offset=0;
                 double derivative=0.;
                 for (const auto &b:factor.blocks) {
-                    const Offset weight=b.size*(b.size+4),copies=b.components*b.na*b.nb;
+                    const Offset weight=Reverse?b.size*(b.size+4):factor.spectra[b.spectrum].rotation_work();
+                    const Offset copies=b.components*b.na*b.nb;
                     const Offset stop=offset+copies*weight;
                     const Offset begin=std::max(first,offset),end=std::min(last,stop);
                     if (begin<end) {
@@ -149,23 +267,9 @@ class ScalarPlan {
                                                              -real_conjugate_product(dual[edge.column],input[edge.row]));
                             }
                             if (u) {
-                                if (d==2) {
-                                    output[0]=u[0]*input[0]+u[1]*input[1];
-                                    output[1]=u[2]*input[0]+u[3]*input[1];
-                                    if constexpr (Reverse) {
-                                        dual_output[0]=u[0]*dual[0]+u[1]*dual[1];
-                                        dual_output[1]=u[2]*dual[0]+u[3]*dual[1];
-                                    }
-                                } else for (Offset j=0;j<d;++j) {
-                                    State value=0.;
-                                    Costate dual_value=0.;
-                                    for (Offset k=0;k<d;++k) {
-                                        value+=u[j*d+k]*input[k];
-                                        if constexpr (Reverse) dual_value+=u[j*d+k]*dual[k];
-                                    }
-                                    output[j]=value;
-                                    if constexpr (Reverse) dual_output[j]=dual_value;
-                                }
+                                factor.spectra[b.spectrum].apply(input.data(),output.data(),u);
+                                if constexpr (Reverse)
+                                    factor.spectra[b.spectrum].apply(dual.data(),dual_output.data(),u);
                             }
                             if (u) for (Offset j=0;j<d;++j) {
                                 state[addresses[j]]=static_cast<double>(signs[j])*output[j];
@@ -210,19 +314,18 @@ public:
             ScalarFactor f;
             for (const auto &s:py::cast<py::list>(factor[0])) {
                 const auto arrays=py::cast<py::tuple>(s);
-                if (arrays.size()!=4) throw py::value_error("Expected four spectral buffers");
+                if (arrays.size()!=3) throw py::value_error("Expected generator, frequencies and Schur basis");
                 ScalarSpectrum spectrum{py::cast<py::array>(arrays[0]),py::cast<py::array>(arrays[1]),
-                                        py::cast<py::array>(arrays[2]),py::cast<py::array>(arrays[3]),0,0};
+                                        py::cast<py::array>(arrays[2]),0,0};
                 const auto &g=spectrum.generator;
                 if (g.ndim()!=2 || g.shape(0)!=g.shape(1) || g.shape(0)<2)
                     throw py::value_error("Expected a square scalar generator");
                 spectrum.size=g.shape(0);spectrum.modes=spectrum.frequencies.size();
-                if (spectrum.cosine.ndim()!=3 || spectrum.sine.ndim()!=3 ||
-                    spectrum.cosine.shape(0)!=spectrum.modes || spectrum.sine.shape(0)!=spectrum.modes ||
-                    spectrum.cosine.shape(1)!=spectrum.size || spectrum.cosine.shape(2)!=spectrum.size ||
-                    spectrum.sine.shape(1)!=spectrum.size || spectrum.sine.shape(2)!=spectrum.size)
-                    throw py::value_error("Invalid scalar spectral projector shape");
-                for (auto a:{g,spectrum.frequencies,spectrum.cosine,spectrum.sine}) {
+                if (spectrum.frequencies.ndim()!=1 || spectrum.basis.ndim()!=2 ||
+                    spectrum.basis.shape(0)!=spectrum.size || spectrum.basis.shape(1)!=2*spectrum.modes ||
+                    2*spectrum.modes>spectrum.size)
+                    throw py::value_error("Invalid scalar Schur basis shape");
+                for (auto a:{g,spectrum.frequencies,spectrum.basis}) {
                     if (!(a.flags() & py::array::c_style)) throw py::value_error("Expected contiguous spectral buffers");
                     array_check(a.reshape({a.size()}),py::dtype::of<double>(),a.size());readonly(a);
                     const auto *v=static_cast<const double*>(a.data());
@@ -265,6 +368,7 @@ public:
                 maximum_=std::max(maximum_,block.size);
                 f.copies+=block.components*block.na*block.nb;
                 f.work+=block.components*block.na*block.nb*block.size*(block.size+4);
+                f.rotation_work+=block.components*block.na*block.nb*f.spectra[block.spectrum].rotation_work();
                 f.blocks.push_back(std::move(block));
             }
             factors_.push_back(std::move(f));
@@ -295,12 +399,54 @@ public:
         void *data=states.mutable_data();
         py::gil_scoped_release release;
         const auto matrices=evolution(values,adjoint);
+        if (dimension_>=200000 && threads>=2*count) {
+            if (real) {
+                auto *state=static_cast<double*>(data);
+                if (int32_) batch_action<double,int32_t,false>(state,state,count,values,threads,adjoint,&matrices);
+                else batch_action<double,int64_t,false>(state,state,count,values,threads,adjoint,&matrices);
+            } else {
+                auto *state=static_cast<Complex*>(data);
+                if (int32_) batch_action<Complex,int32_t,false>(state,state,count,values,threads,adjoint,&matrices);
+                else batch_action<Complex,int64_t,false>(state,state,count,values,threads,adjoint,&matrices);
+            }
+            return;
+        }
+        threads=std::min<int>(threads,count);
         // A worker owns a complete state, preserving all scalar-factor order.
         // Single-worker sweeps have no barriers or nested OpenMP teams.
         #pragma omp parallel for num_threads(threads) schedule(static)
         for (Offset i=0;i<count;++i) {
             if (real) dispatch<double,double,false>(static_cast<double*>(data)+i*dimension_,nullptr,nullptr,values,1,adjoint,nullptr,&matrices);
             else dispatch<Complex,Complex,false>(static_cast<Complex*>(data)+i*dimension_,nullptr,nullptr,values,1,adjoint,nullptr,&matrices);
+        }
+    }
+
+    void generator_batch(py::array theta,py::array states,py::array output,int threads) const {
+        if (threads<1 || states.ndim()!=2 || states.shape(1)!=dimension_ ||
+            output.ndim()!=2 || output.shape(0)!=states.shape(0) || output.shape(1)!=dimension_ ||
+            !(states.flags() & py::array::c_style) || !(output.flags() & py::array::c_style))
+            throw py::value_error("Expected matching scalar row-state buffers and a positive thread count");
+        auto values=parameters(theta);
+        const bool real=states.dtype().equal(py::dtype::of<double>());
+        const auto dtype=real?py::dtype::of<double>():py::dtype::of<Complex>();
+        array_check(states.reshape({states.size()}),dtype,states.size());
+        array_check(output.reshape({output.size()}),dtype,states.size(),true);
+        if (overlap(states,output)) throw py::value_error("Generator input and output must not overlap");
+        const Offset count=states.shape(0);
+        if (!count) return;
+        const void *source=states.data();
+        void *target=output.mutable_data();
+        py::gil_scoped_release release;
+        if (real) {
+            auto *result=static_cast<double*>(target);
+            std::fill(result,result+count*dimension_,0.);
+            if (int32_) batch_action<double,int32_t,true>(static_cast<const double*>(source),result,count,values,threads,false);
+            else batch_action<double,int64_t,true>(static_cast<const double*>(source),result,count,values,threads,false);
+        } else {
+            auto *result=static_cast<Complex*>(target);
+            std::fill(result,result+count*dimension_,Complex{});
+            if (int32_) batch_action<Complex,int32_t,true>(static_cast<const Complex*>(source),result,count,values,threads,false);
+            else batch_action<Complex,int64_t,true>(static_cast<const Complex*>(source),result,count,values,threads,false);
         }
     }
 
@@ -333,13 +479,15 @@ public:
 };
 
 static void bind_scalar(py::module_ &module) {
-    module.attr("scalar_api_version")=1;
+    module.attr("scalar_api_version")=2;
     py::class_<ScalarPlan>(module,"ScalarPlan")
         .def(py::init<Offset,Offset,py::list>(),py::arg("dimension"),py::arg("string_width"),py::arg("factors"))
         .def("forward",&ScalarPlan::forward,py::arg("parameters").noconvert(),py::arg("state").noconvert(),
              py::arg("threads")=1,py::arg("adjoint")=false)
         .def("forward_batch",&ScalarPlan::forward_batch,py::arg("parameters").noconvert(),py::arg("states").noconvert(),
              py::arg("threads")=1,py::arg("adjoint")=false)
+        .def("generator_batch",&ScalarPlan::generator_batch,py::arg("parameters").noconvert(),
+             py::arg("states").noconvert(),py::arg("output").noconvert(),py::arg("threads")=1)
         .def("reverse",&ScalarPlan::reverse,py::arg("parameters").noconvert(),py::arg("state").noconvert(),
              py::arg("costate").noconvert(),py::arg("gradient").noconvert(),py::arg("threads")=1,py::arg("timings")=py::none());
 }

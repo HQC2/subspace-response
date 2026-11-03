@@ -5,7 +5,7 @@ import scipy
 from typing import Callable
 
 
-def davidson_liu(hvp, hdiag, roots, tol=1e-3):
+def davidson_liu(hvp, hdiag, roots, tol=1e-3, *, verbose=False):
     """
     Solves for eigenvalues and eigenvectors of a hessian.
 
@@ -29,12 +29,12 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
         X = V @ Z
         AX = AV @ Z
         r = (AX - L[None, :]*X)
-        print(f'{r.shape}')
-        print(f'Iter    Root    Residual        Eigenvalue (au, eV)')
-        for k in range(len(L)):
-            print(f'{i+1}       {k+1}       {np.linalg.norm(r[:,k]):.6e}    {L[k]:.6f} {L[k]*27.2114:.6f}')
-        if (all(np.linalg.norm(r, axis=0) < tol)):
-            print(f'At solution, AV dimension: {AV.shape}')
+        residual_norms = np.linalg.norm(r, axis=0)
+        if verbose:
+            print(f'Iter    Root    Residual        Eigenvalue (au, eV)')
+            for k in range(len(L)):
+                print(f'{i+1}       {k+1}       {residual_norms[k]:.6e}    {L[k]:.6f} {L[k]*27.2114:.6f}')
+        if all(residual_norms < tol):
             return L, X
         delta = np.array([1/(L[k] - hdiag)*r[:, k] for k in range(len(L))]).T
         delta_norms = np.linalg.norm(delta, axis=0)
@@ -44,8 +44,7 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3):
         for k in range(len(L)):
             q = delta[:, k] - V @ (V.T @ delta[:, k])
             qnorm = np.linalg.norm(q)
-            residual_norm = np.linalg.norm(r[:,k])
-            print(f'State={k+1} {residual_norm=} {qnorm=}')
+            residual_norm = residual_norms[k]
             if qnorm > 1e-3 and residual_norm > tol:
                 vp = q/qnorm
                 V = np.hstack([V, vp[:, None]])
@@ -98,7 +97,8 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
             return x
         beta = residual_norm/residual_norm_old
         direction = residual + beta*direction
-    print('Not converged...')
+    if verbose:
+        print('Not converged...')
     return x
 
 

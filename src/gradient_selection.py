@@ -101,7 +101,7 @@ class GradientSelection(ExcitationNeighborhood):
             if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
                 raise ValueError('Full exponential gradient selection requires current parameters')
             generator = self.simulator.generator(excitations, parameters)
-            proposals, evaluated, maximum = [], 0, 0.
+            proposals, evaluated = [], 0
             for block in sorted(self._candidates):
                 if block not in self._blocks:
                     self._blocks[block] = singlet_excitations_for_block(*block)
@@ -112,20 +112,16 @@ class GradientSelection(ExcitationNeighborhood):
                     tangent = self.simulator.exponential_tangent(generator, excitation)
                     score = max(score, abs(float(2*np.vdot(residual, tangent).real/norm)))
                     evaluated += 1
-                maximum = max(maximum, score)
                 if score > floor and score >= epsilon:
                     proposals.append((block, score, 'gradient'))
             proposals.sort(key=lambda item: (-item[1], item[0]))
             return proposals, dict(candidate_blocks=len(self._candidates),
                                    candidate_operators=evaluated, source_blocks=len(self._sources),
-                                   screened_blocks=0, evaluated_operators=evaluated,
-                                   max_evaluated_gradient=maximum,
-                                   max_candidate_gradient_bound=maximum)
+                                   screened_blocks=0, evaluated_operators=evaluated)
         proposals, candidates, screened, evaluated = [], 0, 0, 0
-        max_gradient = max_bound = 0.
 
         def score_batch(blocks, monomials, starts, counts, packed):
-            nonlocal candidates, screened, evaluated, max_gradient, max_bound
+            nonlocal candidates, screened, evaluated
             enabled = np.ones(len(monomials), dtype=bool)
             missing_counts = list(counts)
             for i, block in enumerate(blocks):
@@ -144,7 +140,6 @@ class GradientSelection(ExcitationNeighborhood):
                 # Cauchy-Schwarz every scalar gradient is bounded by ||g_m||.
                 # Pad for coefficient normalization and floating-point error.
                 bound = float(np.linalg.norm(values))*(1+1e-10)
-                max_bound = max(max_bound, bound)
                 candidates += count
                 if bound < epsilon or bound <= floor:
                     screened += 1
@@ -159,7 +154,6 @@ class GradientSelection(ExcitationNeighborhood):
                         value = abs(sum(term.coefficient*by_term[term.holes, term.particles]
                                         for term in excitation.terms))
                         score = max(score, value)
-                max_gradient = max(max_gradient, score)
                 if score > floor and score >= epsilon:
                     proposals.append((block, score, 'gradient'))
 
@@ -194,6 +188,4 @@ class GradientSelection(ExcitationNeighborhood):
         proposals.sort(key=lambda item: (-item[1], item[0]))
         return proposals, dict(candidate_blocks=len(self._candidates),
                                candidate_operators=candidates, source_blocks=len(self._sources),
-                               screened_blocks=screened, evaluated_operators=evaluated,
-                               max_evaluated_gradient=max_gradient,
-                               max_candidate_gradient_bound=max_bound)
+                               screened_blocks=screened, evaluated_operators=evaluated)

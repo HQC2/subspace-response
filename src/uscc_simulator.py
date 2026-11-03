@@ -257,6 +257,38 @@ class SectorSimulator:
                                   (np.concatenate(rows), np.concatenate(cols))),
                                  shape=(self.dimension, self.dimension)).tocsr()
 
+    def apply_generator_batch(self, vectors, parameters, excitations):
+        """Apply sum theta_mu*(T_mu-T_mu†) using compressed scalar maps.
+
+        The generator is independent of the ground-state exponential scheme.
+        No sector-sized operator or determinant-pair cache is constructed.
+        """
+        vectors = np.asarray(vectors)
+        parameters = np.asarray(parameters, dtype=float)
+        if vectors.ndim != 2 or vectors.shape[1] != self.dimension or not np.all(np.isfinite(vectors)):
+            raise ValueError('Expected finite row vectors matching the electron sector')
+        if parameters.shape != (len(excitations),) or not np.all(np.isfinite(parameters)):
+            raise ValueError('Expected finite parameters matching the excitation list')
+        vectors = np.ascontiguousarray(vectors, dtype=np.result_type(vectors, float))
+        output = np.zeros_like(vectors)
+        if not len(vectors) or not np.any(parameters):
+            return output
+        plan = self.scalar_evolution()
+        plan.plan(excitations)
+        if plan.native is not None and hasattr(plan.native, 'generator_batch'):
+            threads = self.sector_threads or lib.num_threads()
+            if len(vectors) < 4:
+                threads = min(threads, self.effective_rotation_threads())
+            plan.native.generator_batch(np.ascontiguousarray(parameters), vectors, output, threads)
+        else:
+            for factor, theta in zip(plan.factors, parameters):
+                if theta:
+                    for block in factor:
+                        indices, signs = block.addresses(self.shape[1]), block.signs()
+                        local = signs*vectors[:, indices]
+                        output[:, indices] += theta*signs*(local @ block.spectrum.generator.T)
+        return output
+
     def _exponential_action(self, vectors, parameters, excitations, *, adjoint=False):
         """Column-vector exponential actions, also accepting several columns."""
         if self.spin_adaptation == 'exact':
@@ -430,9 +462,10 @@ class SectorSimulator:
     def apply_unitary_batch(self, vectors, parameters, excitations, steps=1, *, adjoint=False):
         """Apply the same circuit to independent row vectors, without normalization.
 
-        Native workers own whole states, eliminating per-gate synchronization.
-        Callers bound batch memory; older extensions and Python kernels fall
-        back to the same scalar operation. Hamiltonian threads set batch workers.
+        Large-sector scalar batches share address calculations across rows
+        when additional workers justify a team within each factor. Other
+        native batches assign whole states to workers. Callers bound batch
+        memory; sector_threads limits the total worker budget.
         """
         vectors = np.asarray(vectors)
         parameters = np.asarray(parameters, dtype=float)
@@ -449,7 +482,7 @@ class SectorSimulator:
                 plan = self.scalar_evolution()
                 plan.plan(excitations)
                 if plan.native is not None and hasattr(plan.native, 'forward_batch'):
-                    threads = min(len(states), self.sector_threads or lib.num_threads())
+                    threads = self.sector_threads or lib.num_threads()
                     plan.native.forward_batch(np.ascontiguousarray(parameters), states, threads, adjoint=adjoint)
                     return states
             return self._exponential_action(states.T, parameters, excitations, adjoint=adjoint).T.copy()

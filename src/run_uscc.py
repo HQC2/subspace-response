@@ -110,7 +110,7 @@ def ground_state_progress(event):
         total = sum(event['ranks'].values())
         convergence = (f"|r|={event['residual_norm']:.3e}" if event['optimizer'] == 'pqe'
                        else f"|g|={event['gradient_norm']:.3e}")
-        print(f"E={event['energy']:.12f} {convergence} S2={event['spin_squared']:.3e} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
+        print(f"E={event['energy']:.12f} {convergence} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
     elif event['event'] == 'growth':
         total = sum(event['ranks'].values())
         print(f"epsilon={event['epsilon']:g}: added {len(event['added'])} operators, ranks={event['ranks']} {total=}", flush=True)

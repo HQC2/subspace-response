@@ -369,9 +369,11 @@ public:
 };
 
 #include "uscc_scalar.hpp"
+#include "uscc_connections.hpp"
 
 PYBIND11_MODULE(_uscc_native,module) {
     bind_scalar(module);
+    bind_connections(module);
     module.doc()="Persistent-team OpenMP determinant rotations; immutable validated plans";
     module.attr("api_version")=1;
 #ifdef USCC_NATIVE_SOURCE_SHA256
