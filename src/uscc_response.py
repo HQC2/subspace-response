@@ -1,8 +1,8 @@
-"""Fixed-space stationary sc-qLR and its undressed (U=I) approximation.
+"""Fixed-space state-transfer qLR on a correlated USCC reference.
 
 Reference CSFs are independent of the selected ground-state generators. The
-response model neglects residual-dependent A corrections and the B block.
-Identity dressing uses the HF energy throughout, giving CIS/TDA for singles.
+active-space equations have A=K, B=0 and an identity response metric.
+They also match self-consistent qLR when its residual corrections vanish.
 """
 from collections import OrderedDict
 from copy import copy, deepcopy
@@ -45,30 +45,27 @@ class ResponseSpace:
 
 
 class USCCResponse:
-    """Response with fixed ground state and independently chosen reference CSFs.
+    """State-transfer response with fixed ground state and independent reference CSFs.
 
-    ``dressing='uscc'`` uses U†HU and U†OU. ``dressing='identity'`` uses the
-    bare operators and HF energy, independent of the ground-state parameters.
+    The saved ground-state unitary defines U†HU and U†OU throughout both
+    response operator selection and the final state-transfer LR calculation.
     Property inputs are real symmetric active-space spatial-orbital integrals;
     returned property vectors are transition couplings, not gate derivatives.
     """
 
-    def __init__(self, wavefunction, excitations=None, *, max_rank=2, dressing='uscc', sector_threads=None):
-        if dressing not in ('uscc','identity'):
-            raise ValueError('dressing must be uscc or identity')
-        self.dressing = dressing
+    def __init__(self, wavefunction, excitations=None, *, max_rank=2, sector_threads=None):
         self.integrals = wavefunction.integrals
         self.metadata = deepcopy(wavefunction.metadata)
         self.theta = np.array(wavefunction.theta,dtype=float,copy=True)
         self.theta.flags.writeable = False
         self.ground_excitations = tuple(wavefunction.excitations)
         self.trotter_steps = wavefunction.trotter_steps
-        self.spin_adaptation = getattr(wavefunction, 'spin_adaptation', 'trotter')
-        self.trotter_order = getattr(wavefunction, 'trotter_order', 1)
+        self.spin_adaptation = wavefunction.spin_adaptation
+        self.trotter_order = wavefunction.trotter_order
         threads = wavefunction.sector_threads if sector_threads is None else sector_threads
-        self.sector_kernels = getattr(wavefunction,'sector_kernels','auto')
-        self.rotation_threads = getattr(wavefunction,'rotation_threads',None)
-        self.simulator = SectorSimulator(self.integrals,sector_threads=threads,kernels=self.sector_kernels if dressing == 'uscc' else 'numpy',rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
+        self.sector_kernels = wavefunction.sector_kernels
+        self.rotation_threads = wavefunction.rotation_threads
+        self.simulator = SectorSimulator(self.integrals,sector_threads=threads,kernels=self.sector_kernels,rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
         if excitations is None:
             if type(max_rank) is not int or max_rank < 1:
                 raise ValueError('max_rank must be a positive integer')
@@ -115,8 +112,6 @@ class USCCResponse:
         return result
 
     def _unitary(self, vector, *, adjoint=False):
-        if self.dressing == 'identity':
-            return np.array(vector,copy=True)
         return self.simulator.apply_unitary(vector,self.theta,self.ground_excitations,self.trotter_steps,adjoint=adjoint)
 
     def matvec(self, vector):
@@ -144,34 +139,60 @@ class USCCResponse:
             self._diagonal = matrix.diagonal().real.copy()
         return self._matrix.copy()
 
-    def matrix_columns(self, indices, *, batch_size=None):
-        """Exact candidate K columns with bounded batches of sector states.
+    def matrix_columns(self, indices, *, batch_size=None, approximation='dressed'):
+        """Candidate K columns, optionally approximated for +X screening only.
 
-        This caches no dense dressed basis. By default each sector-state buffer
-        is at most 64 MiB (and at most 32 vectors), independent of pool size.
+        ``dressed`` uses U†HU; ``bare`` uses H; ``linear`` uses H+[H,A], with
+        A=sum(theta_mu*(T_mu-T_mu†)). All subtract the fixed reference energy.
+        Only dressed columns populate exact matrix/diagonal caches. Each
+        sector-state buffer is bounded by the batch policy; no dense dressed
+        basis or commutator matrix is constructed.
         """
+        if approximation not in ('dressed', 'bare', 'linear'):
+            raise ValueError('Coupling approximation must be dressed, bare or linear')
         indices = self._column_indices(indices)
         if batch_size is None:
             batch_size = self._column_batch_size()
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError('batch_size must be a positive integer')
-        if self._matrix is not None:
+        if approximation == 'dressed' and self._matrix is not None:
             return self._matrix[:, indices].copy()
         result = np.empty((len(self.space), len(indices)))
         for start in range(0, len(indices), batch_size):
             chosen = indices[start:start+batch_size]
             states = self.space.columns[:, chosen].T.toarray()
-            if self.dressing == 'uscc':
+            if approximation == 'dressed':
                 states = self.simulator.apply_unitary_batch(states, self.theta, self.ground_excitations, self.trotter_steps)
-            applied = self.simulator.apply_hamiltonian_batch(states)
-            if self.dressing == 'uscc':
+                applied = self.simulator.apply_hamiltonian_batch(states)
                 applied = self.simulator.apply_unitary_batch(applied, self.theta, self.ground_excitations, self.trotter_steps, adjoint=True)
+            else:
+                applied = self.simulator.apply_hamiltonian_batch(states)
+                if approximation == 'linear':
+                    # e^-A H e^A = H + H A - A H + O(theta**2).
+                    applied = (applied
+                               + self.simulator.apply_hamiltonian_batch(self._selection_generator_action(states))
+                               - self._selection_generator_action(applied))
             result[:, start:start+len(chosen)] = self.space.columns.conj().T @ applied.T
             result[chosen, start+np.arange(len(chosen))] -= self.energy
-        if len(indices):
+        if len(indices) and approximation == 'dressed':
             if self._diagonal is None:
                 self._diagonal = np.full(len(self.space), np.nan)
             self._diagonal[indices] = result[indices, np.arange(len(indices))]
+        return result
+
+    def _selection_generator_action(self, states):
+        """Apply A to independent row states without assembling a sector matrix."""
+        coefficients = {}
+        for excitation, theta in zip(self.ground_excitations, self.theta):
+            for term in excitation.terms:
+                key = term.holes, term.particles
+                coefficients[key] = coefficients.get(key, 0.)+theta*term.coefficient
+        result = np.zeros_like(states)
+        for (holes, particles), coefficient in coefficients.items():
+            if coefficient:
+                source, target, signs = self.simulator.pairs(holes, particles)
+                result[:, target] += coefficient*signs*states[:, source]
+                result[:, source] -= coefficient*signs*states[:, target]
         return result
 
     def diagonal(self, indices=None):
@@ -191,8 +212,7 @@ class USCCResponse:
             # <mu|U† H U|mu> needs only forward rotation sweeps.
             chosen = missing[start:start+batch_size]
             states = self.space.columns[:, chosen].T.toarray()
-            if self.dressing == 'uscc':
-                states = self.simulator.apply_unitary_batch(states, self.theta, self.ground_excitations, self.trotter_steps)
+            states = self.simulator.apply_unitary_batch(states, self.theta, self.ground_excitations, self.trotter_steps)
             applied = self.simulator.apply_hamiltonian_batch(states)
             for i, state, image in zip(chosen, states, applied):
                 self._diagonal[i] = np.vdot(state, image).real-self.energy
@@ -212,8 +232,8 @@ class USCCResponse:
     def orbital_diagonal(self):
         """Cheap Fock excitation gaps, used only to precondition linear solves.
 
-        These are not dressed matrix elements and never replace the exact
-        denominators in residual-based +X selection or the response operator.
+        These are not dressed matrix elements and never replace the response
+        operator. Coupling selection has no energy-denominator score.
         """
         if self._orbital_diagonal is None:
             occupied = range(self.integrals.electrons//2)

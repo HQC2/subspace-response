@@ -24,10 +24,6 @@ from spqe import ReferenceProjector, SPQESelection, solve_pqe
 from gradient_selection import GradientSelection
 from linear_spqe import LinearSPQESelection
 
-FORMAT_VERSION = 1
-CONVENTION = 'canonical-particle-ascending-hole-descending;scalar-mgs-v1;exp(theta*(T-Tdagger))'
-
-
 def block_key(term):
     return tuple(sorted(h//2 for h in term.holes)), tuple(sorted(p//2 for p in term.particles))
 
@@ -122,7 +118,7 @@ class USCCSelector:
 class USCC:
     """Reusable rank-independent ground-state wave function and USCC driver.
 
-    Parameters are physical generator coefficients, not legacy gate angles.
+    Parameters are physical coefficients of the canonical T-T† generators.
     ``apply_ucc`` and the serialized ordered generators remain usable by later
     response code, independently of this ground-state selection loop.
 
@@ -491,11 +487,9 @@ class USCC:
         for array in (self.integrals.one_body,self.integrals.two_body):
             digest.update(np.asarray(array,dtype='<f8').tobytes())
         digest.update(json.dumps(dict(constant=self.integrals.constant,electrons=self.integrals.electrons),sort_keys=True).encode())
-        context = dict(fingerprint=digest.hexdigest(), trotter_steps=self.trotter_steps, observable=observable)
-        # Preserve optimizer compatibility for legacy first-order checkpoints.
-        if self.spin_adaptation != 'trotter' or self.trotter_order != 1:
-            context.update(spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order)
-        return context
+        return dict(fingerprint=digest.hexdigest(), trotter_steps=self.trotter_steps,
+                    observable=observable, spin_adaptation=self.spin_adaptation,
+                    trotter_order=self.trotter_order)
 
     def _curvature_history(self, *, strict=False):
         state = self._optimizer_state
@@ -506,7 +500,7 @@ class USCC:
             anchor = np.asarray(state['theta'], dtype=float)
             s = np.asarray(state['s'], dtype=float)
             y = np.asarray(state['y'], dtype=float)
-            if state['version'] != 1 or anchor.shape != (n,) or s.ndim != 2 or s.shape != y.shape or s.shape[1] != n or len(s)>10:
+            if anchor.shape != (n,) or s.ndim != 2 or s.shape != y.shape or s.shape[1] != n or len(s)>10:
                 raise ValueError('Invalid optimizer curvature state dimensions')
             with np.errstate(over='ignore',invalid='ignore'):
                 sy = np.sum(s*y,axis=1)
@@ -578,7 +572,7 @@ class USCC:
                 self.theta = res.x.copy()
                 energy, gradient = float(res.fun), res.jac
                 pairs = res.history[-10:]
-                self._optimizer_state = dict(version=1,context=self._optimizer_context(),ids=[e.id for e in self.excitations],theta=self.theta.tolist(),
+                self._optimizer_state = dict(context=self._optimizer_context(),ids=[e.id for e in self.excitations],theta=self.theta.tolist(),
                                              s=[s.tolist() for s,y in pairs],y=[y.tolist() for s,y in pairs]) if pairs else None
             else:
                 energy, gradient = old_energy, old_gradient
@@ -720,7 +714,7 @@ class USCC:
         optimizer_state = self._optimizer_state
         if optimizer_state is not None and (optimizer_state['context']['observable'] is not None or self._curvature_history() is None):
             optimizer_state = None
-        data = dict(version=FORMAT_VERSION, convention=CONVENTION, fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
+        data = dict(fingerprint=self._fingerprint(), integrals=dict(one_body=self.integrals.one_body.tolist(), two_body=self.integrals.two_body.tolist(), constant=self.integrals.constant, electrons=self.integrals.electrons), metadata=self.metadata,
                     config=dict(max_rank=self.selector.requested_max_rank, seed=self.seed, selection=self.selection, trotter_steps=self.trotter_steps, device=self.device_name, orbital_irreps=self.selector.orbital_irreps, backend=self.backend, sector_threads=self.sector_threads, sector_kernels=self.sector_kernels, rotation_threads=self.rotation_threads, spin_adaptation=self.spin_adaptation, trotter_order=self.trotter_order), excitations=[e.to_dict() for e in self.excitations], ids=[e.id for e in self.excitations], parameters=self.theta.tolist(), history=self.history, provenance=self.provenance, schedule=self.schedule, threshold_index=self.threshold_index, initialized=self.initialized, needs_optimization=self.needs_optimization, stop_reason=self.stop_reason, optimization_settings=self.optimization_settings, optimizer_state=optimizer_state)
         temporary = filename.with_name(filename.name+'.tmp')
         temporary.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
@@ -729,10 +723,7 @@ class USCC:
     @classmethod
     def from_checkpoint(cls, filename, *, device=None, backend=None, sector_threads=None, sector_kernels=None, rotation_threads=None):
         data = json.loads(Path(filename).read_text())
-        if data.get('version') != FORMAT_VERSION or data.get('convention') != CONVENTION:
-            raise ValueError('Unsupported checkpoint schema or excitation convention')
         config = dict(data['config'])
-        config.setdefault('backend','pennylane')  # Legacy checkpoints retain their backend.
         if backend is not None:
             config['backend'] = backend
         if device is not None:
@@ -756,7 +747,7 @@ class USCC:
         model.set_excitations(excitations, data['parameters'])
         for name in ('history','provenance','schedule','threshold_index','initialized','needs_optimization','stop_reason','optimization_settings'):
             setattr(model, name, data[name])
-        model._optimizer_state = data.get('optimizer_state')
+        model._optimizer_state = data['optimizer_state']
         model._curvature_history(strict=True)
         if not isinstance(model.threshold_index, int) or model.threshold_index < 0 or (model.schedule is not None and model.threshold_index > len(model.schedule)):
             raise ValueError('Invalid checkpoint schedule position')

@@ -448,6 +448,13 @@ class SectorSimulator:
         if self.spin_adaptation != 'trotter':
             if not len(states):
                 return states
+            if self.spin_adaptation == 'scalar':
+                plan = self.scalar_evolution()
+                plan.plan(excitations)
+                if plan.native is not None and hasattr(plan.native, 'forward_batch'):
+                    threads = min(len(states), self.sector_threads or lib.num_threads())
+                    plan.native.forward_batch(np.ascontiguousarray(parameters), states, threads, adjoint=adjoint)
+                    return states
             return self._exponential_action(states.T, parameters, excitations, adjoint=adjoint).T.copy()
         self.plan(excitations, steps)
         if len(states) == 1:

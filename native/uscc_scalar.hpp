@@ -35,6 +35,8 @@ struct ScalarFactor {
 };
 
 class ScalarPlan {
+    using Matrices=std::vector<std::vector<double>>;
+    using Evolution=std::vector<Matrices>;
     Offset dimension_,width_,parameters_,maximum_=0;
     bool int32_;
     std::vector<ScalarFactor> factors_;
@@ -85,17 +87,24 @@ class ScalarPlan {
         return result;
     }
 
-    template<class State,class Costate,class Index,bool Reverse>
-    void sweep(State *state,Costate *costate,double *gradient,
-               const std::vector<double> &theta,int threads,bool adjoint,double *timings) const {
-        const auto matrix_start=std::chrono::steady_clock::now();
-        using Matrices=std::vector<std::vector<double>>;
-        std::vector<Matrices> matrices(parameters_);
+    Evolution evolution(const std::vector<double> &theta,bool adjoint) const {
+        Evolution matrices(parameters_);
         for (Offset i=0;i<parameters_;++i) {
             if (theta[i]==0.) continue;
             for (const auto &s:factors_[i].spectra)
-                matrices[i].push_back(s.evolution((Reverse || adjoint)?-theta[i]:theta[i]));
+                matrices[i].push_back(s.evolution(adjoint?-theta[i]:theta[i]));
         }
+        return matrices;
+    }
+
+    template<class State,class Costate,class Index,bool Reverse>
+    void sweep(State *state,Costate *costate,double *gradient,
+               const std::vector<double> &theta,int threads,bool adjoint,double *timings,
+               const Evolution *prepared=nullptr) const {
+        const auto matrix_start=std::chrono::steady_clock::now();
+        Evolution local;
+        if (!prepared) local=evolution(theta,Reverse || adjoint);
+        const auto &matrices=prepared?*prepared:local;
         const auto sweep_start=std::chrono::steady_clock::now();
         if (timings) timings[0]=std::chrono::duration<double>(sweep_start-matrix_start).count();
         std::vector<double> partials(Reverse?parameters_*threads:0,0.);
@@ -184,9 +193,10 @@ class ScalarPlan {
 
     template<class State,class Costate,bool Reverse>
     void dispatch(State *state,Costate *costate,double *gradient,
-                  const std::vector<double> &theta,int threads,bool adjoint,double *timings=nullptr) const {
-        if (int32_) sweep<State,Costate,int32_t,Reverse>(state,costate,gradient,theta,threads,adjoint,timings);
-        else sweep<State,Costate,int64_t,Reverse>(state,costate,gradient,theta,threads,adjoint,timings);
+                  const std::vector<double> &theta,int threads,bool adjoint,double *timings=nullptr,
+                  const Evolution *prepared=nullptr) const {
+        if (int32_) sweep<State,Costate,int32_t,Reverse>(state,costate,gradient,theta,threads,adjoint,timings,prepared);
+        else sweep<State,Costate,int64_t,Reverse>(state,costate,gradient,theta,threads,adjoint,timings,prepared);
     }
 
 public:
@@ -273,6 +283,27 @@ public:
         else dispatch<Complex,Complex,false>(static_cast<Complex*>(data),nullptr,nullptr,values,threads,adjoint);
     }
 
+    void forward_batch(py::array theta,py::array states,int threads,bool adjoint) const {
+        if (threads<1 || states.ndim()!=2 || states.shape(1)!=dimension_ ||
+            !(states.flags() & py::array::c_style))
+            throw py::value_error("Expected contiguous scalar row states and a positive thread count");
+        const bool real=states.dtype().equal(py::dtype::of<double>());
+        array_check(states.reshape({states.size()}),real?py::dtype::of<double>():py::dtype::of<Complex>(),states.size(),true);
+        auto values=parameters(theta);
+        const Offset count=states.shape(0);
+        if (!count) return;
+        void *data=states.mutable_data();
+        py::gil_scoped_release release;
+        const auto matrices=evolution(values,adjoint);
+        // A worker owns a complete state, preserving all scalar-factor order.
+        // Single-worker sweeps have no barriers or nested OpenMP teams.
+        #pragma omp parallel for num_threads(threads) schedule(static)
+        for (Offset i=0;i<count;++i) {
+            if (real) dispatch<double,double,false>(static_cast<double*>(data)+i*dimension_,nullptr,nullptr,values,1,adjoint,nullptr,&matrices);
+            else dispatch<Complex,Complex,false>(static_cast<Complex*>(data)+i*dimension_,nullptr,nullptr,values,1,adjoint,nullptr,&matrices);
+        }
+    }
+
     void reverse(py::array theta,py::array state,py::array costate,py::array gradient,int threads,py::object timing_output) const {
         if (threads<1) throw py::value_error("Invalid scalar thread count");
         auto values=parameters(theta);
@@ -306,6 +337,8 @@ static void bind_scalar(py::module_ &module) {
     py::class_<ScalarPlan>(module,"ScalarPlan")
         .def(py::init<Offset,Offset,py::list>(),py::arg("dimension"),py::arg("string_width"),py::arg("factors"))
         .def("forward",&ScalarPlan::forward,py::arg("parameters").noconvert(),py::arg("state").noconvert(),
+             py::arg("threads")=1,py::arg("adjoint")=false)
+        .def("forward_batch",&ScalarPlan::forward_batch,py::arg("parameters").noconvert(),py::arg("states").noconvert(),
              py::arg("threads")=1,py::arg("adjoint")=false)
         .def("reverse",&ScalarPlan::reverse,py::arg("parameters").noconvert(),py::arg("state").noconvert(),
              py::arg("costate").noconvert(),py::arg("gradient").noconvert(),py::arg("threads")=1,py::arg("timings")=py::none());
