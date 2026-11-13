@@ -41,7 +41,7 @@ static void array_check(const py::array &a, const py::dtype &dtype,
         throw py::value_error("Expected aligned array storage");
 }
 
-struct Gate { Offset parameter, start, stop; double scale; };
+struct Gate { Offset parameter, start, stop; double scale; Offset product=-1; };
 
 #ifdef USCC_PYSCF_BATCH
 static py::array_t<double> contract_2e_batch(py::array eri,py::array states,
@@ -84,8 +84,9 @@ static py::array_t<double> contract_2e_batch(py::array eri,py::array states,
 
 // Each independent monomial table can be built by a separate worker. NumPy
 // buffers are allocated with the GIL held; workers only fill raw pointers.
-static py::list build_pairs(py::array indices,py::array sorted_indices,
-                            py::array index_order,py::array metadata,int threads) {
+template<class Index>
+static py::list build_pairs_impl(py::array indices,py::array sorted_indices,
+                                 py::array index_order,py::array metadata,int threads) {
     if (threads<1) throw py::value_error("Invalid thread count");
     const Offset dimension=indices.size();
     array_check(indices,py::dtype::of<int64_t>(),dimension);
@@ -104,7 +105,7 @@ static py::list build_pairs(py::array indices,py::array sorted_indices,
     for (Offset i=0;i<dimension;++i)
         if (order[i]<0 || order[i]>=dimension || (i && sorted[i]<=sorted[i-1]))
             throw py::value_error("Invalid sorted determinant lookup");
-    struct Output {int64_t *source,*target;double *sign;Offset size;};
+    struct Output {Index *source,*target;int8_t *sign;Offset size;};
     std::vector<Output> outputs;
     py::list result;
     for (Offset k=0;k<count;++k) {
@@ -112,8 +113,8 @@ static py::list build_pairs(py::array indices,py::array sorted_indices,
         if (rule[4]>static_cast<uint64_t>(dimension) || rule[3]>1 || (rule[0]&rule[1])!=rule[0])
             throw py::value_error("Invalid monomial mask or pair count");
         const Offset size=static_cast<Offset>(rule[4]);
-        py::array_t<int64_t> source(size),target(size);
-        py::array_t<double> sign(size);
+        py::array_t<Index> source(size),target(size);
+        py::array_t<int8_t> sign(size);
         outputs.push_back({source.mutable_data(),target.mutable_data(),sign.mutable_data(),size});
         result.append(py::make_tuple(source,target,sign));
     }
@@ -145,6 +146,16 @@ static py::list build_pairs(py::array indices,py::array sorted_indices,
     return result;
 }
 
+static py::list build_pairs(py::array indices,py::array sorted_indices,
+                            py::array index_order,py::array metadata,int threads) {
+    // Match the portable pair cache: addresses need only represent the sector
+    // dimension, and fermionic signs are exactly +/-1. Avoid wide temporary
+    // tables as well as retaining them alongside the packed rotation plan.
+    if (indices.size()<=std::numeric_limits<int32_t>::max())
+        return build_pairs_impl<int32_t>(indices,sorted_indices,index_order,metadata,threads);
+    return build_pairs_impl<int64_t>(indices,sorted_indices,index_order,metadata,threads);
+}
+
 class RotationPlan {
     // Pair buffers must remain immutable for the plan lifetime. Holding array
     // references prevents normal NumPy resizing while the GIL is released.
@@ -152,6 +163,32 @@ class RotationPlan {
     std::vector<Gate> gates_;
     Offset dimension_, parameters_;
     bool int32_;
+    struct Product {
+        std::vector<Offset> source[2],target[2];
+        std::vector<int8_t> sign[2];
+    };
+    std::vector<Product> products_;
+    Offset width_=0;
+
+    template<class State,class Costate,bool Reverse>
+    static inline double rotate_pair(State *state,Costate *costate,Offset source,
+                                     Offset target,double sign,double c,double sn) {
+        const double ss=sign*sn;
+        const State left=state[source],right=state[target];
+        if constexpr (Reverse) {
+            const Costate cleft=costate[source],cright=costate[target];
+            const double derivative=sign*(real_conjugate_product(cright,left)-real_conjugate_product(cleft,right));
+            state[source]=c*left+ss*right;
+            state[target]=-ss*left+c*right;
+            costate[source]=c*cleft+ss*cright;
+            costate[target]=-ss*cleft+c*cright;
+            return derivative;
+        } else {
+            state[source]=c*left-ss*right;
+            state[target]=ss*left+c*right;
+            return 0.;
+        }
+    }
     template<class Index> void validate_pairs() {
         const auto *source=static_cast<const Index*>(sources_.data());
         const auto *target=static_cast<const Index*>(targets_.data());
@@ -199,9 +236,9 @@ class RotationPlan {
     void sweep(State *state,Costate *costate,double *gradient,
                const std::vector<double> &cosine,const std::vector<double> &sine,
                int threads,Offset minimum,bool adjoint) const {
-        const auto *sources=static_cast<const Index*>(sources_.data());
-        const auto *targets=static_cast<const Index*>(targets_.data());
-        const auto *signs=static_cast<const int8_t*>(signs_.data());
+        const auto *sources=width_?nullptr:static_cast<const Index*>(sources_.data());
+        const auto *targets=width_?nullptr:static_cast<const Index*>(targets_.data());
+        const auto *signs=width_?nullptr:static_cast<const int8_t*>(signs_.data());
         const Offset count=static_cast<Offset>(gates_.size());
         // Each worker owns a full gradient row: no per-gate reduction/barrier
         // beyond the barrier already required by state dependencies.
@@ -210,24 +247,27 @@ class RotationPlan {
             const auto &gate=gates_[g];
             const double c=cosine[g],sn=sine[g];
             double derivative=0.;
-            // Validation proves every pair is disjoint. This explicit SIMD
-            // contract permits indexed gather/scatter without fast math.
-            #pragma omp simd reduction(+:derivative)
-            for (Offset p=begin;p<end;++p) {
-                const auto source=sources[p],target=targets[p];
-                const double ss=signs[p]*sn;
-                const State left=state[source],right=state[target];
-                if constexpr (Reverse) {
-                    const Costate cleft=costate[source],cright=costate[target];
-                    derivative+=signs[p]*(real_conjugate_product(cright,left)-real_conjugate_product(cleft,right));
-                    state[source]=c*left+ss*right;
-                    state[target]=-ss*left+c*right;
-                    costate[source]=c*cleft+ss*cright;
-                    costate[target]=-ss*cleft+c*cright;
-                } else {
-                    state[source]=c*left-ss*right;
-                    state[target]=ss*left+c*right;
+            if (gate.product>=0) {
+                const auto &map=products_[gate.product];
+                const Offset nb=map.source[1].size();
+                // Divide only at row boundaries. The inner beta loop shares
+                // alpha addresses/signs and reads tiny maps instead of the
+                // expanded Cartesian determinant-pair tables.
+                if (nb) for (Offset a=begin/nb;a*nb<end;++a) {
+                    const Offset first=std::max<Offset>(0,begin-a*nb),last=std::min(nb,end-a*nb);
+                    const Offset source=map.source[0][a]*width_,target=map.target[0][a]*width_;
+                    const double sign=map.sign[0][a];
+                    #pragma omp simd reduction(+:derivative)
+                    for (Offset b=first;b<last;++b)
+                        derivative+=rotate_pair<State,Costate,Reverse>(state,costate,
+                            source+map.source[1][b],target+map.target[1][b],sign*map.sign[1][b],c,sn);
                 }
+            } else {
+                // Validation proves every pair is disjoint.
+                #pragma omp simd reduction(+:derivative)
+                for (Offset p=begin;p<end;++p)
+                    derivative+=rotate_pair<State,Costate,Reverse>(state,costate,
+                        sources[p],targets[p],signs[p],c,sn);
             }
             if constexpr (Reverse) local_gradient[gate.parameter]+=2*gate.scale*derivative;
         };
@@ -286,6 +326,54 @@ class RotationPlan {
     }
 
 public:
+    RotationPlan(Offset width,Offset parameters,py::array ids,py::array scales,
+                 py::array products,py::list maps):dimension_(0),parameters_(parameters),int32_(false),width_(width) {
+        if (width<1 || width>std::numeric_limits<Offset>::max()/width || parameters<0)
+            throw py::value_error("Invalid string/parameter dimension");
+        dimension_=width*width;
+        const Offset n=ids.size();
+        array_check(ids,py::dtype::of<Offset>(),n);
+        array_check(scales,py::dtype::of<double>(),n);
+        array_check(products,py::dtype::of<Offset>(),n);
+        for (auto item:maps) {
+            const auto arrays=py::cast<py::tuple>(item);
+            if (arrays.size()!=6) throw py::value_error("Expected six spin-map arrays");
+            Product map;
+            bool disjoint=false;
+            for (int spin=0;spin<2;++spin) {
+                const auto source=py::cast<py::array>(arrays[3*spin]);
+                const auto target=py::cast<py::array>(arrays[3*spin+1]);
+                const auto signs=py::cast<py::array>(arrays[3*spin+2]);
+                array_check(source,py::dtype::of<Offset>(),source.size());
+                array_check(target,py::dtype::of<Offset>(),source.size());
+                array_check(signs,py::dtype::of<int8_t>(),source.size());
+                const auto *s=static_cast<const Offset*>(source.data()),*t=static_cast<const Offset*>(target.data());
+                const auto *v=static_cast<const int8_t*>(signs.data());
+                std::set<Offset> left,right;
+                map.source[spin].reserve(source.size());map.target[spin].reserve(source.size());map.sign[spin].reserve(source.size());
+                for (Offset i=0;i<source.size();++i) {
+                    if (s[i]<0 || s[i]>=width || t[i]<0 || t[i]>=width || (v[i]!=1 && v[i]!=-1) ||
+                        !left.insert(s[i]).second || !right.insert(t[i]).second)
+                        throw py::value_error("Invalid or duplicate spin-map address/sign");
+                    map.source[spin].push_back(s[i]);map.target[spin].push_back(t[i]);map.sign[spin].push_back(v[i]);
+                }
+                bool overlap=false;
+                for (auto address:left) overlap|=right.count(address)!=0;
+                disjoint|=!overlap;
+            }
+            if (!disjoint) throw py::value_error("Cartesian rotation pairs must be disjoint");
+            products_.push_back(std::move(map));
+        }
+        const auto *p=static_cast<const Offset*>(ids.data()),*m=static_cast<const Offset*>(products.data());
+        const auto *c=static_cast<const double*>(scales.data());
+        for (Offset g=0;g<n;++g) {
+            if (p[g]<0 || p[g]>=parameters || m[g]<0 || m[g]>=static_cast<Offset>(products_.size()) || !std::isfinite(c[g]))
+                throw py::value_error("Invalid gate parameter, product or scale");
+            const auto &map=products_[m[g]];
+            gates_.push_back({p[g],0,static_cast<Offset>(map.source[0].size()*map.source[1].size()),c[g],m[g]});
+        }
+    }
+
     RotationPlan(Offset dimension,Offset parameters,py::array ids,py::array scales,
                  py::array starts,py::array stops,py::array sources,
                  py::array targets,py::array signs):sources_(sources),targets_(targets),
@@ -315,6 +403,14 @@ public:
             gates_.push_back({p[g],a[g],b[g],c[g]});
         }
         if (int32_) validate_pairs<int32_t>(); else validate_pairs<int64_t>();
+    }
+
+    Offset storage_bytes() const {
+        Offset size=gates_.capacity()*sizeof(Gate);
+        if (!width_) return size+sources_.nbytes()+targets_.nbytes()+signs_.nbytes();
+        for (const auto &map:products_) for (int spin=0;spin<2;++spin)
+            size+=(map.source[spin].capacity()+map.target[spin].capacity())*sizeof(Offset)+map.sign[spin].capacity();
+        return size;
     }
 
     void forward(py::array theta,py::array state,int threads,Offset minimum,bool adjoint) const {
@@ -384,6 +480,10 @@ PYBIND11_MODULE(_uscc_native,module) {
 #endif
     module.attr("compiler")=__VERSION__;
     py::class_<RotationPlan>(module,"RotationPlan")
+        .def_property_readonly("storage_bytes", &RotationPlan::storage_bytes)
+        .def(py::init<Offset,Offset,py::array,py::array,py::array,py::list>(),
+             py::arg("width"),py::arg("parameter_count"),py::arg("parameter_ids").noconvert(),
+             py::arg("scales").noconvert(),py::arg("product_ids").noconvert(),py::arg("maps"))
         .def(py::init<Offset,Offset,py::array,py::array,py::array,py::array,py::array,py::array,py::array>(),
              py::arg("dimension"),py::arg("parameter_count"),py::arg("parameter_ids").noconvert(),
              py::arg("scales").noconvert(),py::arg("starts").noconvert(),py::arg("stops").noconvert(),
@@ -395,6 +495,7 @@ PYBIND11_MODULE(_uscc_native,module) {
         .def("reverse",&RotationPlan::reverse,py::arg("parameters").noconvert(),py::arg("state").noconvert(),
              py::arg("costate").noconvert(),py::arg("gradient").noconvert(),py::arg("threads")=1,py::arg("minimum_pairs")=0);
     module.def("openmp_max_threads",[](){return omp_get_max_threads();});
+    module.attr("cartesian_rotations")=true;
     module.def("openmp_max_active_levels",[](){return omp_get_max_active_levels();});
 #ifdef USCC_PYSCF_BATCH
     module.def("contract_2e_batch",&contract_2e_batch,py::arg("eri").noconvert(),py::arg("states").noconvert(),

@@ -216,20 +216,25 @@ class SectorSimulator:
         return applied*self.phases+self.integrals.constant*vectors
 
     def plan(self, excitations, steps):
-        validate_evolution(self.spin_adaptation, self.trotter_order, steps)
-        if self._steps != steps or self._order != self.trotter_order or self._excitations is None or len(excitations) != len(self._excitations) or any(a is not b for a,b in zip(excitations,self._excitations)):
+        self._plan_context(excitations, steps)
+        if self._plan is None:
             if self._native_module is not None:
                 self._build_native_pairs(excitations)
             self._plan = tuple((i,scale,*self.pairs(term.holes,term.particles))
                                for i,excitation in enumerate(excitations)
                                for term,scale in component_schedule(excitation,steps,self.trotter_order))
+        return self._plan
+
+    def _plan_context(self, excitations, steps):
+        validate_evolution(self.spin_adaptation, self.trotter_order, steps)
+        if self._steps != steps or self._order != self.trotter_order or self._excitations is None or len(excitations) != len(self._excitations) or any(a is not b for a,b in zip(excitations,self._excitations)):
+            self._plan = None
             self._packed_plan = None
             self._adjoint_plan = None
             self._native_plan = None
             # Keep references so object IDs cannot be recycled under the cache.
             self._excitations, self._steps = tuple(excitations), steps
             self._order = self.trotter_order
-        return self._plan
 
     def generator(self, excitations, parameters):
         """Sparse sum theta_i (T_i - T_i†) in the fixed electron sector.
@@ -347,6 +352,7 @@ class SectorSimulator:
 
     def packed_plan(self):
         if self._packed_plan is None:
+            self.plan(self._excitations, self._steps)
             parameter_ids, scales, starts, stops = [], [], [], []
             sources, targets, signs, offsets = [], [], [], {}
             offset = 0
@@ -369,15 +375,34 @@ class SectorSimulator:
             self._packed_plan = (np.array(parameter_ids,dtype=int),np.array(scales),np.array(starts,dtype=int),np.array(stops,dtype=int),concatenate(sources,address_dtype),concatenate(targets,address_dtype),concatenate(signs,np.int8))
         return self._packed_plan
 
-    def native_plan(self):
+    def native_plan(self, excitations=None, steps=1):
         """Validated immutable native plan, rebuilt after order/growth/step changes."""
         if self._native_module is None:
             raise RuntimeError('Native kernels are not selected')
+        if excitations is not None:
+            self._plan_context(excitations, steps)
         if self._native_plan is None:
-            packed = self.packed_plan()
-            for array in packed:
-                array.flags.writeable = False
-            self._native_plan = self._native_module.RotationPlan(self.dimension,len(self._excitations),*packed)
+            if getattr(self._native_module, 'cartesian_rotations', False):
+                maps, products, ids, scales, monomials = [], [], [], [], {}
+                for i, excitation in enumerate(self._excitations):
+                    for term, scale in component_schedule(excitation, self._steps, self.trotter_order):
+                        key = term.holes, term.particles
+                        if key not in monomials:
+                            alpha, beta, parity, constant = self.excitation_layout(*key)
+                            signs_a = (1-2*constant)*self.string_parities(parity >> 1)[alpha[0]]
+                            signs_b = self.string_parities(parity)[beta[0]]
+                            monomials[key] = len(maps)
+                            maps.append((*alpha, np.ascontiguousarray(signs_a, dtype=np.int8),
+                                         *beta, np.ascontiguousarray(signs_b, dtype=np.int8)))
+                        ids.append(i); scales.append(scale); products.append(monomials[key])
+                self._native_plan = self._native_module.RotationPlan(
+                    self.shape[1], len(self._excitations), np.asarray(ids, dtype=np.intp),
+                    np.asarray(scales, dtype=float), np.asarray(products, dtype=np.intp), maps)
+            else:
+                packed = self.packed_plan()
+                for array in packed:
+                    array.flags.writeable = False
+                self._native_plan = self._native_module.RotationPlan(self.dimension,len(self._excitations),*packed)
         return self._native_plan
 
     def effective_rotation_threads(self):
@@ -439,10 +464,10 @@ class SectorSimulator:
         validate_evolution(self.spin_adaptation, self.trotter_order, steps)
         if self.spin_adaptation != 'trotter':
             return self._exponential_action(state, parameters, excitations, adjoint=adjoint)
-        plan = self.plan(excitations,steps)
         if self._native_module is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')):
-            self.native_plan().forward(np.ascontiguousarray(parameters),state,self.effective_rotation_threads(),adjoint=adjoint)
+            self.native_plan(excitations, steps).forward(np.ascontiguousarray(parameters),state,self.effective_rotation_threads(),adjoint=adjoint)
             return state
+        plan = self.plan(excitations,steps)
         if self._forward is not None and state.dtype in (np.dtype('float64'),np.dtype('complex128')):
             packed = self.packed_plan()
             if adjoint:
@@ -486,11 +511,10 @@ class SectorSimulator:
                     plan.native.forward_batch(np.ascontiguousarray(parameters), states, threads, adjoint=adjoint)
                     return states
             return self._exponential_action(states.T, parameters, excitations, adjoint=adjoint).T.copy()
-        self.plan(excitations, steps)
         if len(states) == 1:
             states[0] = self.apply_unitary(states[0], parameters, excitations, steps, adjoint=adjoint)
             return states
-        if self._native_module is not None and hasattr(self.native_plan(), 'forward_batch') and states.dtype in (np.dtype('float64'),np.dtype('complex128')):
+        if self._native_module is not None and hasattr(self.native_plan(excitations, steps), 'forward_batch') and states.dtype in (np.dtype('float64'),np.dtype('complex128')):
             threads = min(len(states), self.sector_threads or lib.num_threads())
             if threads:
                 self.native_plan().forward_batch(np.ascontiguousarray(parameters), states, threads, adjoint=adjoint)

@@ -431,10 +431,12 @@ def _singlet_coupling_template(holes, particles):
     return tuple(tuple(vector.items()) for vector in basis)
 
 
-def singlet_excitations(electrons, qubits, ranks=(1, 2, 3, 4), orbital_irreps=None):
+def singlet_excitations(electrons, qubits, ranks=(1, 2, 3, 4), orbital_irreps=None, *, block_cache=None):
     """Enumerate normalized singlet blocks for a closed-shell active reference.
 
     Optional Abelian orbital irrep IDs use the XOR multiplication convention.
+    ``block_cache`` may supply complete canonical blocks already discovered by
+    ground selection, avoiding reconstruction after eviction from the LRU.
     """
     if electrons < 0 or electrons % 2 or qubits % 2 or electrons > qubits:
         raise ValueError('A closed-shell reference requires even electron and mode counts')
@@ -457,5 +459,7 @@ def singlet_excitations(electrons, qubits, ranks=(1, 2, 3, 4), orbital_irreps=No
                         irrep ^= int(orbital_irreps[i])
                     if irrep:
                         continue
-                result.extend(singlet_excitations_for_block(holes, particles))
+                block = holes, particles
+                cached = None if block_cache is None else block_cache.get(block)
+                result.extend(singlet_excitations_for_block(holes, particles) if cached is None else cached)
     return result

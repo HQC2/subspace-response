@@ -86,7 +86,17 @@ class USCCResponse:
         if excitations is None:
             if type(max_rank) is not int or max_rank < 1:
                 raise ValueError('max_rank must be a positive integer')
-            excitations = singlet_excitations(self.integrals.electrons,self.integrals.qubits,range(1,max_rank+1))
+            # Selectors retain complete immutable canonical blocks, even after
+            # the shared small LRU has evicted them. Reuse their CSFs/IDs;
+            # the response pool still has its independent rank and full order.
+            block_cache = {}
+            for name in ('_spqe_selector', '_linear_spqe_selector', '_gradient_selector'):
+                cached = getattr(wavefunction, name, None)
+                if cached is not None:
+                    _, selector = cached
+                    block_cache.update(selector._blocks)
+            excitations = singlet_excitations(self.integrals.electrons,self.integrals.qubits,range(1,max_rank+1),
+                                             block_cache=block_cache)
         self.space = ResponseSpace(self.simulator,excitations)
         self.ground_state = self._unitary(self.simulator.initial)
         applied = self.simulator.apply_hamiltonian(self.ground_state)
@@ -238,7 +248,14 @@ class USCCResponse:
         return raw.astype(int)
 
     def _column_batch_size(self):
-        limit = min(32, max(1, 64*1024**2//(8*self.simulator.dimension)))
+        sim = self.simulator
+        # Compressed Trotter plans avoid the large expanded pair tables.
+        # Spend a bounded part of that saving on rows, so e.g. CAS(12,12)
+        # can occupy all 12 workers instead of stopping at nine. This is a
+        # per-state-buffer cap; Hamiltonian/unitary actions own more than one.
+        compressed = sim.spin_adaptation == 'trotter' and getattr(sim._native_module, 'cartesian_rotations', False)
+        budget = (128 if compressed else 64)*1024**2
+        limit = min(32, max(1, budget//(8*sim.dimension)))
         workers = self.simulator.sector_threads or lib.num_threads()
         return limit-limit%workers if limit >= workers else limit
 
