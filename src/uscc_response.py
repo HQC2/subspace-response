@@ -403,7 +403,7 @@ class USCCResponse:
         coefficients = np.asarray(meta['mo_coeff'])[:,core:core+self.simulator.n_orbitals]
         return -np.einsum('pi,xpq,qj->xij',coefficients,molecule.intor('int1e_r'),coefficients)
 
-    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500, denominator_floor=1e-10):
+    def solve(self, source, *, omega=0., gamma=0., tolerance=1e-6, maxiter=500, denominator_floor=1e-10):
         """Solve (K-(omega+i*gamma)I)x=source; audit the true residual.
 
         HF Fock excitation gaps precondition every response solve.
@@ -412,7 +412,7 @@ class USCCResponse:
         return self._solve(source, omega=omega, gamma=gamma, tolerance=tolerance,
                            maxiter=maxiter, denominator_floor=denominator_floor)[0]
 
-    def _solve(self, source, *, omega=0., gamma=0., tolerance=1e-9, maxiter=500, denominator_floor=1e-10):
+    def _solve(self, source, *, omega=0., gamma=0., tolerance=1e-6, maxiter=500, denominator_floor=1e-10):
         """Return the solution and its audited residual norm for selection."""
         source = np.asarray(source)
         if source.shape != (len(self.space),) or not np.all(np.isfinite(source)):

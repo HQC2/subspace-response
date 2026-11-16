@@ -197,7 +197,7 @@ class _ConnectedCouplings:
 
 def select_response(candidates, properties, *, property_threshold=1e-4,
                     response_threshold=1e-4, response_score='coupling', seed_rank=1, shifts=(0j,),
-                    denominator_floor=.05, solver_tolerance=1e-11, max_cycles=50, maxiter=500):
+                    denominator_floor=.05, solver_tolerance=1e-6, max_cycles=50, maxiter=500):
     """Select from a response object's independent rank-limited candidate pool.
 
     U and its ground-state parameters remain fixed. A zero threshold includes

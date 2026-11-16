@@ -21,17 +21,16 @@ def parser():
     response.add_argument('--components', nargs='+', choices=['x', 'y', 'z'], default=['x', 'y', 'z'], help='Dipole components defining both the tensor and selected space')
     response.add_argument('--frequencies', nargs='+', type=float, default=[0.], help='Real frequencies omega (default: static, 0)')
     response.add_argument('--damping', type=float, default=0., help='Nonnegative imaginary shift gamma (default: %(default)s)')
-    response.add_argument('--response-tolerance', type=float, default=1e-9, help='Relative linear-solve tolerance (default: %(default)s)')
+    response.add_argument('--response-tolerance', type=float, default=1e-6, help='Relative residual tolerance for selection and final linear solves (default: %(default)s)')
     response.add_argument('--response-maxiter', type=int, default=500, help='Linear solver iteration limit (default: %(default)s)')
     response.add_argument('--lr-memory-mb', type=float, default=1024., help='LR workspace budget in MiB, excluding integrals and simulator plans (default: %(default)s)')
     selection = cli.add_argument_group('response operator selection (+V/+X; state-transfer LR equations are fixed)')
-    selection.add_argument('--response-selection', choices=['full', *COUPLING_MODES], default='full', help='Full candidate pool, or +X external equation-residual screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling). All choices solve correlated-USCC state-transfer LR equations (default: %(default)s)')
+    selection.add_argument('--response-selection', choices=[*COUPLING_MODES, 'full'], default='coupling', help='+X external equation-residual screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling), or full candidate pool. (default: %(default)s)')
     selection.add_argument('--property-threshold', type=float, default=1e-4, help='+V threshold on absolute dipole coupling (default: %(default)s)')
     selection.add_argument('--response-threshold', type=float, default=1e-4, help='+X threshold on external block residual norm over properties and unique frequency branches, in dipole units (default: %(default)s)')
     selection.add_argument('--response-seed-rank', type=int, default=1, help='Ranks always included in the seed; 0 uses +V alone (default: %(default)s)')
     selection.add_argument('--response-max-cycles', type=int, default=50, help='Response selection growth limit (default: %(default)s)')
     selection.add_argument('--denominator-floor', type=float, default=.05, help='Positive floor for inner-solver orbital-gap preconditioning (default: %(default)s)')
-    selection.add_argument('--selection-solver-tolerance', type=float, default=1e-11, help='Relative inner response-selection solve tolerance (default: %(default)s)')
     return cli
 
 
@@ -47,7 +46,7 @@ def validate_args(args, cli):
         value = getattr(args, name)
         if not np.isfinite(value) or value < 0:
             cli.error(f'--{name.replace("_", "-")} must be finite and nonnegative')
-    for name in ('response_tolerance', 'selection_solver_tolerance', 'denominator_floor'):
+    for name in ('response_tolerance', 'denominator_floor'):
         value = getattr(args, name)
         if not np.isfinite(value) or value <= 0:
             cli.error(f'--{name.replace("_", "-")} must be finite and positive')
@@ -70,15 +69,14 @@ def calculate_response(model, args):
                          f'selection={args.response_selection}. LR uses the fixed-sector simulator.')
         progress.message(f'Components={" ".join(args.components)}; frequencies={args.frequencies} hartree; '
                          f'damping={args.damping:g} hartree. Both frequency branches contribute.')
-        progress.message(f'Final linear solves: relative residual tolerance={args.response_tolerance:.3e}, '
+        progress.message(f'Selection and final linear solves: relative residual tolerance={args.response_tolerance:.3e}, '
                          f'max iterations={args.response_maxiter}; orbital-gap preconditioning.')
         if args.response_selection != 'full':
             progress.message(f'Selection settings: seed rank={args.response_seed_rank}, '
                              f'dipole threshold (+V)={args.property_threshold:g}, '
                              f'block residual threshold (+X)={args.response_threshold:g}, '
                              f'growth limit={args.response_max_cycles}.')
-            progress.message(f'Inner linear solves: relative tolerance={args.selection_solver_tolerance:.3e}, '
-                             f'denominator floor={args.denominator_floor:g} hartree; selected equations always use U†HU.')
+            progress.message(f'Selection denominator floor={args.denominator_floor:g} hartree.')
     # The constructor requires a positive rank even for a fully occupied space.
     response = USCCResponse(model, max_rank=max(1, max_rank),
                             sector_threads=model.sector_threads, progress=progress, compact=True, memory_mb=args.lr_memory_mb)
@@ -97,7 +95,7 @@ def calculate_response(model, args):
             seed_rank=args.response_seed_rank,
             shifts=[complex(w, args.damping) for w in args.frequencies],
             denominator_floor=args.denominator_floor,
-            solver_tolerance=args.selection_solver_tolerance, max_cycles=args.response_max_cycles,
+            solver_tolerance=args.response_tolerance, max_cycles=args.response_max_cycles,
             maxiter=args.response_maxiter)
         response = selected.response
         print(f'Response operator selection: {selected.stop_reason}; {len(response.space)}/{candidate_dimension} CSFs', flush=True)
@@ -143,7 +141,7 @@ def calculate_response(model, args):
             criterion='external-block-frobenius',
             property_threshold=args.property_threshold, response_threshold=args.response_threshold,
             seed_rank=args.response_seed_rank, max_cycles=args.response_max_cycles,
-            denominator_floor=args.denominator_floor, solver_tolerance=args.selection_solver_tolerance)
+            denominator_floor=args.denominator_floor)
     return result
 
 
