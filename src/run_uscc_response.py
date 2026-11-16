@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 
-from run_uscc import excitation_rank, load_ground_state, parser as ground_state_parser, run_ground_state
+from run_uscc import cli_progress, excitation_rank, load_ground_state, parser as ground_state_parser, run_ground_state
 from response_selection import COUPLING_MODES, select_response
 from uscc_response import USCCResponse
 
@@ -23,13 +23,14 @@ def parser():
     response.add_argument('--damping', type=float, default=0., help='Nonnegative imaginary shift gamma (default: %(default)s)')
     response.add_argument('--response-tolerance', type=float, default=1e-9, help='Relative linear-solve tolerance (default: %(default)s)')
     response.add_argument('--response-maxiter', type=int, default=500, help='Linear solver iteration limit (default: %(default)s)')
+    response.add_argument('--lr-memory-mb', type=float, default=1024., help='LR workspace budget in MiB, excluding integrals and simulator plans (default: %(default)s)')
     selection = cli.add_argument_group('response operator selection (+V/+X; state-transfer LR equations are fixed)')
-    selection.add_argument('--response-selection', choices=['full', *COUPLING_MODES], default='full', help='Full candidate pool, or +X coupling screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling). All choices solve correlated-USCC state-transfer LR equations (default: %(default)s)')
+    selection.add_argument('--response-selection', choices=['full', *COUPLING_MODES], default='full', help='Full candidate pool, or +X external equation-residual screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling). All choices solve correlated-USCC state-transfer LR equations (default: %(default)s)')
     selection.add_argument('--property-threshold', type=float, default=1e-4, help='+V threshold on absolute dipole coupling (default: %(default)s)')
-    selection.add_argument('--response-threshold', type=float, default=1e-4, help='+X threshold on max_i |K_ai*x_i|, in dipole units (default: %(default)s)')
+    selection.add_argument('--response-threshold', type=float, default=1e-4, help='+X threshold on external block residual norm over properties and unique frequency branches, in dipole units (default: %(default)s)')
     selection.add_argument('--response-seed-rank', type=int, default=1, help='Ranks always included in the seed; 0 uses +V alone (default: %(default)s)')
     selection.add_argument('--response-max-cycles', type=int, default=50, help='Response selection growth limit (default: %(default)s)')
-    selection.add_argument('--denominator-floor', type=float, default=.05, help='Positive floor for inner-solver preconditioning and initial coupling-cache screening (default: %(default)s)')
+    selection.add_argument('--denominator-floor', type=float, default=.05, help='Positive floor for inner-solver orbital-gap preconditioning (default: %(default)s)')
     selection.add_argument('--selection-solver-tolerance', type=float, default=1e-11, help='Relative inner response-selection solve tolerance (default: %(default)s)')
     return cli
 
@@ -55,16 +56,38 @@ def validate_args(args, cli):
             cli.error(f'--{name.replace("_", "-")} must be positive')
     if args.response_seed_rank < 0:
         cli.error('--response-seed-rank must be nonnegative')
+    if not np.isfinite(args.lr_memory_mb) or args.lr_memory_mb <= 0:
+        cli.error('--lr-memory-mb must be finite and positive')
 
 
 def calculate_response(model, args):
     """Evaluate static or frequency-dependent dipole polarizability tensors."""
     physical_rank = min(model.integrals.electrons, model.integrals.qubits-model.integrals.electrons)
     max_rank = physical_rank if args.response_max_rank is None else min(args.response_max_rank, physical_rank)
+    progress = cli_progress(args, 'Polarizability LR')
+    if progress:
+        progress.message(f'State-transfer LR on the fixed USCC reference; effective maximum rank={max_rank}; '
+                         f'selection={args.response_selection}. LR uses the fixed-sector simulator.')
+        progress.message(f'Components={" ".join(args.components)}; frequencies={args.frequencies} hartree; '
+                         f'damping={args.damping:g} hartree. Both frequency branches contribute.')
+        progress.message(f'Final linear solves: relative residual tolerance={args.response_tolerance:.3e}, '
+                         f'max iterations={args.response_maxiter}; orbital-gap preconditioning.')
+        if args.response_selection != 'full':
+            progress.message(f'Selection settings: seed rank={args.response_seed_rank}, '
+                             f'dipole threshold (+V)={args.property_threshold:g}, '
+                             f'block residual threshold (+X)={args.response_threshold:g}, '
+                             f'growth limit={args.response_max_cycles}.')
+            progress.message(f'Inner linear solves: relative tolerance={args.selection_solver_tolerance:.3e}, '
+                             f'denominator floor={args.denominator_floor:g} hartree; selected equations always use U†HU.')
     # The constructor requires a positive rank even for a fully occupied space.
     response = USCCResponse(model, max_rank=max(1, max_rank),
-                            sector_threads=model.sector_threads)
+                            sector_threads=model.sector_threads, progress=progress, compact=True, memory_mb=args.lr_memory_mb)
+    if progress:
+        progress.message(f'Matrix-free actions with occupation-block CSF transforms; LR workspace budget={args.lr_memory_mb:g} MiB '
+                         '(integrals and simulator plans excluded).')
     candidate_dimension = len(response.space)
+    if progress:
+        progress.message(f'Computing dipole integrals for components {" ".join(args.components)} in the saved active orbitals.')
     operators = response.dipole_integrals()[['xyz'.index(c) for c in args.components]]
     selected = None
     if args.response_selection != 'full':
@@ -74,18 +97,31 @@ def calculate_response(model, args):
             seed_rank=args.response_seed_rank,
             shifts=[complex(w, args.damping) for w in args.frequencies],
             denominator_floor=args.denominator_floor,
-            solver_tolerance=args.selection_solver_tolerance, max_cycles=args.response_max_cycles)
+            solver_tolerance=args.selection_solver_tolerance, max_cycles=args.response_max_cycles,
+            maxiter=args.response_maxiter)
         response = selected.response
         print(f'Response operator selection: {selected.stop_reason}; {len(response.space)}/{candidate_dimension} CSFs', flush=True)
+    elif progress:
+        progress.message(f'Using the full pool of {candidate_dimension} CSFs; no operator screening.')
     print(f'Response reference E={response.energy:.12f}; '
           f'ground residual={response.ground_residual_norm:.3e}; '
           f'{len(response.space)} CSFs', flush=True)
     tensors = []
     for omega in args.frequencies:
+        if progress:
+            progress.message(f'Computing the polarizability tensor at omega={omega:g}, gamma={args.damping:g} hartree.')
         options = dict(
             omega=omega, gamma=args.damping, tolerance=args.response_tolerance,
             maxiter=args.response_maxiter)
-        tensor = np.array([[response.linear_response(a, b, **options) for b in operators] for a in operators])
+        rows = []
+        for i, a in enumerate(operators):
+            row = []
+            for j, b in enumerate(operators):
+                if progress:
+                    progress.message(f'Computing alpha_{args.components[i]}{args.components[j]}.')
+                row.append(response.linear_response(a, b, **options))
+            rows.append(row)
+        tensor = np.array(rows)
         tensors.append(dict(omega=omega, gamma=args.damping,
                             real=tensor.real.tolist(), imag=tensor.imag.tolist()))
         print(f'omega={omega:g} gamma={args.damping:g}: polarizability ({" ".join(args.components)})\n{tensor}', flush=True)
@@ -96,13 +132,15 @@ def calculate_response(model, args):
         reference_energy=response.energy, ground_residual_norm=response.ground_residual_norm,
         sector_dimension=response.simulator.dimension, candidate_dimension=candidate_dimension,
         response_dimension=len(response.space), response_ids=list(response.space.ids),
-        solver=dict(tolerance=args.response_tolerance, maxiter=args.response_maxiter),
+        solver=dict(method='response-davidson',tolerance=args.response_tolerance,
+                    maxiter=args.response_maxiter,memory_mb=args.lr_memory_mb),
         polarizabilities=tensors,
         selection=dict(method=args.response_selection, converged=True, stop_reason='full_pool'))
     if selected is not None:
         result['selection'] = dict(
             method=args.response_selection, converged=selected.converged, stop_reason=selected.stop_reason,
             indices=list(selected.indices), history=selected.history,
+            criterion='external-block-frobenius',
             property_threshold=args.property_threshold, response_threshold=args.response_threshold,
             seed_rank=args.response_seed_rank, max_cycles=args.response_max_cycles,
             denominator_floor=args.denominator_floor, solver_tolerance=args.selection_solver_tolerance)
@@ -114,9 +152,17 @@ def main(argv=None):
     args = cli.parse_args(argv)
     validate_args(args, cli)
     try:
+        progress = cli_progress(args, 'Workflow')
+        if progress:
+            ground = 'keep the checkpoint ground state fixed' if args.response_only else 'prepare and optimize the USCC ground state'
+            progress.message(f'Plan: {ground}, then compute dipole polarizabilities '
+                             f'for {" ".join(args.components)} at {args.frequencies} hartree '
+                             f'with {args.response_selection} LR operator selection.')
         model, thresholds = load_ground_state(args, cli)
-        print(args)
         if args.response_only:
+            progress = cli_progress(args, 'Ground state')
+            if progress:
+                progress.message('Keeping the checkpoint reference fixed; skipping ground-state selection and optimization.')
             ground_result = dict(energy=float(model.expectation()), stop_reason=model.stop_reason)
             checkpoint = args.restart
         else:

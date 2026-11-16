@@ -135,12 +135,14 @@ def _select_scores(scores, epsilon):
     return selected, dict(excluded_residual_norm=float(discarded))
 
 
-def solve_pqe(objective, initial, gaps, *, residual_tolerance=1e-6, maxiter=300, memory=8):
+def solve_pqe(objective, initial, gaps, *, residual_tolerance=1e-6, maxiter=300, memory=8, callback=None):
     """Gap-preconditioned quasi-Newton/DIIS with residual-norm backtracking.
 
     objective returns (energy, selected residuals). Neither energy gradients nor
     energy decrease enter the update or convergence test. Failed solves are
     returned to the caller without committing their trial amplitudes.
+    ``callback`` receives the iteration, energy and projected residual norm
+    at iteration zero and after each accepted step.
     """
     x = np.array(initial, dtype=float, copy=True)
     gaps = np.asarray(gaps, dtype=float)
@@ -154,6 +156,8 @@ def solve_pqe(objective, initial, gaps, *, residual_tolerance=1e-6, maxiter=300,
     energy, residual = objective(x)
     for iteration in range(maxiter+1):
         norm = np.linalg.norm(residual)
+        if callback is not None:
+            callback(dict(iteration=iteration, energy=float(energy), norm=float(norm)))
         if not np.isfinite(energy) or not np.all(np.isfinite(residual)):
             message = 'Nonfinite projective energy or residual'
             break

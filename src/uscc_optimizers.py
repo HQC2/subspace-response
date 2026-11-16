@@ -38,7 +38,7 @@ def _line_search(objective, x, energy, gradient, direction, max_steps=24):
 
 def minimize_metric(objective, initial, curvature, *, gradient_tolerance=1e-6,
                     maxiter=300, history=None, algorithm='lbfgs', scale_metric=False,
-                    memory=10, warmup=3):
+                    memory=10, warmup=3, callback=None):
     """Preconditioned L-BFGS or safeguarded gradient-descent/Pulay DIIS.
 
     Secant pairs can be padded with zeros by the caller when the ansatz grows.
@@ -47,6 +47,8 @@ def minimize_metric(objective, initial, curvature, *, gradient_tolerance=1e-6,
     Steps satisfy Armijo decrease or reduce the analytic gradient within the
     energy's roundoff resolution. Convergence requires the public L2 gradient
     target, rather than a small energy change.
+    ``callback`` receives scalar iteration/energy/norm data at the initial
+    point (iteration zero) and after each accepted step, without reevaluation.
     """
     x = np.array(initial, dtype=float, copy=True)
     curvature = np.asarray(curvature, dtype=float)
@@ -71,6 +73,8 @@ def minimize_metric(objective, initial, curvature, *, gradient_tolerance=1e-6,
     points, errors = [], []
     searches, rejected = 0, 0
     for iteration in range(maxiter+1):
+        if callback is not None:
+            callback(dict(iteration=iteration, energy=float(energy), norm=float(np.linalg.norm(gradient))))
         if np.linalg.norm(gradient) <= gradient_tolerance:
             return OptimizeResult(x=x, fun=energy, jac=gradient, success=True, nit=iteration,
                                   message='L2 gradient converged', history=pairs, searches=searches, rejected=rejected)

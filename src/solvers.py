@@ -3,55 +3,211 @@
 import numpy as np
 import scipy
 from typing import Callable
+from dataclasses import dataclass
 
 
-def davidson_liu(hvp, hdiag, roots, tol=1e-3, *, verbose=False):
+@dataclass
+class DavidsonEigenResult:
+    energies: np.ndarray
+    vectors: np.ndarray
+    residual_norms: np.ndarray
+    iterations: int
+    products: int
+    restarts: int
+    subspace_limit: int
+
+
+def davidson_eigenpairs(matmat, diagonal, roots, *, tolerance=1e-9, maxiter=500,
+                        max_subspace=None, memory_bytes=128*1024**2, guesses=None,
+                        history=None, callback=None, audit=None, denominator_floor=1e-8):
+    """Bounded block Davidson--Liu for the lowest Hermitian eigenpairs.
+
+    Operators accept column batches, never a constructed Hamiltonian. Only V,
+    KV and the small Ritz matrix are retained. History contains *valid* images
+    in the current coordinates. The optional audit returns fresh operator
+    images; callers can retain underlying sector images during that audit.
     """
-    Solves for eigenvalues and eigenvectors of a hessian.
+    diagonal = np.asarray(diagonal, dtype=float)
+    n = len(diagonal)
+    if diagonal.ndim != 1 or not n or not np.all(np.isfinite(diagonal)):
+        raise ValueError('Expected a nonempty finite Davidson diagonal')
+    if type(roots) is not int or roots < 1 or not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError('Expected positive root count and Davidson tolerance')
+    if type(maxiter) is not int or maxiter < 1 or not np.isfinite(denominator_floor) or denominator_floor <= 0:
+        raise ValueError('Expected a positive Davidson iteration limit and denominator floor')
+    if not np.isfinite(memory_bytes) or memory_bytes <= 0:
+        raise ValueError('Davidson memory budget must be positive')
+    roots = min(roots, n)
+    if max_subspace is not None and (type(max_subspace) is not int or max_subspace < min(n, roots+1)):
+        raise ValueError('Davidson subspace must leave room for correction vectors')
+    limit = min(n, max_subspace if max_subspace is not None else max(32, 6*roots+12))
+    # Conservative complex-sized V/AV, Ritz and root/correction work accounting.
+    while limit >= roots and 16*(2*n*limit+4*limit*limit+5*n*roots) > memory_bytes:
+        limit -= 1
+    if limit < min(n, roots+1):
+        raise ValueError('Davidson memory budget cannot hold the requested roots and a correction subspace')
+    rng = np.random.default_rng(29)
+    initial, known = [], []
+    if history is not None:
+        hv, ha = np.asarray(history['V']), np.asarray(history['AV'])
+        if hv.ndim != 2 or hv.shape[0] != n or ha.shape != hv.shape or not np.all(np.isfinite(hv)) or not np.all(np.isfinite(ha)):
+            raise ValueError('Davidson eigenvector history does not match this space')
+        initial.extend(hv.T)
+        known.extend(ha.T)
+    if guesses is not None:
+        guesses = np.asarray(guesses)
+        if guesses.ndim == 1:
+            guesses = guesses[:, None]
+        if guesses.ndim != 2 or guesses.shape[0] != n or not np.all(np.isfinite(guesses)):
+            raise ValueError('Davidson guesses do not match this space')
+        initial.extend(guesses.T)
+        known.extend([None]*guesses.shape[1])
+    dtype = np.result_type(float, *[v.dtype for v in initial])
+    V = np.empty((n, limit), dtype=dtype)
+    AV = np.empty_like(V)
+    m, products, restarts = 0, 0, 0
+    pending = []
+    initializing = True
 
-    Args:
-        hvp (callable): hessian-vector product, function that implements the matrix-vector product of the hessian with a trial vector
-        hdiag (array): (approximate) diagonal hessian elements
-        roots (int): number of roots to solve for
-        tol (float): convergence tolerance on the residual norm
-    """
-    # select initial unit vectors based on diagonal hessian
-    grad_dim = len(hdiag)
-    V = np.zeros((grad_dim, roots))
-    V[np.argsort(hdiag)[:roots], np.arange(roots)] = 1.0
+    def independent(vector, image=None):
+        vector = np.array(vector, dtype=np.result_type(V.dtype, vector), copy=True)
+        image = None if image is None else np.array(image, dtype=np.result_type(AV.dtype, image), copy=True)
+        original = np.linalg.norm(vector)
+        if not original:
+            return None, None
+        for _ in range(2):
+            coefficients = V[:, :m].conj().T @ vector
+            vector -= V[:, :m] @ coefficients
+            if image is not None:
+                image -= AV[:, :m] @ coefficients
+        norm = np.linalg.norm(vector)
+        if norm <= 1e-12*original:
+            return None, None
+        return vector/norm, None if image is None else image/norm
 
-    AV = hvp(V)
-    for i in range(100):
-        S = V.T @ AV
-        L, Z = np.linalg.eigh(S)
-        L = L[:roots]
-        Z = Z[:, :roots]
-        X = V @ Z
-        AX = AV @ Z
-        r = (AX - L[None, :]*X)
-        residual_norms = np.linalg.norm(r, axis=0)
+    def append(vector, image=None):
+        nonlocal m, V, AV, products
+        if image is None and initializing:
+            pending.append(m)
+            image = np.zeros(n,dtype=V.dtype)
+        elif image is None:
+            image = np.asarray(matmat(vector[:, None]))
+            if image.shape != (n, 1):
+                raise ValueError('Davidson operator returned an invalid block')
+            image = image[:, 0]
+            products += 1
+        if not np.all(np.isfinite(image)):
+            raise ValueError('Davidson operator returned nonfinite data')
+        promoted = np.result_type(V, image)
+        if promoted != V.dtype:
+            V, AV = V.astype(promoted), AV.astype(promoted)
+        V[:, m], AV[:, m] = vector, image
+        m += 1
+
+    target = min(limit, n, max(roots+3, 2*roots+1))
+    for vector, image in zip(initial, known):
+        if m >= min(target, limit-1 if limit > roots else limit):
+            break
+        vector, image = independent(vector, image)
+        if vector is not None:
+            append(vector, image)
+    for index in np.argsort(diagonal, kind='stable'):
+        if m >= max(roots, target-1):
+            break
+        vector = np.zeros(n)
+        vector[index] = 1.
+        vector, _ = independent(vector)
+        if vector is not None:
+            append(vector)
+    # A dense guard reduces the risk of remaining confined to a guessed
+    # symmetry block. As in any iterative eigensolver, it is not a certificate
+    # that all lower disconnected states have been found.
+    if m < target:
+        vector, _ = independent(rng.normal(size=n))
+        if vector is not None:
+            append(vector)
+    initializing = False
+    if pending:
+        block = np.asarray(matmat(V[:,pending]))
+        if block.shape != (n,len(pending)) or not np.all(np.isfinite(block)):
+            raise ValueError('Davidson operator returned an invalid initial block')
+        promoted = np.result_type(V,block)
+        V,AV = V.astype(promoted,copy=False),AV.astype(promoted,copy=False)
+        AV[:,pending] = block
+        products += len(pending)
+    for iteration in range(1, maxiter+1):
+        reduced = V[:, :m].conj().T @ AV[:, :m]
+        if not np.allclose(reduced, reduced.conj().T, atol=1e-10, rtol=1e-10):
+            raise ValueError('Davidson operator/history is not Hermitian')
+        values, coefficients = np.linalg.eigh((reduced+reduced.conj().T)/2)
+        energies = values[:roots]
+        vectors = V[:, :m] @ coefficients[:, :roots]
+        images = AV[:, :m] @ coefficients[:, :roots]
+        residuals = images-vectors*energies
+        norms = np.linalg.norm(residuals, axis=0)
+        if callback is not None:
+            callback(dict(iteration=iteration, energies=energies.tolist(), residual_norms=norms.tolist(),
+                          dimension=m, products=products, restarts=restarts, subspace_limit=limit))
+        if np.all(norms <= tolerance):
+            audited = np.asarray((audit or matmat)(vectors))
+            products += roots
+            if audited.shape != vectors.shape or not np.all(np.isfinite(audited)):
+                raise ValueError('Davidson audit returned an invalid block')
+            norms = np.linalg.norm(audited-vectors*energies, axis=0)
+            if np.any(norms > tolerance):
+                raise RuntimeError('Excitation eigensolve did not converge (true residual)')
+            return DavidsonEigenResult(energies, vectors, norms, iteration, products, restarts, limit)
+        if iteration == maxiter:
+            break
+        if m+min(roots, np.count_nonzero(norms > tolerance)) > limit:
+            keep = min(m, max(roots, min(2*roots, limit-1)))
+            new_v = V[:, :m] @ coefficients[:, :keep]
+            new_av = AV[:, :m] @ coefficients[:, :keep]
+            V[:, :keep], AV[:, :keep] = new_v, new_av
+            m = keep
+            restarts += 1
+        # Orthogonalize a whole correction block before applying the operator.
+        start = m
+        for root in np.argsort(-norms):
+            if norms[root] <= tolerance or m == limit:
+                continue
+            denominator = diagonal-energies[root]
+            denominator = np.where(abs(denominator) < denominator_floor,
+                                   np.where(denominator < 0, -denominator_floor, denominator_floor), denominator)
+            vector, _ = independent(-residuals[:, root]/denominator)
+            if vector is None:
+                vector, _ = independent(residuals[:, root])
+            if vector is not None:
+                V[:, m] = vector
+                m += 1
+        if m == start and m < limit:
+            vector, _ = independent(rng.normal(size=n))
+            if vector is not None:
+                V[:, m] = vector
+                m += 1
+        if m == start:
+            raise RuntimeError('Excitation Davidson stagnated before convergence')
+        block = np.asarray(matmat(V[:, start:m]))
+        products += m-start
+        if block.shape != (n, m-start) or not np.all(np.isfinite(block)):
+            raise ValueError('Davidson operator returned an invalid block')
+        promoted = np.result_type(AV, block)
+        if promoted != AV.dtype:
+            V, AV = V.astype(promoted), AV.astype(promoted)
+        AV[:, start:m] = block
+    raise RuntimeError(f'Excitation Davidson did not converge after {maxiter} iterations (max residual={max(norms):.3e})')
+
+
+def davidson_liu(hvp, hdiag, roots, tol=1e-3, *, verbose=False, **options):
+    """Compatible Hessian interface to the bounded block Davidson solver."""
+    callback = options.pop('callback',None)
+    def report(event):
         if verbose:
-            print(f'Iter    Root    Residual        Eigenvalue (au, eV)')
-            for k in range(len(L)):
-                print(f'{i+1}       {k+1}       {residual_norms[k]:.6e}    {L[k]:.6f} {L[k]*27.2114:.6f}')
-        if all(residual_norms < tol):
-            return L, X
-        delta = np.array([1/(L[k] - hdiag)*r[:, k] for k in range(len(L))]).T
-        delta_norms = np.linalg.norm(delta, axis=0)
-        delta /= delta_norms
-
-        new_vs = []
-        for k in range(len(L)):
-            q = delta[:, k] - V @ (V.T @ delta[:, k])
-            qnorm = np.linalg.norm(q)
-            residual_norm = residual_norms[k]
-            if qnorm > 1e-3 and residual_norm > tol:
-                vp = q/qnorm
-                V = np.hstack([V, vp[:, None]])
-                new_vs.append(vp)
-        new_vs = np.array(new_vs).T
-        AV = np.hstack([AV, hvp(new_vs)])
-    raise ValueError('Convergence not reached')
+            print(f"Davidson iteration {event['iteration']}: residuals={event['residual_norms']}", flush=True)
+        if callback is not None:
+            callback(event)
+    result = davidson_eigenpairs(hvp, hdiag, roots, tolerance=tol, callback=report, **options)
+    return result.energies, result.vectors
 
 
 def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=False):
@@ -104,7 +260,7 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
 
 def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
                       tol=1e-6, verbose=False, *, maxiter=500,
-                      denominator_floor=1e-10):
+                      denominator_floor=1e-10, callback=None, memory_bytes=128*1024**2, audit=None):
     """Solve ``(A + (omega + i*gamma) I) x = b`` by response Davidson.
 
     The plus sign preserves this module's historical frequency convention.
@@ -118,6 +274,13 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
     conjugate projections, double orthogonalization, and solution restarts.
     Nonconvergence and singular systems raise RuntimeError, never return a
     silently unconverged solution.
+    ``callback`` receives each one-based iteration's residual norm, absolute
+    tolerance and subspace dimension. With ``audit``, apparent convergence is
+    checked with a fresh unshifted operator image. A failed audit replaces the
+    cached residual and restarts from x and its true image before continuing;
+    it never loosens the requested tolerance. Refresh events include
+    ``residual_replacement=True``. The accepted audit can be retained by the
+    caller, avoiding another expensive action after return.
     """
     b = np.asarray(b)
     if b.ndim != 1 or not np.all(np.isfinite(b)):
@@ -143,7 +306,13 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
     b = b.astype(dtype, copy=False)
     if not np.any(b):
         return np.zeros_like(b), history
+    if not np.isfinite(memory_bytes) or memory_bytes <= 0:
+        raise ValueError('Response Davidson memory budget must be positive')
     limit = min(n, 64)
+    while limit and 16*(2*n*limit+4*limit*limit+8*n) > memory_bytes:
+        limit -= 1
+    if limit < min(n, 2):
+        raise ValueError('Response Davidson memory budget cannot hold a correction subspace')
 
     def matvec(v):
         if matrix is not None:
@@ -170,8 +339,7 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
         old_v, old_av = np.asarray(history['V']), np.asarray(history['AV'])
         if old_v.ndim != 2 or old_v.shape[0] != n or old_av.shape != old_v.shape or not np.all(np.isfinite(old_v)) or not np.all(np.isfinite(old_av)):
             raise ValueError('Davidson history does not match the response space')
-        if old_v.shape[1] > limit:
-            raise ValueError('Davidson history exceeds the bounded subspace')
+        old_v, old_av = old_v[:, :limit], old_av[:, :limit]
         dtype = np.result_type(dtype, old_v, old_av)
     V = np.empty((n, limit), dtype=dtype)
     AV = np.empty_like(V)
@@ -221,8 +389,30 @@ def davidson_response(A, b, hdiag, history=None, omega=None, gamma=None,
         ax = AV[:, :m] @ coefficients
         residual = b-ax-shift*x
         residual_norm = scipy.linalg.norm(residual)
+        if callback is not None:
+            callback(dict(iteration=iteration+1, residual_norm=float(residual_norm), tolerance=tol, dimension=m))
         if verbose:
             print(f'Iteration {iteration+1:3d} residual norm: {residual_norm:6e}')
+        if residual_norm <= tol and audit is not None:
+            ax = np.asarray(audit(x))
+            if ax.shape != b.shape or not np.all(np.isfinite(ax)):
+                raise ValueError('Response audit returned an invalid vector')
+            residual = b-ax-shift*x
+            residual_norm = scipy.linalg.norm(residual)
+            if residual_norm > tol:
+                # Long matrix-free actions can accumulate roundoff differently
+                # on x than on the cached basis combination AV @ coefficients.
+                # Re-anchor both V and AV to the fresh image before correcting.
+                norm = scipy.linalg.norm(x)
+                m = 0
+                if norm:
+                    append(x/norm,ax/norm)
+                if callback is not None:
+                    callback(dict(iteration=iteration+1,residual_norm=float(residual_norm),
+                                  tolerance=tol,dimension=m,residual_replacement=True))
+                # Resolve the refreshed reduced equation before generating a
+                # new direction: the correction may already lie in span(x).
+                continue
         if residual_norm <= tol:
             return x, dict(V=V[:, :m].copy(), AV=AV[:, :m].copy())
         if iteration+1 == maxiter:

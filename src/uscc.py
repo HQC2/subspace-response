@@ -20,6 +20,7 @@ from stateprep import stateprep
 from ucc_circuits import apply_ucc
 from ucc_evolution import component_schedule, validate_evolution
 from uscc_optimizers import excitation_curvature, minimize_metric
+from calculation_progress import emit
 from spqe import ReferenceProjector, SPQESelection, solve_pqe
 from gradient_selection import GradientSelection
 from linear_spqe import LinearSPQESelection
@@ -240,7 +241,7 @@ class USCC:
         self._H = operator
 
     @classmethod
-    def from_molecule(cls, symbols, geometry, charge=0, basis='sto-3g', *, unit='bohr', active_electrons=None, active_orbitals=None, **kwargs):
+    def from_molecule(cls, symbols, geometry, charge=0, basis='sto-3g', *, unit='bohr', active_electrons=None, active_orbitals=None, progress=None, **kwargs):
         geometry = np.asarray(geometry, dtype=float)
         if geometry.shape != (len(symbols),3) or not np.all(np.isfinite(geometry)):
             raise ValueError('Expected one finite xyz coordinate per atom')
@@ -249,14 +250,21 @@ class USCC:
         m = pyscf.M(atom=[(s, tuple(x)) for s,x in zip(symbols,geometry)], charge=charge, basis=basis, unit=unit, spin=0, verbose=0)
         if m.nelectron % 2:
             raise ValueError('The initial implementation requires a closed-shell reference')
-        mf = pyscf.scf.RHF(m).run()
+        emit(progress, 'scf_start', basis=basis, charge=charge, atoms=len(symbols))
+        mf = pyscf.scf.RHF(m)
+        if progress is not None:
+            mf.callback = lambda env: emit(progress, 'scf_iteration', iteration=env['cycle']+1,
+                                          energy=float(env['e_tot']), gradient_norm=float(env['norm_gorb']))
+        mf.run()
         if not mf.converged:
             raise RuntimeError('RHF reference did not converge')
+        emit(progress, 'scf_complete', energy=float(mf.e_tot))
         ne = m.nelectron if active_electrons is None else active_electrons
         no = m.nao if active_orbitals is None else active_orbitals
         if not isinstance(ne, int) or not isinstance(no, int) or ne < 0 or ne % 2 or ne > m.nelectron or no < ne//2 or no+(m.nelectron-ne)//2 > m.nao:
             raise ValueError('Invalid closed-shell frozen-core active space')
         setup = SimpleNamespace(m=m, mf=mf, inactive_orbitals=(m.nelectron-ne)//2, active_orbitals=no, active_electrons=ne)
+        emit(progress, 'integrals_start', electrons=ne, orbitals=no, core=setup.inactive_orbitals)
         integrals = get_active_space_integrals(setup)
         metadata = dict(symbols=list(symbols), geometry=geometry.tolist(), unit=unit.lower(), charge=charge, basis=basis, active_electrons=ne, active_orbitals=no, inactive_orbitals=setup.inactive_orbitals, mo_coeff=mf.mo_coeff.tolist())
         result = cls(integrals, metadata=metadata, **kwargs)
@@ -547,7 +555,7 @@ class USCC:
                 raise ValueError('Invalid optimizer curvature state') from error
             return None
 
-    def optimize(self, *, gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs'):
+    def optimize(self, *, gradient_tolerance=1e-6, residual_tolerance=1e-6, energy_tolerance=1e-10, maxiter=300, method='lbfgs', progress=None):
         """Optimize with a physical diagonal metric and reusable L-BFGS pairs.
 
         L-BFGS and DIIS require the requested L2 gradient tolerance; a tiny
@@ -562,8 +570,13 @@ class USCC:
         method = method.lower()
         if method not in ('lbfgs','diis','pqe'):
             raise ValueError('Optimizer must be lbfgs, diis or pqe')
+        tolerance = residual_tolerance if method == 'pqe' else gradient_tolerance
+        emit(progress, 'optimization_start', optimizer=method, dimension=len(self.theta),
+             tolerance=tolerance, maxiter=maxiter)
+        iteration_progress = (None if progress is None else
+            lambda event: emit(progress, 'optimization_iteration', optimizer=method, tolerance=tolerance, **event))
         if method == 'pqe':
-            return self._optimize_pqe(residual_tolerance=residual_tolerance, maxiter=maxiter)
+            return self._optimize_pqe(residual_tolerance=residual_tolerance, maxiter=maxiter, callback=iteration_progress)
         initial = self.theta.copy()
         old_energy, old_gradient = self.energy_and_gradient(initial)
         last = [initial.copy(), (old_energy,old_gradient)]
@@ -576,6 +589,8 @@ class USCC:
             return last[1]
         reused = 0
         if not len(initial) or np.linalg.norm(old_gradient) <= gradient_tolerance:
+            if iteration_progress is not None:
+                iteration_progress(dict(iteration=0, energy=float(old_energy), norm=float(np.linalg.norm(old_gradient))))
             result = dict(success=True, message='Initial point converged', iterations=0)
             energy, gradient = old_energy, old_gradient
         else:
@@ -583,7 +598,8 @@ class USCC:
             reused = len(history) if history is not None else 0
             res = minimize_metric(objective,initial,excitation_curvature(self.integrals,self.excitations),
                                   gradient_tolerance=gradient_tolerance,maxiter=maxiter,history=history,
-                                  algorithm=method,scale_metric=True,memory=10 if method=='lbfgs' else 8,warmup=2)
+                                  algorithm=method,scale_metric=True,memory=10 if method=='lbfgs' else 8,warmup=2,
+                                  callback=iteration_progress)
             accepted = bool(res.success and np.all(np.isfinite(res.jac)) and np.isfinite(res.fun) and res.fun <= old_energy+energy_tolerance)
             if accepted:
                 self.theta = res.x.copy()
@@ -598,7 +614,7 @@ class USCC:
         self.needs_optimization = not result['success']
         return result
 
-    def _optimize_pqe(self, *, residual_tolerance, maxiter):
+    def _optimize_pqe(self, *, residual_tolerance, maxiter, callback=None):
         evaluations = 0
         initial = self.theta.copy()
         old_energy, old_residual = self.projective_residuals(initial)
@@ -611,7 +627,7 @@ class USCC:
                 evaluations += 1
             return last[1]
         res = solve_pqe(objective, initial, excitation_curvature(self.integrals, self.excitations)/2,
-                        residual_tolerance=residual_tolerance, maxiter=maxiter)
+                        residual_tolerance=residual_tolerance, maxiter=maxiter, callback=callback)
         # PQE solves equations; its energy need not decrease on every update.
         if res.success:
             self.theta = res.x.copy()
@@ -625,7 +641,12 @@ class USCC:
                     residual_norm=float(np.linalg.norm(residual)),
                     **self.resources())
 
-    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, residual_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None):
+    def run(self, thresholds=None, *, checkpoint=None, max_cycles=50, max_operators=None, gradient_tolerance=None, residual_tolerance=None, energy_tolerance=None, maxiter=None, optimizer=None, callback=None, progress=None):
+        """Run adaptive selection; progress receives transient phase/iteration events.
+
+        The existing callback and saved history contain only checkpoint events.
+        Neither callback is installed on the model or serialized.
+        """
         if thresholds is None:
             thresholds = self.schedule if self.schedule is not None else (1e-2,1e-3,1e-4)
         thresholds = tuple(float(x) for x in thresholds)
@@ -645,9 +666,12 @@ class USCC:
             self.history.append(event)
             if callback is not None:
                 callback(event)
+            if progress is not None:
+                progress(event)
             if checkpoint is not None:
                 self.save_checkpoint(checkpoint)
         if not self.initialized:
+            emit(progress, 'seed_start', seed=self.seed, epsilon=thresholds[0])
             if self.seed == 'sd':
                 pool = singlet_excitations(self.integrals.electrons, self.qubits, range(1,min(2,self.selector.max_rank)+1), self.selector.orbital_irreps)
                 blocks = sorted({e.block for e in pool})
@@ -656,7 +680,9 @@ class USCC:
                 proposals = [(b,s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
             else:
                 proposals = []  # Residual/variational criteria first screen the HF state.
+            emit(progress, 'growth_start', blocks=len(proposals), epsilon=thresholds[0])
             added, limited = self._append_blocks(proposals, max_operators)
+            emit(progress, 'seed_complete', added=len(added), dimension=len(self.theta), ranks=self.resources()['ranks'])
             self.initialized = not limited
             self.needs_optimization = True
             if limited:
@@ -666,7 +692,7 @@ class USCC:
         cycles = 0
         while True:
             if self.needs_optimization:
-                optimization = self.optimize(**self.optimization_settings)
+                optimization = self.optimize(**self.optimization_settings, progress=progress)
                 self.stop_reason = 'running' if optimization['success'] else 'optimizer_failure'
                 record(dict(event='optimization', threshold_index=self.threshold_index, **optimization))
                 if not optimization['success']:
@@ -680,11 +706,13 @@ class USCC:
                 record(dict(event='finished', reason=self.stop_reason))
                 return self.result()
             epsilon = thresholds[self.threshold_index]
+            emit(progress, 'selection_start', epsilon=epsilon, cycle=cycles+1, dimension=len(self.theta))
             proposals, selection_diagnostics = self._select(epsilon)
             if not proposals:
                 self.threshold_index += 1
                 record(dict(event='threshold_closed', epsilon=epsilon, **selection_diagnostics))
                 continue
+            emit(progress, 'growth_start', blocks=len(proposals), epsilon=epsilon)
             added, limited = self._append_blocks(proposals, max_operators)
             cycles += 1
             if added:

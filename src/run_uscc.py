@@ -4,6 +4,9 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from math import comb
+from pyscf import lib
+from calculation_progress import ConsoleProgress
 from uscc import USCC
 
 
@@ -72,17 +75,25 @@ def parser(*, description=__doc__):
     cli.add_argument('--rotation-threads', type=int, help='Rotation threads; default uses one for small sectors, otherwise up to two for Numba or four for native kernels')
     cli.add_argument('--device', default='lightning.qubit', help='PennyLane simulator, default %(default)s')
     cli.add_argument('--output-dir', type=Path, default=Path('uscc-output'))
+    cli.add_argument('--quiet', action='store_true', help='Print results and output paths only; suppress setup and progress messages')
     return cli
+
+
+def cli_progress(args, scope):
+    return None if getattr(args, 'quiet', False) else ConsoleProgress(scope)
 
 
 def load_ground_state(args, cli):
     """Create or restore a model using the shared ground-state arguments."""
     provided = vars(args).pop('_provided', set())
+    progress = cli_progress(args, 'Setup')
     if args.restart:
         forbidden = {'unit','basis','charge','active_electrons','active_orbitals','max_rank','seed','selection','trotter_steps','trotter_order','spin_adaptation','orbital_irreps'}
         if args.xyz is not None or provided & forbidden:
             cli.error('Restart uses the saved molecule, orbitals, ansatz, and selection configuration')
         overrides = {key: getattr(args, key) for key in ('device','backend','sector_threads','sector_kernels','rotation_threads') if key in provided}
+        if progress:
+            progress.message(f'Loading the saved molecule, orbitals and USCC ansatz from {args.restart}.')
         model = USCC.from_checkpoint(args.restart, **overrides)
         thresholds = args.thresholds if args.thresholds is not None else model.schedule
         if thresholds is None:
@@ -90,6 +101,8 @@ def load_ground_state(args, cli):
     else:
         if args.xyz is None:
             cli.error('Provide an XYZ geometry or --restart')
+        if progress:
+            progress.message(f'Reading geometry from {args.xyz} ({args.unit}).')
         symbols, geometry = read_xyz(args.xyz)
         model = USCC.from_molecule(
             symbols, geometry, charge=args.charge, basis=args.basis,
@@ -100,28 +113,57 @@ def load_ground_state(args, cli):
             device=args.device, orbital_irreps=args.orbital_irreps,
             backend=args.backend, sector_threads=args.sector_threads,
             sector_kernels=args.sector_kernels,
-            rotation_threads=args.rotation_threads)
+            rotation_threads=args.rotation_threads, progress=progress)
         thresholds = args.thresholds if args.thresholds is not None else (.01,.001,.0001)
+    if progress:
+        meta = model.metadata
+        progress.message(f"Molecule: {' '.join(meta.get('symbols', []))}; basis={meta.get('basis', 'saved integrals')}, "
+                         f"charge={meta.get('charge', 0)}, geometry unit={meta.get('unit', 'saved')}.")
+        orbitals, occupied = model.qubits//2, model.integrals.electrons//2
+        progress.message(f'Active space: {model.integrals.electrons} electrons in {orbitals} spatial orbitals; '
+                         f'{comb(orbitals, occupied)**2} determinants in the fixed spin sector.')
+        progress.message(f'USCC evolution: spin adaptation={model.spin_adaptation}, '
+                         f'Trotter order={model.trotter_order}, steps={model.trotter_steps}.')
+        progress.message(f'Backend={model.backend}; sector kernel preference={model.sector_kernels}, '
+                         f'sector threads={model.sector_threads or lib.num_threads()}, '
+                         f'rotation threads={model.rotation_threads or "automatic"}.')
+        if model.backend == 'pennylane':
+            progress.message(f'PennyLane device={model.device_name}.')
+        if model.selector.orbital_irreps is not None:
+            progress.message(f'Ground-state orbital irreps: {model.selector.orbital_irreps}.')
+        progress.message(f'Loaded {len(model.excitations)} ground-state operators; output directory={args.output_dir}.')
     return model, thresholds
 
 
 def ground_state_progress(event):
-    if event['event'] == 'optimization':
-        total = sum(event['ranks'].values())
-        convergence = (f"|r|={event['residual_norm']:.3e}" if event['optimizer'] == 'pqe'
-                       else f"|g|={event['gradient_norm']:.3e}")
-        print(f"E={event['energy']:.12f} {convergence} ranks={event['ranks']} {total=} success={event['success']}", flush=True)
-    elif event['event'] == 'growth':
-        total = sum(event['ranks'].values())
-        print(f"epsilon={event['epsilon']:g}: added {len(event['added'])} operators, ranks={event['ranks']} {total=}", flush=True)
+    ConsoleProgress('Ground state')(event)
 
 
 def run_ground_state(model, thresholds, args):
     """Run selection/optimization and write the standard ground-state outputs."""
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    result = model.run(thresholds, checkpoint=args.output_dir/'checkpoint.json', max_cycles=args.max_cycles, max_operators=args.max_operators, gradient_tolerance=args.gradient_tolerance, residual_tolerance=args.residual_tolerance, energy_tolerance=args.energy_tolerance, maxiter=args.maxiter, optimizer=args.optimizer, callback=ground_state_progress)
+    progress = cli_progress(args, 'Ground state')
+    if progress:
+        settings = dict(model.optimization_settings)
+        for name, value in dict(method=args.optimizer, gradient_tolerance=args.gradient_tolerance,
+                                residual_tolerance=args.residual_tolerance,
+                                energy_tolerance=args.energy_tolerance, maxiter=args.maxiter).items():
+            if value is not None:
+                settings[name] = value
+        descriptions = dict(uscc='amplitude/integral product screening', spqe='exact projective residual screening',
+                            **{'linear-spqe': 'first-order commutator residual screening', 'gradient': 'insertion-gradient screening'})
+        progress.message(f'Selection={model.selection} ({descriptions[model.selection]}); seed={model.seed}; '
+                         f'effective maximum rank={model.selector.max_rank}.')
+        progress.message(f'Threshold schedule={list(thresholds)}; starting at schedule position {model.threshold_index+1}; '
+                         f'growth cycle limit={args.max_cycles}, operator limit={args.max_operators if args.max_operators is not None else "unlimited"}.')
+        progress.message(f"Optimizer={settings['method']}; gradient tolerance={settings['gradient_tolerance']:.3e}, "
+                         f"projected residual tolerance={settings['residual_tolerance']:.3e}, "
+                         f"energy acceptance tolerance={settings['energy_tolerance']:.3e}, max iterations={settings['maxiter']}.")
+        progress.message(f'Checkpoint will be updated at {args.output_dir/"checkpoint.json"}.')
+    result = model.run(thresholds, checkpoint=args.output_dir/'checkpoint.json', max_cycles=args.max_cycles, max_operators=args.max_operators, gradient_tolerance=args.gradient_tolerance, residual_tolerance=args.residual_tolerance, energy_tolerance=args.energy_tolerance, maxiter=args.maxiter, optimizer=args.optimizer, progress=progress)
     (args.output_dir/'result.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n')
-    print(f"Stopped: {result['stop_reason']}; energy={result['energy']:.12f}")
+    print(f"Stopped: {result['stop_reason']}; energy={result['energy']:.12f}", flush=True)
+    print(f'Ground-state results saved to {args.output_dir/"result.json"}', flush=True)
     return result
 
 
@@ -130,7 +172,6 @@ def main(argv=None):
     args = cli.parse_args(argv)
     try:
         model, thresholds = load_ground_state(args, cli)
-        print(args)
         result = run_ground_state(model, thresholds, args)
         return 1 if result['stop_reason'] == 'optimizer_failure' else 0
     except (ValueError, RuntimeError, OSError) as error:

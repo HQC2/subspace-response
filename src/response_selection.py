@@ -1,15 +1,16 @@
 """Finite-candidate +V/+X selection for fixed-ground-state USCC response.
 
-property_threshold compares |b_a| (property units); response_threshold compares
-the coupling score max_i |K_ai*x_i| (property units). +X may use dressed,
-bare or first-order commutator couplings; the response equations stay exact.
-Scores take the maximum over properties and both frequency branches. Entire spatial
-spin-coupling blocks within the supplied pool are promoted. Convergence refers
-to that finite pool.
+property_threshold compares |b_a|; response_threshold compares the external
+block residual Frobenius norm across properties and unique frequency branches.
+Screening may use dressed, bare or first-order commutator operators; selected
+response equations always use U†HU. Complete spatial spin-coupling blocks are
+promoted. Convergence refers to that finite pool and screening criterion.
 """
 from dataclasses import dataclass
 import numpy as np
 from uscc_response import USCCResponse
+from calculation_progress import emit
+from lr_screening import ExternalResiduals
 
 
 COUPLING_MODES = {'coupling': 'dressed', 'bare-coupling': 'bare', 'linear-coupling': 'linear'}
@@ -28,7 +29,9 @@ class ResponseSelection:
 
 
 class _CouplingColumns:
-    """Exact selected matrix and adaptively screened external couplings.
+    """Legacy max-product oracle, unused by production residual selection.
+
+    Exact selected matrix and adaptively screened external couplings.
 
     Sparse columns retain a bound on every omitted element. Screening checks
     that bound with the current amplitudes and remeasures only columns whose
@@ -72,6 +75,8 @@ class _CouplingColumns:
         external = np.ones(len(self.candidates.space), dtype=bool)
         external[indices] = False
         batch_size = self.candidates._column_batch_size()
+        progress = getattr(self.candidates, 'progress', None)
+        emit(progress, 'coupling_start', columns=len(missing))
         for start in range(0, len(missing), batch_size):
             chosen = missing[start:start+batch_size]
             values = self._columns(chosen)
@@ -82,6 +87,7 @@ class _CouplingColumns:
             matrix[np.ix_(positions, old_positions)] = internal[old_positions].T
             for index, column in zip(chosen, values.T):
                 self._store(index, column, external, self.cutoff)
+            emit(progress, 'coupling_progress', completed=min(start+batch_size, len(missing)), columns=len(missing))
         self.indices = indices.copy()
         self.matrix = matrix
 
@@ -191,7 +197,7 @@ class _ConnectedCouplings:
 
 def select_response(candidates, properties, *, property_threshold=1e-4,
                     response_threshold=1e-4, response_score='coupling', seed_rank=1, shifts=(0j,),
-                    denominator_floor=.05, solver_tolerance=1e-11, max_cycles=50):
+                    denominator_floor=.05, solver_tolerance=1e-11, max_cycles=50, maxiter=500):
     """Select from a response object's independent rank-limited candidate pool.
 
     U and its ground-state parameters remain fixed. A zero threshold includes
@@ -200,7 +206,10 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
     The +X modes are coupling (U†HU), bare-coupling (H), and linear-coupling
     (H+[H,A], A=sum(theta_mu*(T_mu-T_mu†))). Only external screening is
     approximated; +V, selected-space solves and final response use U†HU.
-    Scores ignore cancellations and are not external-equation error criteria.
+    Each complete spatial block is scored by the Frobenius norm of
+    b_Q-Ktilde_QP*x_P across properties and unique +/- frequency branches.
+    Full cancellations are included. Approximate modes score approximate
+    residuals, not error bounds on the dressed equations.
     """
     if any(not np.isfinite(x) or x < 0 for x in (property_threshold,response_threshold)):
         raise ValueError('Selection thresholds must be finite and nonnegative')
@@ -208,6 +217,8 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
         raise ValueError('response_score must be '+', '.join(COUPLING_MODES))
     if type(seed_rank) is not int or seed_rank < 0 or type(max_cycles) is not int or max_cycles < 1:
         raise ValueError('Expected a nonnegative seed rank and positive cycle limit')
+    if type(maxiter) is not int or maxiter < 1:
+        raise ValueError('Expected a positive response iteration limit')
     if not np.isfinite(denominator_floor) or denominator_floor <= 0 or not np.isfinite(solver_tolerance) or solver_tolerance <= 0:
         raise ValueError('Denominator floor and solver tolerance must be positive')
     properties = list(properties)
@@ -224,6 +235,7 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
     if not branches:
         raise ValueError('At least one frequency shift is required')
     excitations = candidates.space.excitations
+    emit(candidates.progress, 'properties_start')
     sources = np.array([candidates.property_vector(op) for op in properties])
     blocks = {}
     for i,excitation in enumerate(excitations):
@@ -235,43 +247,50 @@ def select_response(candidates, properties, *, property_threshold=1e-4,
         return promoted
     selected = {i for i,e in enumerate(excitations) if e.rank <= seed_rank}
     selected = promote(selected,np.any(abs(sources) >= property_threshold, axis=0))
+    emit(candidates.progress, 'lr_seed', dimension=len(selected), candidate_dimension=len(excitations),
+         description=f'complete ranks through {seed_rank} plus dipole coupling threshold {property_threshold:g}')
     history = []
     approximation = COUPLING_MODES[response_score]
-    if approximation == 'dressed':
-        amplitude_scale = max(np.linalg.norm(source) for source in sources)/denominator_floor
-        coupling_columns = _CouplingColumns(candidates, response_threshold, amplitude_scale)
-    else:
-        coupling_columns = _ConnectedCouplings(candidates, response_threshold, approximation=approximation)
     converged = False
     previous, previous_indices = None, None
     for cycle in range(max_cycles+1):
         P = np.array(sorted(selected),dtype=int)
-        weights = np.zeros(len(P))
+        emit(candidates.progress, 'lr_cycle', cycle=cycle, dimension=len(P))
         max_internal_norm = 0.
-        if approximation == 'dressed':
-            coupling_columns.add(P)
-            response = candidates._restrict(P, matrix=coupling_columns.matrix)
-        else:
-            response = candidates._restrict(P)
-            response._retain_solution_images = True
-            if previous is not None:
-                response._seed_from_response(previous, np.searchsorted(P, previous_indices))
+        response = candidates._restrict(P,matrix_free=True)
+        response._retain_solution_images = True
+        if previous is not None:
+            response._seed_from_response(previous,np.searchsorted(P,previous_indices))
+        screen = ExternalResiduals(candidates,P)
+        screen_started = False
         for shift in branches:
             dtype = complex if shift.imag else float
-            shift = shift if shift.imag else shift.real
             for source in sources:
                 rhs = source[P].astype(dtype)
-                solution, residual_norm = response._solve(rhs, omega=complex(shift).real,
-                    gamma=complex(shift).imag, tolerance=solver_tolerance, denominator_floor=denominator_floor)
-                max_internal_norm = max(max_internal_norm, residual_norm)
-                np.maximum(weights, abs(solution), out=weights)
-        passed = coupling_columns.screen(weights, P)
-        grown = promote(selected,passed)
+                solution,residual_norm = response._solve(rhs,omega=shift.real,gamma=shift.imag,
+                    tolerance=solver_tolerance,denominator_floor=denominator_floor,maxiter=maxiter)
+                max_internal_norm = max(max_internal_norm,residual_norm)
+                if not screen_started:
+                    emit(candidates.progress,'screen_start',method=response_score)
+                    screen_started = True
+                if response_threshold != 0:
+                    image = response._solution_image(rhs,shift,solver_tolerance) if approximation == 'dressed' else None
+                    if image is None:
+                        image = response.sector_images(solution[:,None],approximation=approximation)[:,0]
+                    screen.add(image,source)
+        if response_threshold == 0:
+            grown = set(range(len(excitations)))
+        else:
+            passed = np.zeros(len(excitations),dtype=bool)
+            passed[screen.passed(response_threshold)] = True
+            grown = promote(selected,passed)
+        emit(candidates.progress,'residual_screen',maximum=screen.maximum,images=len(screen.norms))
         added = grown-selected
+        emit(candidates.progress, 'lr_growth', added=len(added), dimension=len(P), will_grow=cycle < max_cycles)
         history.append(dict(cycle=cycle,dimension=len(P),ranks={str(r):sum(excitations[i].rank == r for i in P) for r in sorted({e.rank for e in excitations})},max_internal_residual_norm=max_internal_norm,added=[excitations[i].id for i in sorted(added)]))
-        history[-1].update(coupling_cache_bytes=coupling_columns.stored_bytes,
-                           coupling_dense_columns=coupling_columns.dense_columns,
-                           coupling_refined_columns=coupling_columns.refined_columns)
+        history[-1].update(criterion='external-block-frobenius',screening_operator=approximation,
+            external_residual_norms=screen.norms,max_external_block_norm=screen.maximum,
+            coupling_cache_bytes=0,coupling_dense_columns=0,coupling_refined_columns=0)
         if not added:
             converged = True
             break
