@@ -91,7 +91,3 @@ class ExcitationNeighborhood:
             if pair[0] != pair[1] or occupations[pair[0]] == (2 if removing else 0))
         return [(sum(1 << i for i in set(move)), sum(self._occupation_powers[i] for i in move))
                 for move in moves]
-
-    def generators(self, block):
-        """Reuse discovered blocks even after eviction from the shared LRU."""
-        return self._blocks[block]

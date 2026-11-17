@@ -456,7 +456,7 @@ class USCCResponse:
             while len(self._solution_images)>limit:
                 self._solution_images.popitem(last=False)
         residual_norm = float(np.linalg.norm(applied-shift*solution-source))
-        if not np.all(np.isfinite(solution)) or not np.isfinite(residual_norm) or residual_norm > tolerance*np.linalg.norm(source)*1.01:
+        if not np.all(np.isfinite(solution)) or not np.isfinite(residual_norm) or residual_norm > tolerance*np.linalg.norm(source):
             raise RuntimeError(f'Response linear solve did not converge (true residual={residual_norm:.3e}; target={tolerance*np.linalg.norm(source):.3e})')
         emit(self.progress, 'linear_complete', residual_norm=residual_norm)
         self._davidson_history = history

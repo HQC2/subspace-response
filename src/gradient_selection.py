@@ -93,7 +93,6 @@ class GradientSelection(ExcitationNeighborhood):
         norm = np.vdot(state, state).real
         energy = float(np.vdot(state, applied).real/norm)
         residual = applied-energy*state
-        floor = 64*np.finfo(float).eps*max(1., abs(energy), np.linalg.norm(applied)/np.sqrt(norm))
         if self.simulator.spin_adaptation == 'exact':
             # A new parameter lies inside the summed exponential. Its tangent
             # is L_exp(A,G)|HF>, rather than the factorized insertion G|psi>.
@@ -105,16 +104,15 @@ class GradientSelection(ExcitationNeighborhood):
             for block in sorted(self._candidates):
                 if block not in self._blocks:
                     self._blocks[block] = singlet_excitations_for_block(*block)
-                score = 0.
                 for excitation in self._blocks[block]:
                     if excitation.id in present:
                         continue
                     tangent = self.simulator.exponential_tangent(generator, excitation)
-                    score = max(score, abs(float(2*np.vdot(residual, tangent).real/norm)))
+                    value = abs(float(2*np.vdot(residual, tangent).real/norm))
+                    if value >= epsilon:
+                        proposals.append((excitation, value, 'gradient'))
                     evaluated += 1
-                if score > floor and score >= epsilon:
-                    proposals.append((block, score, 'gradient'))
-            proposals.sort(key=lambda item: (-item[1], item[0]))
+            proposals.sort(key=lambda item: (-item[1], item[0].block, item[0].coupling))
             return proposals, dict(candidate_blocks=len(self._candidates),
                                    candidate_operators=evaluated, source_blocks=len(self._sources),
                                    screened_blocks=0, evaluated_operators=evaluated)
@@ -138,24 +136,21 @@ class GradientSelection(ExcitationNeighborhood):
                 values = derivatives[starts[i]:starts[i+1]]
                 # Scalar coefficient vectors have unit Euclidean norm. By
                 # Cauchy-Schwarz every scalar gradient is bounded by ||g_m||.
-                # Pad for coefficient normalization and floating-point error.
-                bound = float(np.linalg.norm(values))*(1+1e-10)
+                bound = float(np.linalg.norm(values))
                 candidates += count
-                if bound < epsilon or bound <= floor:
+                if bound < epsilon:
                     screened += 1
                     continue
                 if block not in self._blocks:
                     self._blocks[block] = singlet_excitations_for_block(*block)
                 by_term = dict(zip(keys, values))
-                score = 0.
                 for excitation in self._blocks[block]:
                     if excitation.id not in present:
                         evaluated += 1
                         value = abs(sum(term.coefficient*by_term[term.holes, term.particles]
                                         for term in excitation.terms))
-                        score = max(score, value)
-                if score > floor and score >= epsilon:
-                    proposals.append((block, score, 'gradient'))
+                        if value >= epsilon:
+                            proposals.append((excitation, value, 'gradient'))
 
         # Cache only circuit-independent structure, never derivative values.
         # Replacing the ansatz can shrink the neighborhood, invalidating plans.
@@ -185,7 +180,7 @@ class GradientSelection(ExcitationNeighborhood):
                 self._blocks[block] = singlet_excitations_for_block(*block)
         for batch in self._batches:
             score_batch(*batch)
-        proposals.sort(key=lambda item: (-item[1], item[0]))
+        proposals.sort(key=lambda item: (-item[1], item[0].block, item[0].coupling))
         return proposals, dict(candidate_blocks=len(self._candidates),
                                candidate_operators=candidates, source_blocks=len(self._sources),
                                screened_blocks=screened, evaluated_operators=evaluated)

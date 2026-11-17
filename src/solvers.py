@@ -211,7 +211,7 @@ def davidson_liu(hvp, hdiag, roots, tol=1e-3, *, verbose=False, **options):
 
 
 def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=False):
-    if np.allclose(b, 0.0, atol=1e-20):
+    if not np.any(b):
         return b
     if omega is not None:
         I = omega*np.ones(len(b))
@@ -234,7 +234,7 @@ def cg(A, b, maxiter=100, tol=1e-4, omega=None, gamma=None, guess=None, verbose=
     direction = np.zeros_like(residual)
     direction[:] = residual[:]
     for i in range(maxiter):
-        if np.allclose(direction.imag, 0.):
+        if not np.any(direction.imag):
             product = matvec(direction)
         else:
             product_real = matvec(direction.real)

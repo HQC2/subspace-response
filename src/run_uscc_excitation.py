@@ -26,7 +26,7 @@ def parser():
     excitation.add_argument('--excitation-max-subspace', type=int, help='Davidson subspace cap; also bounded by --lr-memory-mb')
     selection = cli.add_argument_group('excitation operator selection (+X; state-transfer LR equations are fixed)')
     selection.add_argument('--excitation-selection', choices=['full', *COUPLING_MODES], default='full', help='Full pool, or external Ritz-residual screening using U†HU, H, or H+[H,A] (default: %(default)s)')
-    selection.add_argument('--excitation-threshold', type=float, default=1e-4, help='+X threshold on external block residual norm over all roots, in hartree (default: %(default)s)')
+    selection.add_argument('--excitation-threshold', type=float, default=1e-4, help='+X threshold on external CSF residual norm over all roots, in hartree (default: %(default)s)')
     selection.add_argument('--excitation-seed', choices=['rank', 'cis'], default='rank', help='Seed for selected calculations: complete ranks or PySCF singlet CIS amplitudes (default: %(default)s)')
     selection.add_argument('--excitation-seed-rank', type=int, default=1, help='Ranks included with --excitation-seed rank (default: %(default)s)')
     selection.add_argument('--cis-roots', type=int, help='CIS roots contributing to the seed (default: --roots, capped at the singles dimension)')
@@ -66,7 +66,7 @@ def calculate_excitations(model, args):
         progress.message(f'Eigensolver: absolute residual tolerance={args.excitation_tolerance:.3e} hartree, '
                          f'iteration limit={args.excitation_maxiter}.')
         if args.excitation_selection != 'full':
-            progress.message(f'Selection settings: block residual threshold={args.excitation_threshold:g} hartree, '
+            progress.message(f'Selection settings: residual threshold={args.excitation_threshold:g} hartree, '
                              f'growth limit={args.excitation_max_cycles}; selected equations always use U†HU.')
             if args.excitation_seed == 'cis':
                 progress.message(f'CIS seed: PySCF singlet TDA on saved active-space integrals, '
@@ -99,7 +99,8 @@ def calculate_excitations(model, args):
         selection = dict(method=args.excitation_selection, converged=selected.converged,
                          stop_reason=selected.stop_reason, indices=list(selected.indices),
                          history=selected.history, seed=selected.seed,
-                         criterion='external-block-frobenius',threshold=args.excitation_threshold, max_cycles=args.excitation_max_cycles)
+                         criterion='external-csf-norm',
+                         threshold=args.excitation_threshold, max_cycles=args.excitation_max_cycles)
         print(f'Excitation operator selection: {selected.stop_reason}; '
               f'{len(response.space)}/{candidate_dimension} CSFs', flush=True)
     print(f'Excitation reference E={response.energy:.12f}; '

@@ -1,4 +1,4 @@
-"""Streaming external equation residual norms for complete spatial blocks."""
+"""Streaming external equation residual norms for individual CSFs."""
 import numpy as np
 
 
@@ -7,12 +7,11 @@ class ExternalResiduals:
         self.space = candidates.space
         self.external = np.ones(len(self.space), dtype=bool)
         self.external[np.asarray(selected,dtype=int)] = False
-        self.groups = self.space.groups()
-        self.squared = np.zeros(len(self.groups))
+        self.squared = np.zeros(len(self.space))
         self.norms = []
 
     def add(self, images, sources=None):
-        """Accumulate block Frobenius norms over column roots or RHS branches.
+        """Accumulate individual-CSF norms over roots or RHS branches.
 
         Only a block-sized projection is live; never an M by P coupling table.
         With no source this is the external Ritz residual (sign immaterial).
@@ -29,23 +28,20 @@ class ExternalResiduals:
         if not np.any(self.external):
             self.norms.extend(norms.tolist())
             return
-        for block,(indices,values) in enumerate(self.space.project_blocks(images)):
+        for indices,values in self.space.project_blocks(images):
             if not np.any(self.external[indices]):
                 continue
             if sources is not None:
                 values = sources[indices]-values
-            values = values[self.external[indices]]
-            squares = np.sum(abs(values)**2,axis=0)
-            self.squared[block] += np.sum(squares)
-            norms += squares
+            mask = self.external[indices]
+            values = values[mask]
+            squares = abs(values)**2
+            self.squared[indices[mask]] += np.sum(squares, axis=1)
+            norms += np.sum(squares, axis=0)
         self.norms.extend(np.sqrt(norms).tolist())
 
     def passed(self, threshold):
-        chosen = []
-        for score,(_,indices) in zip(self.squared,self.groups):
-            if score >= threshold**2:
-                chosen.extend(indices[self.external[indices]])
-        return chosen
+        return np.flatnonzero(self.external & (self.squared >= threshold**2)).tolist()
 
     @property
     def maximum(self):

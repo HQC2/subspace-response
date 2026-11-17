@@ -27,7 +27,7 @@ def parser():
     selection = cli.add_argument_group('response operator selection (+V/+X; state-transfer LR equations are fixed)')
     selection.add_argument('--response-selection', choices=[*COUPLING_MODES, 'full'], default='coupling', help='+X external equation-residual screening using U†HU (coupling), H (bare-coupling), or H+[H,A] (linear-coupling), or full candidate pool. (default: %(default)s)')
     selection.add_argument('--property-threshold', type=float, default=1e-4, help='+V threshold on absolute dipole coupling (default: %(default)s)')
-    selection.add_argument('--response-threshold', type=float, default=1e-4, help='+X threshold on external block residual norm over properties and unique frequency branches, in dipole units (default: %(default)s)')
+    selection.add_argument('--response-threshold', type=float, default=1e-4, help='+X threshold on external CSF residual norm over properties and unique frequency branches, in dipole units (default: %(default)s)')
     selection.add_argument('--response-seed-rank', type=int, default=1, help='Ranks always included in the seed; 0 uses +V alone (default: %(default)s)')
     selection.add_argument('--response-max-cycles', type=int, default=50, help='Response selection growth limit (default: %(default)s)')
     selection.add_argument('--denominator-floor', type=float, default=.05, help='Positive floor for inner-solver orbital-gap preconditioning (default: %(default)s)')
@@ -74,7 +74,7 @@ def calculate_response(model, args):
         if args.response_selection != 'full':
             progress.message(f'Selection settings: seed rank={args.response_seed_rank}, '
                              f'dipole threshold (+V)={args.property_threshold:g}, '
-                             f'block residual threshold (+X)={args.response_threshold:g}, '
+                             f'residual threshold (+X)={args.response_threshold:g}, '
                              f'growth limit={args.response_max_cycles}.')
             progress.message(f'Selection denominator floor={args.denominator_floor:g} hartree.')
     # The constructor requires a positive rank even for a fully occupied space.
@@ -138,7 +138,7 @@ def calculate_response(model, args):
         result['selection'] = dict(
             method=args.response_selection, converged=selected.converged, stop_reason=selected.stop_reason,
             indices=list(selected.indices), history=selected.history,
-            criterion='external-block-frobenius',
+            criterion='external-csf-norm',
             property_threshold=args.property_threshold, response_threshold=args.response_threshold,
             seed_rank=args.response_seed_rank, max_cycles=args.response_max_cycles,
             denominator_floor=args.denominator_floor)

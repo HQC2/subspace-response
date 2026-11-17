@@ -59,8 +59,7 @@ def main():
                     if args.pyscf_batch=='auto' and contraction.is_file():
                         command.extend([str(contraction),'-DUSCC_PYSCF_BATCH=1'])
         digest=sha256(b''.join(p.read_bytes() for p in
-                              (root/'native'/'uscc_native.cpp', root/'native'/'uscc_scalar.hpp',
-                               root/'native'/'uscc_connections.hpp'))).hexdigest()
+                              (root/'native'/'uscc_native.cpp', root/'native'/'uscc_scalar.hpp'))).hexdigest()
         command.append('-DUSCC_NATIVE_SOURCE_SHA256="'+digest+'"')
         command.append('-DUSCC_NATIVE_OPENMP_RUNTIME="'+runtime+'"')
         print(shlex.join(command),flush=True)

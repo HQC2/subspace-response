@@ -1,4 +1,4 @@
-"""Adaptive ground-state selection with scalar Trotter blocks.
+"""Adaptive ground-state selection with spin-adapted generators.
 
 USCC uses a spin-adapted amplitude-times-integral heuristic. SPQE uses exact
 transformed residuals with either VQE energy or PQE residual optimization.
@@ -29,12 +29,9 @@ def block_key(term):
     return tuple(sorted(h//2 for h in term.holes)), tuple(sorted(p//2 for p in term.particles))
 
 
-def block_id(block):
-    return ','.join(map(str, block[0])) + '->' + ','.join(map(str, block[1]))
-
 
 class USCCSelector:
-    """Max-product screening followed by promotion of whole scalar blocks.
+    """Spin-adapted max-product screening.
 
     The one-body coefficient is h[a,i]. The two-body coefficient is the
     antisymmetrized coefficient of canonical tau in (1/2) V a†a†aa. Scalar
@@ -405,7 +402,8 @@ class USCC:
 
     def _select(self, epsilon):
         if self.selection == 'uscc':
-            return self.selector.select(self.excitations, self.theta, epsilon), {}
+            return [(singlet_excitations_for_block(*block), score, reason)
+                    for block, score, reason in self.selector.select(self.excitations, self.theta, epsilon)], {}
         if self.selection == 'linear-spqe':
             if self._H is not self._integral_hamiltonian:
                 raise ValueError('linear-spqe selection requires the integral Hamiltonian')
@@ -473,24 +471,17 @@ class USCC:
                     pauli_rotations=rotations*factor if self.spin_adaptation == 'trotter' else None,
                     estimated_parity_cnots=cnots*factor if self.spin_adaptation == 'trotter' else None)
 
-    def _append_blocks(self, proposals, max_operators=None):
+    def _append_operators(self, proposals, max_operators=None):
         added, limited = [], False
         present = {e.id for e in self.excitations}
-        for block, score, reason in proposals:
-            cached = (self._spqe_selector if self.selection == 'spqe'
-                      else self._linear_spqe_selector if self.selection == 'linear-spqe'
-                      else self._gradient_selector if self.selection == 'gradient' else None)
-            try:
-                pool = cached[1].generators(block) if cached is not None else None
-            except KeyError:
-                pool = None  # Explicit seeds or manually supplied proposals.
-            if pool is None:
-                pool = singlet_excitations_for_block(*block)
+        for target, score, reason in proposals:
+            pool = (target,) if isinstance(target, Excitation) else target
             generators = tuple(e for e in pool if e.id not in present)
             if max_operators is not None and len(self.excitations)+len(added)+len(generators) > max_operators:
                 limited = True
                 break
-            self.provenance[block_id(block)] = dict(score=float(score), source=reason)
+            for excitation in generators:
+                self.provenance[excitation.id] = dict(score=float(score), source=reason)
             added.extend(generators)
             present.update(e.id for e in generators)
         if added:
@@ -674,14 +665,13 @@ class USCC:
             emit(progress, 'seed_start', seed=self.seed, epsilon=thresholds[0])
             if self.seed == 'sd':
                 pool = singlet_excitations(self.integrals.electrons, self.qubits, range(1,min(2,self.selector.max_rank)+1), self.selector.orbital_irreps)
-                blocks = sorted({e.block for e in pool})
-                proposals = [(b,0.,'full_sd_seed') for b in blocks]
+                proposals = [(e,0.,'full_sd_seed') for e in pool]
             elif self.selection == 'uscc':
-                proposals = [(b,s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
+                proposals = [(singlet_excitations_for_block(*b),s,why) for b,(s,why) in sorted(self.selector.base_scores().items()) if s >= thresholds[0]]
             else:
                 proposals = []  # Residual/variational criteria first screen the HF state.
-            emit(progress, 'growth_start', blocks=len(proposals), epsilon=thresholds[0])
-            added, limited = self._append_blocks(proposals, max_operators)
+            emit(progress, 'growth_start', operators=sum(len(p[0]) if isinstance(p[0], tuple) else 1 for p in proposals), epsilon=thresholds[0])
+            added, limited = self._append_operators(proposals, max_operators)
             emit(progress, 'seed_complete', added=len(added), dimension=len(self.theta), ranks=self.resources()['ranks'])
             self.initialized = not limited
             self.needs_optimization = True
@@ -712,8 +702,8 @@ class USCC:
                 self.threshold_index += 1
                 record(dict(event='threshold_closed', epsilon=epsilon, **selection_diagnostics))
                 continue
-            emit(progress, 'growth_start', blocks=len(proposals), epsilon=epsilon)
-            added, limited = self._append_blocks(proposals, max_operators)
+            emit(progress, 'growth_start', operators=sum(len(p[0]) if isinstance(p[0], tuple) else 1 for p in proposals), epsilon=epsilon)
+            added, limited = self._append_operators(proposals, max_operators)
             cycles += 1
             if added:
                 self.stop_reason = 'running'

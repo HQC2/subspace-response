@@ -1,8 +1,8 @@
 """Exact, spin-adapted SPQE screening and projective amplitude microiterations.
 
 This project uses exact SPQE-style residuals within the single/double spatial
-occupation neighborhood of HF and selected amplitudes. Selection promotes whole
-scalar blocks.
+occupation neighborhood of HF and selected amplitudes. Selection scores
+individual canonical spin-adapted excitations.
 """
 from itertools import combinations
 from math import hypot
@@ -54,8 +54,8 @@ class SPQESelection(ExcitationNeighborhood):
     """Residual selection within the single/double neighborhood of selected CSFs.
 
     HF is always a source. Spatial occupation distance is half the occupation
-    L1 distance, so whole scalar blocks are eligible within two electron moves
-    of any source block. Only eligible blocks with nonzero determinant support
+    L1 distance, so candidates are eligible within two electron moves of HF
+    or a selected occupation pattern. Only patterns with nonzero determinant support
     get a scalar basis. Values are recomputed on every call.
     """
     def __init__(self, indices, hf_index, n_modes, constraints, address=None):
@@ -90,11 +90,9 @@ class SPQESelection(ExcitationNeighborhood):
         blocks = sorted(self._candidates & self._blocks.keys())
         if self._projector is None or blocks != self.blocks:
             self.blocks = blocks
-            generators, block_rows = [], []
-            for i, block in enumerate(self.blocks):
+            generators = []
+            for block in self.blocks:
                 generators.extend(self._blocks[block])
-                block_rows.extend([i]*len(self._blocks[block]))
-            self._block_rows = np.asarray(block_rows, dtype=np.intp)
             self._projector = ReferenceProjector(generators, self.address, self.hf_index,
                                                  self.n_modes, len(self.indices))
             self._active_ids = None
@@ -110,10 +108,8 @@ class SPQESelection(ExcitationNeighborhood):
             self._active_ids = active_ids
         residuals = self._projector.project(vector)
         residuals[~self._missing] = 0.
-        norms = np.sqrt(np.bincount(self._block_rows, weights=residuals**2,
-                                   minlength=len(self.blocks)))
-        scores = [(self.blocks[i], float(norms[i]), 'projective_residual')
-                  for i in np.flatnonzero(norms)]
+        scores = [(self._projector.excitations[i], float(abs(residuals[i])), 'projective_residual')
+                  for i in np.flatnonzero(residuals)]
         proposals, diagnostics = _select_scores(scores, epsilon)
         diagnostics.update(candidate_blocks=len(self._candidates),
                            source_blocks=len(self._sources))
@@ -125,13 +121,13 @@ def _select_scores(scores, epsilon):
     # subtracting nearly equal squared norms near a tight selection threshold.
     discarded = 0.
     selected = []
-    for proposal in sorted(scores, key=lambda item: (item[1], item[0])):
+    for proposal in sorted(scores, key=lambda item: (item[1], item[0].block, item[0].coupling)):
         candidate = hypot(discarded, proposal[1])
         if candidate <= epsilon:
             discarded = candidate
         else:
             selected.append(proposal)
-    selected.sort(key=lambda item: (-item[1], item[0]))
+    selected.sort(key=lambda item: (-item[1], item[0].block, item[0].coupling))
     return selected, dict(excluded_residual_norm=float(discarded))
 
 

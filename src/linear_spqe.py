@@ -145,7 +145,7 @@ def _sparse_residual(indices, amplitudes, h, g, hf, electrons, irreps, max_rank)
 
 
 class LinearSPQESelection(ExcitationNeighborhood):
-    """First-order residual screening with SPQE's cumulative block L2 budget."""
+    """First-order screening with a cumulative L2 budget on individual CSFs."""
     def __init__(self, integrals, constraints):
         modes, electrons = integrals.qubits, integrals.electrons
         if modes > 62:
@@ -201,13 +201,10 @@ class LinearSPQESelection(ExcitationNeighborhood):
         values = np.fromiter(vector.values(), dtype=float)
         beta_mask = sum(1 << (2*i) for i in range(self.n_orbitals))
         occupations = (indices & beta_mask)+((indices >> 1) & beta_mask)
-        codes, inverse = np.unique(occupations, return_inverse=True)
-        norms = np.sqrt(np.bincount(inverse, weights=values**2))
+        codes = np.unique(occupations[values != 0])
         self._candidates = set()
         scores = []
-        for code, norm in zip(codes,norms):
-            if norm == 0:
-                continue
+        for code in codes:
             if code not in self._occupation_blocks:
                 numbers = tuple((int(code) >> (self.n_modes-2*i-2)) & 3
                                 for i in range(self.n_orbitals))
@@ -221,27 +218,18 @@ class LinearSPQESelection(ExcitationNeighborhood):
             self._candidates.add(block)
             if present_counts.get(block,0) == count:
                 continue
-            if block in present_counts:
-                # Avoid subtracting nearly equal squared norms for a partially
-                # selected block: project its missing scalar rows explicitly.
-                missing = []
-                for excitation in self.generators(block):
-                    if excitation.id in present:
-                        continue
-                    value = 0.
-                    for term in excitation.terms:
-                        key = term.holes, term.particles
-                        if key not in self._references:
-                            self._references[key] = apply_fermion_word(self.hf_index, self.n_modes, term.word)
-                        index, sign = self._references[key]
-                        value += term.coefficient*sign*vector.get(index, 0.)
-                    missing.append(value)
-                norm = np.linalg.norm(missing)
-            # H and A are spin scalars. Their complete singlet block has the
-            # same norm in the determinant and orthonormal CSF bases (Parseval).
-            norm = float(norm)
-            if norm:
-                scores.append((block, norm, 'first_order_commutator'))
+            for excitation in self.generators(block):
+                if excitation.id in present:
+                    continue
+                value = 0.
+                for term in excitation.terms:
+                    key = term.holes, term.particles
+                    if key not in self._references:
+                        self._references[key] = apply_fermion_word(self.hf_index, self.n_modes, term.word)
+                    index, sign = self._references[key]
+                    value += term.coefficient*sign*vector.get(index, 0.)
+                if value:
+                    scores.append((excitation, float(abs(value)), 'first_order_commutator'))
         proposals, diagnostics = _select_scores(scores, epsilon)
         diagnostics.update(candidate_blocks=len(self._candidates), source_blocks=len(self._sources),
                            residual_determinants=len(vector))

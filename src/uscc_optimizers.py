@@ -16,21 +16,14 @@ def _line_search(objective, x, energy, gradient, direction, max_steps=24):
     slope = float(gradient @ direction)
     if not np.isfinite(slope) or slope >= 0:
         return None
-    noise = 64*np.finfo(float).eps*max(1., abs(energy))
     alpha = 1.
     for _ in range(max_steps):
         trial = x+alpha*direction
         if np.array_equal(trial, x):
             return None
         value, derivative = objective(trial)
-        predicted = -alpha*slope
-        armijo = (value <= energy+1e-4*alpha*slope
-                  and (predicted > 10*noise or energy-value > noise))
-        # Near stationarity the energy difference can be below floating-point
-        # resolution even while the analytic gradient remains informative.
-        roundoff = (predicted <= 10*noise and abs(value-energy) <= noise
-                    and np.linalg.norm(derivative) <= (1-1e-4)*np.linalg.norm(gradient))
-        if np.isfinite(value) and np.all(np.isfinite(derivative)) and (armijo or roundoff):
+        if (np.isfinite(value) and np.all(np.isfinite(derivative))
+                and value <= energy+1e-4*alpha*slope):
             return trial, float(value), np.asarray(derivative)
         alpha *= .5
     return None
@@ -44,8 +37,7 @@ def minimize_metric(objective, initial, curvature, *, gradient_tolerance=1e-6,
     Secant pairs can be padded with zeros by the caller when the ansatz grows.
     This embeds the learned old block and initializes new coordinates with the
     diagonal metric; new cross curvatures are learned by subsequent updates.
-    Steps satisfy Armijo decrease or reduce the analytic gradient within the
-    energy's roundoff resolution. Convergence requires the public L2 gradient
+    Steps satisfy Armijo decrease. Convergence requires the public L2 gradient
     target, rather than a small energy change.
     ``callback`` receives scalar iteration/energy/norm data at the initial
     point (iteration zero) and after each accepted step, without reevaluation.
@@ -124,19 +116,13 @@ def minimize_metric(objective, initial, curvature, *, gradient_tolerance=1e-6,
             if not diagonal_direction:
                 step = _line_search(objective, x, energy, gradient, diagonal_step)
                 searches += 1
-            if step is None:
-                # Near a positive-curvature minimum the unscaled negative
-                # gradient also decreases its norm, even when a poor diagonal
-                # metric fails that roundoff-region merit test.
-                step = _line_search(objective,x,energy,gradient,-gradient/np.max(curvature))
-                searches += 1
         if step is None:
             return OptimizeResult(x=x, fun=energy, jac=gradient, success=False, nit=iteration,
                                   message='Line search failed', history=pairs, searches=searches, rejected=rejected)
         new_x, new_energy, new_gradient = step
         s, y = new_x-x, new_gradient-gradient
         sy = float(s @ y)
-        if sy > 1e-10*np.linalg.norm(s)*np.linalg.norm(y) and sy > 0:
+        if sy > 0:
             pairs.append((s, y)); pairs = pairs[-memory:]
         x, energy, gradient = new_x, new_energy, new_gradient
     return OptimizeResult(x=x, fun=energy, jac=gradient, success=False, nit=maxiter,

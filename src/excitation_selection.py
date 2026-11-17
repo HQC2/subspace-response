@@ -1,7 +1,7 @@
 """Eigenvector-driven operator selection for singlet state-transfer LR-USCC.
 
-The +X score is the external residual Frobenius norm of each complete
-spatial block over all requested unit-normalized Ritz vectors. Only external screening may use bare or linearized couplings;
+The +X score is the external residual L2 norm of each CSF over all requested unit-normalized
+Ritz vectors. Only external screening may use bare or linearized couplings;
 all selected-space eigenproblems use the correlated USCC Hamiltonian.
 """
 from dataclasses import dataclass
@@ -94,10 +94,10 @@ def select_excitations(candidates, *, roots=5, excitation_threshold=1e-4,
     Rank seeds include every CSF through ``seed_rank``. CIS seeds include
     singles whose normalized absolute amplitude in any requested CIS root is
     at least ``cis_threshold``, plus each root's largest component. Lowest-gap
-    blocks supplement either seed if needed to represent all requested roots.
-    Growth promotes complete spatial spin-coupling blocks. A zero +X threshold
+    CSFs supplement either seed if needed to represent all requested roots.
+    A zero +X threshold
     recovers the full candidate pool. Convergence refers only to that pool and
-    the block residual criterion; it does not certify missing disconnected roots.
+    the chosen residual criterion; it does not certify missing disconnected roots.
     """
     if excitation_score not in COUPLING_MODES:
         raise ValueError('excitation_score must be '+', '.join(COUPLING_MODES))
@@ -119,16 +119,6 @@ def select_excitations(candidates, *, roots=5, excitation_threshold=1e-4,
         raise ValueError('Selection cycle limit must be positive')
     roots = min(roots, len(candidates.space))
     excitations = candidates.space.excitations
-    blocks = {}
-    for i, excitation in enumerate(excitations):
-        blocks.setdefault(excitation.block, []).append(i)
-
-    def promote(selected, indices):
-        result = set(selected)
-        for i in indices:
-            result.update(blocks[excitations[i].block])
-        return result
-
     amplitudes = None
     seed_info = dict(method=seed)
     if seed == 'rank':
@@ -148,12 +138,11 @@ def select_excitations(candidates, *, roots=5, excitation_threshold=1e-4,
                     and keep[e.spatial_holes[0], e.spatial_particles[0]-nocc]}
         seed_info.update(threshold=cis_threshold, requested_roots=cis_roots,
                          energies_hartree=cis_energies.tolist(), roots=len(cis_energies))
-    selected = promote(set(), selected)
     initial = set(selected)
     for i in np.argsort(candidates.orbital_diagonal(), kind='stable'):
         if len(selected) >= roots:
             break
-        selected = promote(selected, [int(i)])
+        selected.add(int(i))
     seed_info.update(indices=sorted(selected), dimension=len(selected),
                      supplemented_indices=sorted(selected-initial))
     emit(candidates.progress, 'lr_seed', dimension=len(selected), candidate_dimension=len(excitations),
@@ -192,20 +181,20 @@ def select_excitations(candidates, *, roots=5, excitation_threshold=1e-4,
                 if image is None:
                     image = response.sector_images(vector[:,None],approximation=approximation)[:,0]
                 screen.add(image)
-            grown = promote(selected,screen.passed(excitation_threshold))
+            grown = selected | set(screen.passed(excitation_threshold))
         added = grown-selected
         emit(candidates.progress,'residual_screen',maximum=screen.maximum,images=len(screen.norms))
         emit(candidates.progress,'lr_growth',added=len(added),dimension=len(indices),will_grow=cycle<max_cycles)
         result = response._eigen_result
         history.append(dict(cycle=cycle,dimension=len(indices),energies_hartree=energies.tolist(),
-            residual_norms=result.residual_norms.tolist(),criterion='external-block-frobenius',
+            residual_norms=result.residual_norms.tolist(),criterion='external-csf-norm',
             screening_operator=approximation,external_residual_norms=screen.norms,
-            max_external_block_norm=screen.maximum,
             ranks={str(r):sum(excitations[i].rank==r for i in indices)
                    for r in sorted({e.rank for e in excitations})},
-            added=[excitations[i].id for i in sorted(added)],coupling_cache_bytes=0,
+            added=[excitations[i].id for i in sorted(added)],
             eigen_iterations=result.iterations,eigen_products=result.products,
             eigen_restarts=result.restarts,eigen_subspace_limit=result.subspace_limit))
+        history[-1]['max_external_csf_norm'] = screen.maximum
         if not added:
             converged = True
             break

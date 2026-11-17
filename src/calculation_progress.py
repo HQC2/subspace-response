@@ -50,7 +50,7 @@ class ConsoleProgress:
         elif name == 'selection_start':
             message = f"Screening ground-state operators at threshold {event['epsilon']:g} (growth cycle {event['cycle']}, {event['dimension']} current operators)."
         elif name == 'growth_start':
-            message = f"About to add operators from {event['blocks']} spatial blocks at threshold {event['epsilon']:g}."
+            message = f"About to add {event['operators']} operators at threshold {event['epsilon']:g}."
         elif name == 'growth':
             message = f"Added {len(event['added'])} operators; {sum(event['ranks'].values())} total, ranks={event['ranks']}. Amplitudes will be reoptimized."
         elif name == 'threshold_closed':
@@ -71,16 +71,12 @@ class ConsoleProgress:
             message = f"LR seed contains {event['dimension']}/{event['candidate_dimension']} CSFs ({event['description']})."
         elif name == 'lr_cycle':
             message = f"Selection cycle {event['cycle']+1}: solving in {event['dimension']} CSFs before external residual screening."
-        elif name == 'coupling_start':
-            message = f"Measuring dressed couplings for {event['columns']} newly selected CSFs."
-        elif name == 'coupling_progress':
-            message = f"Dressed coupling columns measured: {event['completed']}/{event['columns']}."
         elif name == 'screen_start':
             operator = {'coupling': 'U†HU', 'bare-coupling': 'H', 'linear-coupling': 'H+[H,A]'}[event['method']]
-            message = f"Screening external block residuals using {operator} ({event['method']})."
+            message = f"Screening external CSF residuals using {operator} ({event['method']})."
         elif name == 'lr_growth':
             if event['added'] and event['will_grow']:
-                message = f"About to add {event['added']} CSFs in complete spatial blocks: {event['dimension']} -> {event['dimension']+event['added']}."
+                message = f"About to add {event['added']} CSFs: {event['dimension']} -> {event['dimension']+event['added']}."
             elif event['added']:
                 message = f"{event['added']} additional CSFs passed screening; growth limit reached, keeping the last solved space."
             else:
@@ -115,7 +111,7 @@ class ConsoleProgress:
                        f"operator products={event['products']}, restarts={event['restarts']}.")
         elif name == 'residual_screen':
             message = (f"External screening completed for {event['images']} vector images; "
-                       f"largest block residual norm={event['maximum']:.3e}.")
+                       f"largest CSF residual norm={event['maximum']:.3e}.")
         elif name == 'eigen_work':
             message = f"{event['kind']} eigensolver: {event['products']} operator applications completed."
         elif name == 'eigen_root':
