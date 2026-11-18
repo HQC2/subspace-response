@@ -67,6 +67,9 @@ class ConsoleProgress:
             message = f"Reference E={event['energy']:.12f} hartree, ground-state residual={event['residual_norm']:.3e}."
         elif name == 'properties_start':
             message = 'Computing correlated property couplings for the response seed.'
+            if 'dimension' in event:
+                message += (f" Single-move property neighborhood: "
+                            f"{event['dimension']}/{event['candidate_dimension']} CSFs; selected-space sources remain exact.")
         elif name == 'lr_seed':
             message = f"LR seed contains {event['dimension']}/{event['candidate_dimension']} CSFs ({event['description']})."
         elif name == 'lr_cycle':
@@ -110,8 +113,9 @@ class ConsoleProgress:
                        f"subspace={event['dimension']}/{event['subspace_limit']}, "
                        f"operator products={event['products']}, restarts={event['restarts']}.")
         elif name == 'residual_screen':
+            kind = 'norm bound' if event.get('norm_bounds') else 'norm'
             message = (f"External screening completed for {event['images']} vector images; "
-                       f"largest CSF residual norm={event['maximum']:.3e}.")
+                       f"largest CSF residual {kind}={event['maximum']:.3e}.")
         elif name == 'eigen_work':
             message = f"{event['kind']} eigensolver: {event['products']} operator applications completed."
         elif name == 'eigen_root':

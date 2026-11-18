@@ -362,20 +362,25 @@ def _scalar_monomials(holes, particles):
 @lru_cache(maxsize=2048)
 def _singlet_coupling_template(holes, particles):
     """Canonical monomial coefficients for compact spatial occupation labels."""
-    n_modes = 2 * (max(holes + particles) + 1)
-    hf = sum((1 << (n_modes - 2*h - 1)) + (1 << (n_modes - 2*h - 2)) for h in set(holes))
     basis = []
-    canonical_phases = {}
     open_shells = sum(indices.count(i) == 1 for indices in (holes, particles) for i in set(indices))
     # Multiplicity of S=0 in open_shells spin-1/2 representations. Once this
     # basis is complete every remaining E product is necessarily dependent.
     half = open_shells//2
     singlets = comb(open_shells, half) - comb(open_shells, half+1)
-    from uscc_kernels import orthogonalize
-    compiled = orthogonalize is not None and open_shells >= 8
+    from uscc_kernels import orthogonalize, spin_free_coefficients
+    compiled = orthogonalize is not None
+    keys = _scalar_monomials(holes, particles)
+    # Encode only singly occupied orbitals: paired shells have fixed spins.
+    # The lookup is proportional to the M_S=0 space, rather than 2**open_shells.
+    open_orbitals = [(side, i) for side, indices in enumerate((holes, particles))
+                     for i in sorted(set(indices)) if indices.count(i) == 1]
+    bits = {orbital:1 << i for i,orbital in enumerate(open_orbitals)}
+    codes = np.array([sum(bits.get((side, mode//2), 0)*(mode%2)
+                         for side, modes in enumerate(key) for mode in modes) for key in keys], dtype=np.int64)
+    key_columns = np.argsort(codes)
+    key_codes = codes[key_columns]
     if compiled:
-        keys = _scalar_monomials(holes, particles)
-        addresses = {key:i for i,key in enumerate(keys)}
         vectors = np.zeros((singlets, len(keys)))
         columns = np.empty(vectors.shape, dtype=np.int32)
         counts = np.zeros(singlets, dtype=np.int32)
@@ -383,37 +388,25 @@ def _singlet_coupling_template(holes, particles):
     # directly, retaining the original lexicographic order of valid spin words.
     choices = [((0,1), (1,0)) if holes.count(h) == 2 else ((0,), (1,))
                for h in sorted(set(holes))]
-    spin_words = [tuple(spin for group in groups for spin in group) for groups in product(*choices)]
+    spin_words = np.array([tuple(spin for group in groups for spin in group) for groups in product(*choices)], dtype=np.int8)
+    repeated_holes = [(i,j) for i,h in enumerate(holes) for j in range(i) if holes[j] == h]
+    hole_parities = np.array([sum(int(spins[j]) for i,j in repeated_holes) for spins in spin_words])
+    hole_codes = np.array([sum(int(s)*bits.get((0,h),0) for h,s in zip(holes,spins)) for spins in spin_words], dtype=np.int64)
     for pairing in _spin_free_pairings(holes, particles):
-        raw = {}
-        repeated_particles = [(i,j) for i,p in enumerate(pairing) for j in range(i) if pairing[j] == p]
-        for spins in spin_words:
-            if any(spins[i] == spins[j] for i,j in repeated_particles):
-                continue
-            word = tuple(op for h, p, spin in zip(holes, pairing, spins) for op in ((2*p+spin, True), (2*h+spin, False)))
-            applied = apply_fermion_word(hf, n_modes, word)
-            if applied is None:
-                continue
-            hs = tuple(sorted(2*h+spin for h, spin in zip(holes, spins)))
-            ps = tuple(sorted(2*p+spin for p, spin in zip(pairing, spins)))
-            key = hs, ps
-            if key not in canonical_phases:
-                # This word is canonical by construction. Avoid rebuilding
-                # and validating an ExcitationTerm for every spin pairing.
-                canonical_word = tuple((p, True) for p in ps) + tuple((h, False) for h in reversed(hs))
-                canonical_phases[key] = apply_fermion_word(hf, n_modes, canonical_word)[1]
-            raw[key] = raw.get(key, 0.) + applied[1] / canonical_phases[key]
+        repeated_particles = np.array([(i,j) for i,p in enumerate(pairing) for j in range(i) if pairing[j] == p], dtype=np.int32).reshape(-1,2)
+        inversions = sum(p > q for i,p in enumerate(pairing) for q in pairing[i+1:])
+        # Normal ordering E_p1h1 ... E_prhr against the canonical excitation
+        # leaves just the sorting parity of the hole and particle modes.
+        particle_bits = np.array([bits.get((1,p),0) for p in pairing], dtype=np.int64)
+        values, order, count = spin_free_coefficients(spin_words, hole_codes, hole_parities,
+            particle_bits, repeated_particles, inversions, key_codes, key_columns)
         if compiled:
-            values = np.zeros(len(keys))
-            order = np.empty(len(keys), dtype=np.int32)
-            for i,(key,value) in enumerate(raw.items()):
-                col = addresses[key]
-                values[col], order[i] = value, col
-            count = orthogonalize(values, order, len(raw), vectors, columns, counts, len(basis))
+            count = orthogonalize(values, order, count, vectors, columns, counts, len(basis))
             if not count:
                 continue
             basis.append({keys[col]:vectors[len(basis), col] for col in columns[len(basis), :count]})
         else:
+            raw = {keys[col]:values[col] for col in order[:count]}
             # Reorthogonalization stabilizes blocks with several spin couplings.
             for _ in range(2):
                 for previous in basis:

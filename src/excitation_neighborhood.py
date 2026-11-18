@@ -4,8 +4,9 @@ from itertools import combinations_with_replacement
 
 class ExcitationNeighborhood:
     """HF and selected blocks supply sources, independently of their amplitudes."""
-    def __init__(self, hf_index, n_modes, constraints):
+    def __init__(self, hf_index, n_modes, constraints, *, max_distance=2):
         self.hf_index, self.n_modes, self.constraints = hf_index, n_modes, constraints
+        self.max_distance = max_distance
         self.n_orbitals = n_modes//2
         self.reference_occupations = tuple((hf_index >> (n_modes-2*i-2) & 3).bit_count()
                                            for i in range(self.n_orbitals))
@@ -35,7 +36,7 @@ class ExcitationNeighborhood:
         occupations = self._occupations(source)
         holes = [i for i, n in enumerate(occupations) if n]
         particles = [i for i, n in enumerate(occupations) if n < 2]
-        for rank in (1, 2):
+        for rank in range(1, self.max_distance+1):
             removals = ([(i,) for i in holes] if rank == 1 else
                         [pair for pair in combinations_with_replacement(holes, 2)
                          if pair[0] != pair[1] or occupations[pair[0]] == 2])
@@ -64,7 +65,7 @@ class ExcitationNeighborhood:
         for source in sorted(sources-self._sources):
             occupations = self._occupations(source)
             code = sum(n*p for n, p in zip(occupations, self._occupation_powers))
-            for rank in (1, 2):
+            for rank in range(1, self.max_distance+1):
                 removals = self._occupation_moves(occupations, rank, removing=True)
                 additions = self._occupation_moves(occupations, rank, removing=False)
                 for removed_mask, removed_code in removals:

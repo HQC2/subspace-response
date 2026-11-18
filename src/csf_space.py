@@ -102,6 +102,7 @@ class CompactResponseSpace:
         self._cache_sizes = {}
         self.excitations, self.ids = _Excitations(self), _Excitations(self, ids=True)
         self._groups = None
+        self._occupation_rows = None
 
     def __len__(self):
         return len(self.indices)
@@ -217,3 +218,38 @@ class CompactResponseSpace:
         for local, values in self.project_blocks(states):
             result[local] = values
         return result
+
+    def occupation_norms(self, states):
+        """Determinant norms per catalog occupation block, without spin templates.
+
+        These bound every individual CSF projection, including nonsinglet
+        components of a Trotter state. The final bin absorbs HF and occupations
+        outside this rank-limited catalog.
+        """
+        catalog,sim = self.catalog,self.simulator
+        if catalog._occupation_rows is None:
+            powers = [3**i for i in range(sim.n_orbitals)]
+            indices = np.asarray(sim.indices,dtype=np.uint64)
+            occupations = np.zeros(len(indices),dtype=np.int64)
+            reference = 0
+            for i,power in enumerate(powers):
+                shift = sim.n_modes-2*i-2
+                occupations += np.bitwise_count((indices >> shift) & 3).astype(np.int64)*power
+                reference += ((catalog.hf_index >> shift) & 3).bit_count()*power
+            codes = np.array([reference-sum(powers[h] for h in holes)+sum(powers[p] for p in particles)
+                              for holes,particles in catalog.blocks])
+            order = np.argsort(codes)
+            positions = np.searchsorted(codes[order],occupations)
+            rows = np.full(len(indices),len(codes),dtype=np.int64)
+            valid = positions < len(codes)
+            matched = order[positions[valid]]
+            where = np.flatnonzero(valid)
+            where = where[codes[matched] == occupations[where]]
+            rows[where] = order[positions[where]]
+            catalog._occupation_rows = rows
+        states = np.asarray(states)
+        if states.ndim == 1:
+            states = states[:,None]
+        count = len(catalog.blocks)
+        return np.column_stack([np.sqrt(np.bincount(catalog._occupation_rows,weights=abs(v)**2,
+                                                    minlength=count+1)[:count]) for v in states.T])

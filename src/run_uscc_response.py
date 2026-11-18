@@ -77,6 +77,8 @@ def calculate_response(model, args):
                              f'residual threshold (+X)={args.response_threshold:g}, '
                              f'growth limit={args.response_max_cycles}.')
             progress.message(f'Selection denominator floor={args.denominator_floor:g} hartree.')
+            progress.message('Property screening uses single-move neighbors of HF and ground-state generators; outside-neighborhood source couplings '
+                             'are omitted during screening. Selected-space sources and final properties use exact couplings.')
     # The constructor requires a positive rank even for a fully occupied space.
     response = USCCResponse(model, max_rank=max(1, max_rank),
                             sector_threads=model.sector_threads, progress=progress, compact=True, memory_mb=args.lr_memory_mb)
@@ -140,6 +142,7 @@ def calculate_response(model, args):
             indices=list(selected.indices), history=selected.history,
             criterion='external-csf-norm',
             property_threshold=args.property_threshold, response_threshold=args.response_threshold,
+            property_candidate_dimension=selected.property_candidate_dimension,
             seed_rank=args.response_seed_rank, max_cycles=args.response_max_cycles,
             denominator_floor=args.denominator_floor)
     return result

@@ -1,4 +1,4 @@
-"""Optional compiled determinant rotations and scalar-basis orthogonalization.
+"""Optional compiled determinant rotations and scalar spin adaptation.
 
 The packed plan preserves every component and Trotter step in its original
 order. No fast-math reassociation or gate reordering is used.
@@ -137,6 +137,41 @@ def _orthogonalize(raw, order, count, basis, columns, counts, size):
     return count
 
 
+def _spin_free_coefficients(spins, hole_codes, hole_parities, particle_bits,
+                            particle_pairs, pairing_parity, key_codes, key_columns):
+    """Expand an E-product by sorting parity, in lexicographic spin-word order.
+
+    Codes record the spins on singly occupied spatial orbitals. Paired holes
+    already have opposite spins; reject Pauli-forbidden paired particles here.
+    Track first insertion even if later contributions cancel, as MGS uses it.
+    """
+    raw = np.zeros(len(key_codes))
+    order = np.empty(len(key_codes), dtype=np.int32)
+    present = np.zeros(len(key_codes), dtype=np.bool_)
+    count = 0
+    for row in range(len(spins)):
+        parity = hole_parities[row]+pairing_parity
+        valid = True
+        for pair in range(len(particle_pairs)):
+            i, j = particle_pairs[pair]
+            if spins[row, i] == spins[row, j]:
+                valid = False
+                break
+            parity += spins[row, j]
+        if not valid:
+            continue
+        code = hole_codes[row]
+        for i in range(len(particle_bits)):
+            code += spins[row, i]*particle_bits[i]
+        col = key_columns[np.searchsorted(key_codes, code)]
+        if not present[col]:
+            order[count] = col
+            count += 1
+            present[col] = True
+        raw[col] += -1. if parity % 2 else 1.
+    return raw, order, count
+
+
 def _insertion_gradients(output, state, residual, width, enabled, a_starts, b_starts,
                          sources, targets, signs):
     for term in range(len(output)):
@@ -176,6 +211,7 @@ reverse = None if njit is None else njit(cache=True)(_reverse)
 parallel_forward = None if njit is None else njit(cache=True, parallel=True)(_forward_parallel)
 parallel_reverse = None if njit is None else njit(cache=True, parallel=True)(_reverse_parallel)
 orthogonalize = None if njit is None else njit(cache=True)(_orthogonalize)
+spin_free_coefficients = _spin_free_coefficients if njit is None else njit(cache=True)(_spin_free_coefficients)
 
 insertion_gradients = None if njit is None else njit(cache=True)(_insertion_gradients)
 parallel_insertion_gradients = None if njit is None else njit(cache=True, parallel=True)(_insertion_gradients_parallel)

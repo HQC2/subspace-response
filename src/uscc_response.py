@@ -157,6 +157,7 @@ class USCCResponse:
         self._retain_solution_images = False
         self._davidson_history = None
         self._property_cache = {}
+        self._property_images = {}
         self._one_body_links = None
         self._eigen_images = {}
         self._eigen_result = None
@@ -167,7 +168,8 @@ class USCCResponse:
 
         Production selectors set matrix_free=True, including when a caller
         constructed an explicit oracle on the parent. The simulator/rotation
-        plan is shared; response-space caches are independent.
+        plan and determinant property images are shared; projected property
+        and solver caches are independent.
         As with a single simulator, concurrent calls require external locking.
         """
         indices = np.asarray(indices, dtype=int)
@@ -368,15 +370,15 @@ class USCCResponse:
             self._orbital_diagonal = self.integrals.excitation_gaps(self.space.excitations)
         return self._orbital_diagonal.copy()
 
-    def property_vector(self, one_body):
-        """b_mu=<mu|U† O U|HF> for real symmetric spin-summed one-body O."""
+    def property_image(self, one_body):
+        """Read-only determinant image U† O U|HF>, shared by restricted contexts."""
         one_body = np.asarray(one_body)
         norb = self.simulator.n_orbitals
         if one_body.shape != (norb,norb) or np.iscomplexobj(one_body) or not np.all(np.isfinite(one_body)) or not np.allclose(one_body,one_body.T,rtol=0,atol=1e-12):
             raise ValueError('Expected real symmetric active-space one-electron integrals')
         one_body = np.ascontiguousarray(one_body,dtype=float)
         key = one_body.tobytes()
-        if key not in self._property_cache:
+        if key not in self._property_images:
             sim = self.simulator
             if self._one_body_links is None:
                 links = cistring.gen_linkstr_index_trilidx(range(norb),sim.n_alpha)
@@ -385,7 +387,22 @@ class USCCResponse:
             with lib.with_omp_threads(sim.sector_threads):
                 applied = np.asarray(direct_spin1.contract_1e(one_body,ci,norb,(sim.n_alpha,sim.n_beta),link_index=self._one_body_links)).ravel()
             applied = self._unitary(sim.phases*applied,adjoint=True)
-            self._property_cache[key] = self.space.project(applied)
+            applied.flags.writeable = False
+            self._property_images[key] = applied
+        return self._property_images[key]
+
+    def property_vector(self, one_body, *, indices=None):
+        """Exact b_mu=<mu|U† O U|HF>, optionally projected only onto local indices.
+
+        Partial projections never populate the complete-space property cache.
+        The determinant image is reused as the selected LR space grows.
+        """
+        image = self.property_image(one_body)
+        if indices is not None:
+            return self.space.restrict(indices).project(image)
+        key = np.ascontiguousarray(one_body,dtype=float).tobytes()
+        if key not in self._property_cache:
+            self._property_cache[key] = self.space.project(image)
         return self._property_cache[key].copy()
 
     def dipole_integrals(self):
